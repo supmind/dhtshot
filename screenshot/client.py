@@ -30,7 +30,7 @@ class TorrentClient:
         settings = {
             'listen_interfaces': '0.0.0.0:6881', 'enable_dht': True,
             'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage,
-            'dht_bootstrap_nodes': 'router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881',
+            'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
         }
         self.ses = lt.session(settings)
         self.alert_task = None
@@ -64,8 +64,11 @@ class TorrentClient:
         meta_future = self.loop.create_future()
         self.pending_metadata[infohash] = meta_future
         trackers = [
-            "udp://tracker.openbittorrent.com:80", "udp://tracker.opentrackr.org:1337/announce",
-            "udp://tracker.coppersurfer.tk:6969/announce", "udp://tracker.leechers-paradise.org:6969/announce",
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.demonii.com:1337/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://exodus.desync.com:6969/announce",
+            "udp://tracker.bittor.pw:1337/announce",
         ]
         magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
         params = lt.parse_magnet_uri(magnet_uri)
@@ -75,7 +78,7 @@ class TorrentClient:
         handle = self.ses.add_torrent(params)
 
         try:
-            await asyncio.wait_for(self.dht_ready.wait(), timeout=30)
+            await asyncio.wait_for(self.dht_ready.wait(), timeout=90)
         except asyncio.TimeoutError:
             self.log.error("DHT 引导超时。")
             raise LibtorrentError("DHT bootstrap timed out")
@@ -86,7 +89,7 @@ class TorrentClient:
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
             self.pending_metadata.pop(infohash, None)
-            raise
+            raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
 
         return handle
 

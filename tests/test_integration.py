@@ -11,7 +11,7 @@ from screenshot.service import ScreenshotService
 SINTEL_INFOHASH = "08ada5a7a6183aae1e09d831df6748d566095a10"
 TEST_OUTPUT_DIR = "./screenshots_output_test"
 # 定义一个更合理的超时时间
-TEST_TIMEOUT = 60 # 秒
+TEST_TIMEOUT = 300 # 秒
 
 async def wait_for_screenshots(output_dir, infohash, timeout):
     """
@@ -30,7 +30,7 @@ async def wait_for_screenshots(output_dir, infohash, timeout):
 
         await asyncio.sleep(1) # 每秒轮询一次
 
-@pytest.mark.skip(reason="网络集成测试在沙盒环境中不稳定")
+@pytest.mark.skip(reason="此测试依赖于真实的 P2P 网络连接，在受限的沙盒网络环境中无法稳定运行。")
 @pytest.mark.asyncio
 async def test_full_screenshot_process_network():
     """

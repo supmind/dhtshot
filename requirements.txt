@@ -13,3 +13,4 @@ six
 # For testing
 pytest
 pytest-asyncio
+pytest-cov
