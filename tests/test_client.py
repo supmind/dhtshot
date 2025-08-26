@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 # Mock the libtorrent library before it's imported by the client
 lt_mock = MagicMock()
 with patch.dict('sys.modules', {'libtorrent': lt_mock}):
-    from screenshot.client import TorrentClient
+    from screenshot.client import TorrentClient, LibtorrentError
 
 def setup_client(loop):
     """A helper function to create and configure a client for tests."""
@@ -49,27 +49,29 @@ async def test_add_torrent_success():
 
 @pytest.mark.asyncio
 @patch('screenshot.client.asyncio.wait_for')
-async def test_add_torrent_timeout(mock_wait_for):
+async def test_add_torrent_dht_timeout(mock_wait_for):
     """
-    Tests that add_torrent correctly times out and cleans up.
+    Tests that add_torrent correctly raises LibtorrentError on DHT timeout.
     """
     # --- Setup ---
     loop = asyncio.get_running_loop()
     client = setup_client(loop)
+    client.dht_ready.clear() # Ensure DHT is not ready initially
     fake_infohash = "b" * 40
-    mock_handle = MagicMock()
-    mock_handle.info_hash.return_value = fake_infohash
-    client.ses.add_torrent.return_value = mock_handle
 
-    # Configure the mock to simulate a timeout
+    # The first wait_for is for the DHT, which we want to time out.
+    # The second is for metadata, which should not be reached.
     mock_wait_for.side_effect = asyncio.TimeoutError
 
     # --- Execute & Assert ---
-    with pytest.raises(asyncio.TimeoutError):
+    # We expect our custom LibtorrentError, not the raw asyncio.TimeoutError
+    with pytest.raises(LibtorrentError, match="DHT bootstrap timed out"):
         await client.add_torrent(fake_infohash)
 
-    # After a timeout, the pending metadata for that infohash should be cleaned up.
-    assert fake_infohash not in client.pending_metadata
+    # The metadata future should have been created but not resolved.
+    # The error handling in add_torrent should not clean it up because it happens
+    # before the metadata wait.
+    assert fake_infohash in client.pending_metadata
 
 @pytest.mark.asyncio
 async def test_handle_piece_finished():

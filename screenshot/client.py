@@ -74,7 +74,12 @@ class TorrentClient:
 
         handle = self.ses.add_torrent(params)
 
-        await self.dht_ready.wait()
+        try:
+            await asyncio.wait_for(self.dht_ready.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            self.log.error("DHT 引导超时。")
+            raise LibtorrentError("DHT bootstrap timed out")
+
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:
             handle = await asyncio.wait_for(meta_future, timeout=180)
@@ -140,10 +145,12 @@ class TorrentClient:
         with self.pending_reads_lock:
             futures = self.pending_reads.pop(alert.piece, [])
         if alert.error and alert.error.value() != 0:
-            error = LibtorrentError(alert.error)
-            for future in futures:
-                if not future.done(): future.set_exception(error)
-            return
+            # 在某些情况下，即使出现非零错误码，libtorrent 也会报告“成功”
+            if "success" not in alert.error.message().lower():
+                error = LibtorrentError(alert.error)
+                for future in futures:
+                    if not future.done(): future.set_exception(error)
+                return
         data = bytes(alert.buffer)
         for future in futures:
             if not future.done(): future.set_result(data)

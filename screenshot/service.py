@@ -52,56 +52,52 @@ class ScreenshotService:
         await self.task_queue.put({'infohash': infohash})
         self.log.info(f"已提交新的任务，infohash: {infohash}")
 
+    async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
+        """给定一个有效的句柄，执行截图生成的具体逻辑。"""
+        video_file = VideoFile(self.client, handle)
+        if video_file.file_index == -1:
+            self.log.warning(f"在 torrent {infohash_hex} 中未找到视频文件。")
+            return
+
+        keyframe_infos, moov_data = await video_file.get_keyframes_and_moov()
+        if not keyframe_infos or not moov_data:
+            self.log.error(f"无法为 {infohash_hex} 提取关键帧或 moov_data。")
+            return
+
+        decode_tasks = []
+        for keyframe_info in keyframe_infos:
+            keyframe_data = await video_file.download_keyframe_data(keyframe_info)
+            if not keyframe_data:
+                self.log.warning(f"因下载失败，跳过帧 (PTS: {keyframe_info.pts})。")
+                continue
+
+            ts_sec = keyframe_info.pts / keyframe_info.timescale
+            m, s = divmod(ts_sec, 60)
+            h, m = divmod(m, 60)
+            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(round(s)):02d}"
+
+            task = self.generator.generate(
+                moov_data=moov_data, keyframe_data=keyframe_data,
+                keyframe_info=keyframe_info, infohash_hex=infohash_hex,
+                timestamp_str=timestamp_str
+            )
+            decode_tasks.append(task)
+
+        await asyncio.gather(*decode_tasks)
+        self.log.info(f"{infohash_hex} 的截图任务已完成。")
+
     async def _handle_screenshot_task(self, task_info: dict):
-        """处理单个截图任务的核心协调逻辑。"""
+        """处理截图任务的完整生命周期，包括获取和释放 torrent 句柄。"""
         infohash_hex = task_info['infohash']
         self.log.info(f"正在处理任务: {infohash_hex}")
         handle = None
         try:
-            # 1. 从客户端获取 torrent 句柄
             handle = await self.client.add_torrent(infohash_hex)
             if not handle or not handle.is_valid():
                 self.log.error(f"无法为 {infohash_hex} 获取有效的 torrent 句柄。")
                 return
 
-            # 2. 使用 VideoFile 获取关键帧元数据
-            video_file = VideoFile(self.client, handle)
-            if video_file.file_index == -1:
-                self.log.warning(f"在 torrent {infohash_hex} 中未找到视频文件。")
-                return
-
-            keyframe_infos, moov_data = await video_file.get_keyframes_and_moov()
-            if not keyframe_infos or not moov_data:
-                self.log.error(f"无法为 {infohash_hex} 提取关键帧或 moov_data。")
-                return
-
-            # 3. 为每个关键帧下载其数据并生成截图
-            decode_tasks = []
-            for keyframe_info in keyframe_infos:
-                # a. 下载特定帧的数据
-                keyframe_data = await video_file.download_keyframe_data(keyframe_info)
-                if not keyframe_data:
-                    self.log.warning(f"因下载失败，跳过帧 (PTS: {keyframe_info.pts})。")
-                    continue
-
-                # b. 安排截图生成任务
-                ts_sec = keyframe_info.pts / keyframe_info.timescale
-                m, s = divmod(ts_sec, 60)
-                h, m = divmod(m, 60)
-                timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(round(s)):02d}"
-
-                task = self.generator.generate(
-                    moov_data=moov_data,
-                    keyframe_data=keyframe_data,
-                    keyframe_info=keyframe_info,
-                    infohash_hex=infohash_hex,
-                    timestamp_str=timestamp_str
-                )
-                decode_tasks.append(task)
-
-            await asyncio.gather(*decode_tasks)
-            self.log.info(f"{infohash_hex} 的截图任务已完成。")
-
+            await self._generate_screenshots_from_torrent(handle, infohash_hex)
         except Exception:
             self.log.exception(f"处理 {infohash_hex} 时发生未知错误。")
         finally:

@@ -3,48 +3,22 @@ import pytest
 import os
 import struct
 
-# 定义测试视频文件的路径，使用新下载的视频
-TEST_VIDEO_PATH = os.path.join(os.path.dirname(__file__), 'test_video.mp4')
-
-def find_box_data(file_path, box_type_str):
-    """
-    一个辅助函数，用于在 MP4 文件中查找指定类型的 box 并返回其内容。
-    这对于隔离 'moov' box 进行单元测试非常有用。
-    """
-    with open(file_path, 'rb') as f:
-        while True:
-            header_bytes = f.read(8)
-            if not header_bytes:
-                break
-
-            size, box_type_bytes = struct.unpack('>I4s', header_bytes)
-            box_type = box_type_bytes.decode('ascii', errors='ignore')
-
-            if size == 1: # 64-bit size
-                size_bytes = f.read(8)
-                if not size_bytes: break
-                size = struct.unpack('>Q', size_bytes)[0]
-                content_size = size - 16
-            else:
-                content_size = size - 8
-
-            if box_type == box_type_str:
-                # 找到了！返回整个 box 的数据 (header + content)
-                f.seek(f.tell() - 8 - (8 if size == 1 else 0)) # 回到 box 的起始位置
-                return f.read(size)
-
-            # 跳转到下一个 box
-            f.seek(content_size, os.SEEK_CUR)
-    return None
+# 定义固件文件的路径
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
+MOOV_DAT_PATH = os.path.join(FIXTURE_DIR, 'moov.dat')
 
 @pytest.fixture(scope="session")
 def moov_data():
     """
-    一个 pytest fixture，它在模块测试开始前运行一次，
-    负责找到并加载 'moov' box 的数据，供后续测试用例使用。
+    一个 pytest fixture，它在测试会话开始前只运行一次，
+    负责从预先提取的 'moov.dat' 文件中加载 'moov' box 的二进制数据。
+    这避免了在每次测试运行时都去解析一个完整的视频文件，从而提高了效率和稳定性。
     """
-    # 确认测试视频文件存在
-    assert os.path.exists(TEST_VIDEO_PATH), f"测试视频文件不存在于: {TEST_VIDEO_PATH}"
-    data = find_box_data(TEST_VIDEO_PATH, 'moov')
-    assert data is not None, f"测试失败：未能在 {TEST_VIDEO_PATH} 文件中找到 'moov' box。"
+    # 确认 'moov.dat' 文件存在
+    assert os.path.exists(MOOV_DAT_PATH), f"测试固件文件 'moov.dat' 不存在于: {MOOV_DAT_PATH}"
+
+    with open(MOOV_DAT_PATH, 'rb') as f:
+        data = f.read()
+
+    assert data is not None and len(data) > 0, f"测试失败：未能从 {MOOV_DAT_PATH} 文件中读取到有效数据。"
     return data

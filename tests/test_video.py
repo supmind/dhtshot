@@ -184,7 +184,6 @@ class TestAsyncTorrentReader:
             reader.seek(-10, 2) # SEEK_END
             assert reader.tell() == 990
 
-@pytest.mark.skip(reason="需要一个有效的测试视频文件来提取 'moov' box")
 def test_parse_keyframes_from_stbl(moov_data, mock_client, mock_handle):
     """
     Tests the _parse_keyframes_from_stbl method with a real 'moov' box.

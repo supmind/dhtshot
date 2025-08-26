@@ -4,7 +4,6 @@ import pytest
 import struct
 from screenshot.pymp4parse import F4VParser, BoxHeader, UnImplementedBox
 
-@pytest.mark.skip(reason="需要一个有效的测试视频文件来提取 'moov' box")
 def test_parse_moov_box(moov_data):
     """
     核心单元测试：测试 F4VParser 能否正确解析一个真实的 'moov' box。
@@ -58,7 +57,6 @@ def test_parse_moov_box(moov_data):
     assert stco_box.header.box_type == 'stco'
     assert len(stco_box.entries) > 0, "'stco' box (块偏移表) 不应为空"
 
-@pytest.mark.skip(reason="需要一个有效的测试视频文件来提取 'moov' box")
 def test_find_child_box(moov_data):
     """
     测试辅助函数 find_child_box 是否能正确地在解析树中导航。
