@@ -109,6 +109,7 @@ class AsyncTorrentReader:
         self.pos += size
         return bytes(result_buffer)
 
+
 # ==============================================================================
 # ScreenshotService: 主服务类
 # ==============================================================================
@@ -269,7 +270,6 @@ class ScreenshotService:
             if not ti: self.log.error(f"未能获取 {infohash_hex} 的 torrent_file 对象。"); return
             handle.prioritize_pieces([0] * ti.num_pieces())
 
-            # 使用现代 API files() 替换已弃用的 file_at()
             files = ti.files()
             video_file_index, max_size = -1, -1
             for i in range(files.num_files()):
@@ -280,33 +280,17 @@ class ScreenshotService:
             if video_file_index == -1: self.log.warning(f"在 {infohash_hex} 中未找到视频文件。"); return
 
             # =================================================================
-            # 1. 下载整个视频文件到内存
+            # 1. 新策略：通过部分下载获取关键帧信息
             # =================================================================
-            self.log.info(f"任务 {infohash_hex}: 开始将视频文件下载到内存...")
-            video_file_data = await self._download_video_file_in_memory(handle, video_file_index)
-            if not video_file_data:
-                self.log.error(f"任务 {infohash_hex}: 无法下载视频文件，中止任务。")
-                return
-            self.log.info(f"任务 {infohash_hex}: 视频文件已成功下载到内存。")
-
-            # =================================================================
-            # 2. 从内存中的数据解析关键帧
-            # =================================================================
-            def parse_keyframes_sync(video_data):
-                from .pymp4parse import F4VParser
-                moov_box = next((b for b in F4VParser.parse(bytes_input=video_data) if b.header.box_type == 'moov'), None)
-                if not moov_box:
-                    self.log.error(f"任务 {infohash_hex}: 在下载的数据中未找到 'moov' box。")
-                    return None
-                return self._parse_keyframes_from_stbl(moov_box)
-
-            keyframe_infos = await self.loop.run_in_executor(None, parse_keyframes_sync, video_file_data)
+            self.log.info(f"任务 {infohash_hex}: 开始通过部分下载解析关键帧...")
+            keyframe_infos = await self._get_keyframes_from_partial_download(handle, video_file_index)
             if not keyframe_infos:
-                self.log.error(f"任务 {infohash_hex}: 无法从内存数据中提取关键帧。")
+                self.log.error(f"任务 {infohash_hex}: 无法从文件的部分内容中提取关键帧，中止任务。")
                 return
+            self.log.info(f"任务 {infohash_hex}: 成功解析了 {len(keyframe_infos)} 个关键帧信息。")
 
             # =================================================================
-            # 3. 为每个关键帧创建截图任务
+            # 2. 为每个关键帧创建“先下载后解码”的截图任务
             # =================================================================
             decode_tasks = []
             for keyframe_info in keyframe_infos:
@@ -315,9 +299,15 @@ class ScreenshotService:
                 h, m = divmod(m, 60)
                 timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(round(s)):02d}"
 
-                # 注意：现在传递的是 video_file_data，而不是 handle 和 video_file_index
+                # 1. 先精确下载单个关键帧的数据
+                keyframe_data = await self._download_keyframe_data(handle, video_file_index, keyframe_info)
+                if not keyframe_data:
+                    self.log.warning(f"未能下载关键帧 {timestamp_str} 的数据，跳过此帧。")
+                    continue
+
+                # 2. 将下载好的数据传递给解码函数
                 task = self._decode_and_save_frame(
-                    video_file_data=video_file_data,
+                    keyframe_data=keyframe_data,
                     keyframe_info=keyframe_info,
                     infohash_hex=infohash_hex,
                     timestamp_str=timestamp_str
@@ -326,42 +316,76 @@ class ScreenshotService:
 
             await asyncio.gather(*decode_tasks)
             self.log.info(f"{infohash_hex} 的截图任务完成。")
+
         except asyncio.TimeoutError: self.log.error(f"处理 {infohash_hex} 时发生超时。")
         except Exception: self.log.exception(f"处理 {infohash_hex} 时发生未知错误。")
         finally:
             if infohash_hex in self.pending_metadata: self.pending_metadata.pop(infohash_hex, None)
             if handle: self.ses.remove_torrent(handle, lt.session.delete_files)
 
-    async def _download_video_file_in_memory(self, handle, video_file_index):
+    async def _get_keyframes_from_partial_download(self, handle, video_file_index):
         """
-        一个健壮的方法，用于将 torrent 中的单个视频文件完全下载到内存中。
+        通过下载文件的头部和尾部来解析 'moov' box 并提取关键帧信息。
+        这是实现按需下载的第一步。
         """
+        from .pymp4parse import F4VParser
         ti = handle.torrent_file()
         fs = ti.files()
         file_size = fs.file_size(video_file_index)
+        reader = AsyncTorrentReader(self, handle, video_file_index)
 
-        # 1. 优先处理文件对应的所有 piece
-        # 这会告诉 libtorrent 我们想要这个文件的所有部分
-        file_prio = [0] * fs.num_files()
-        file_prio[video_file_index] = 7 # 设置最高优先级
-        handle.prioritize_files(file_prio)
-        self.log.info(f"文件 {video_file_index} 的所有 piece 已设置为高优先级。")
+        # 定义要下载的数据块大小（例如，前后各 4MB）
+        PROBE_SIZE = 4 * 1024 * 1024
+        moov_box = None
 
-        # 2. 使用 AsyncTorrentReader 读取整个文件
+        # 1. 尝试从文件头部寻找 'moov' box
+        self.log.debug(f"正在下载文件头部 ({PROBE_SIZE} 字节)...")
+        try:
+            reader.seek(0)
+            head_data = await reader.read(min(PROBE_SIZE, file_size))
+            moov_box = next((b for b in F4VParser.parse(bytes_input=head_data) if b.header.box_type == 'moov'), None)
+        except Exception as e:
+            self.log.warning(f"解析文件头部时出错: {e}")
+
+        # 2. 如果头部没有，则尝试从文件尾部寻找
+        if not moov_box and file_size > PROBE_SIZE:
+            self.log.debug(f"文件头部未找到 'moov' box，正在下载尾部 ({PROBE_SIZE} 字节)...")
+            try:
+                seek_pos = max(0, file_size - PROBE_SIZE)
+                reader.seek(seek_pos)
+                tail_data = await reader.read(PROBE_SIZE)
+                # 解析尾部数据时，需要注意 pymp4parse 可能会因为数据不完整而出错，
+                # 但它的迭代器设计使得我们仍然可能找到有效的 box。
+                moov_box = next((b for b in F4VParser.parse(bytes_input=tail_data) if b.header.box_type == 'moov'), None)
+            except Exception as e:
+                self.log.warning(f"解析文件尾部时出错: {e}")
+
+        # 3. 如果找到了 'moov' box，则从中解析关键帧
+        if moov_box:
+            self.log.info("'moov' box 已找到，正在解析关键帧...")
+            # 在执行器中运行同步的、CPU密集型的解析任务
+            return await self.loop.run_in_executor(None, self._parse_keyframes_from_stbl, moov_box)
+        else:
+            self.log.error("在文件的头部和尾部都未能找到 'moov' box。")
+            return None
+
+    async def _download_keyframe_data(self, handle, video_file_index, keyframe_info):
+        """
+        精确地只下载一个关键帧所需的数据。
+        """
+        self.log.debug(f"正在为关键帧 (PTS: {keyframe_info.pts}) 下载数据，位置: {keyframe_info.pos}, 大小: {keyframe_info.size}")
         try:
             reader = AsyncTorrentReader(self, handle, video_file_index)
-            # seek(0) 确保我们从头开始读
-            reader.seek(0)
-            # read(-1) 表示读取到文件末尾
-            file_data = await reader.read(file_size)
+            reader.seek(keyframe_info.pos)
+            keyframe_data = await reader.read(keyframe_info.size)
 
-            if len(file_data) != file_size:
-                self.log.error(f"下载的文件大小与预期不符。预期: {file_size}, 实际: {len(file_data)}")
+            if len(keyframe_data) != keyframe_info.size:
+                self.log.error(f"关键帧数据下载不完整。预期: {keyframe_info.size}, 实际: {len(keyframe_data)}")
                 return None
 
-            return file_data
+            return keyframe_data
         except Exception as e:
-            self.log.exception(f"下载文件 {video_file_index} 到内存时发生错误: {e}")
+            self.log.exception(f"下载关键帧 (PTS: {keyframe_info.pts}) 数据时出错: {e}")
             return None
 
     def _parse_keyframes_from_stbl(self, moov_box):
@@ -448,7 +472,7 @@ class ScreenshotService:
         frame.to_image().save(output_filename)
         self.log.info(f"成功: 截图已保存到 {output_filename}")
 
-    async def _decode_and_save_frame(self, *, video_file_data, keyframe_info, infohash_hex, timestamp_str):
+    async def _decode_and_save_frame(self, *, keyframe_data, keyframe_info, infohash_hex, timestamp_str):
         """
         一个简化的解码函数，它在一个内存中的字节对象上操作。
         这避免了复杂的异步I/O和线程问题。
@@ -458,17 +482,7 @@ class ScreenshotService:
         def decode_and_save_sync():
             try:
                 # 使用 io.BytesIO 将内存中的数据包装成一个文件类对象
-                with av.open(io.BytesIO(video_file_data), 'r') as container:
-                    stream = container.streams.video[0]
-
-                    # 在内存数据中进行 seek 操作非常快
-                    container.seek(
-                        keyframe_info.pts,
-                        stream=stream,
-                        any_frame=False,
-                        backward=True
-                    )
-
+                with av.open(io.BytesIO(keyframe_data), 'r') as container:
                     # 解码并保存帧
                     frame = next(container.decode(video=0))
                     self._save_frame_to_jpeg(frame, infohash_hex, timestamp_str)
