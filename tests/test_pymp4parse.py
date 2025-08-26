@@ -105,3 +105,57 @@ def test_parse_box_with_invalid_size():
     boxes = list(F4VParser.parse(bytes_input=invalid_size_data))
     # 经过错误处理逻辑的改进，解析器现在会中止并返回一个空列表
     assert len(boxes) == 0
+
+def test_parse_co64_box():
+    """
+    测试能否正确解析 'co64' (64-bit Chunk Offset) box。
+    """
+    # 构建一个包含 co64 的 stbl box 的字节流
+    # Fullbox header (version 0, flags 0) + entry_count (1)
+    co64_content = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x01'
+    # 64-bit offset
+    co64_content += b'\x00\x00\x00\x01\x00\x00\x00\x02'
+
+    # co64_header (size, type)
+    co64_header = struct.pack('>I', len(co64_content) + 8) + b'co64'
+
+    box = next(F4VParser.parse(bytes_input=co64_header + co64_content))
+
+    assert box.header.box_type == 'co64'
+    assert len(box.entries) == 1
+    assert box.entries[0] == 0x100000002
+
+def test_parse_unimplemented_box():
+    """
+    测试解析器遇到未知 box 类型时的行为。
+    """
+    # 创建一个自定义的 box 'test'
+    test_box_data = b'\x00\x00\x00\x10' + b'test' + b'data' * 2
+    box = next(F4VParser.parse(bytes_input=test_box_data))
+
+    assert isinstance(box, UnImplementedBox)
+    assert box.header.box_type == 'test'
+    assert box.header.box_size == 8
+
+def test_parsing_with_corrupt_entry_count():
+    """
+    测试当 box 内容（如 entry_count）损坏时解析器的鲁棒性。
+    """
+    # stts box 声明有 1000 个条目，但数据不足
+    # Fullbox header + entry_count (1000)
+    stts_content = b'\x00\x00\x00\x00' + b'\x00\x00\x03\xe8'
+    # 但只提供一个条目的数据
+    stts_content += b'\x00\x00\x00\x01\x00\x00\x00\x01'
+
+    stts_header = struct.pack('>I', len(stts_content) + 8) + b'stts'
+
+    # 解析器应该能捕获 ReadError 并安全地跳过这个 box
+    # 我们用一个正常的 box 跟在后面，以确保解析可以继续
+    ftyp_box_data = b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00iso2avc1mp41'
+
+    boxes = list(F4VParser.parse(bytes_input=stts_header + stts_content + ftyp_box_data))
+
+    # 第一个 box 解析失败，被跳过
+    # 第二个 box (ftyp) 应该被成功解析
+    assert len(boxes) == 1
+    assert boxes[0].header.box_type == 'ftyp'

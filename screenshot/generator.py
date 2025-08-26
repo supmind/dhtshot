@@ -21,7 +21,7 @@ class ScreenshotGenerator:
         在内存中创建一个最小化的、有效的 MP4 文件。
         该文件包含解码单个关键帧所需的上下文（moov）和数据（mdat）。
         """
-        ftyp_box = b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00iso2avc1mp41'
+        ftyp_box = b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00iso2avc1'
         mdat_size = len(keyframe_data) + 8
         mdat_header = struct.pack('>I', mdat_size) + b'mdat'
         mdat_box = mdat_header + keyframe_data

@@ -244,3 +244,82 @@ async def test_get_keyframes_and_moov_not_found(mock_loop, mock_client, mock_han
             assert moov_data is None
             # Assert that it tried reading both the head and the tail
             assert mock_reader_instance.read.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_read_error(self, mock_client):
+        """
+        Tests that an error during piece download is handled correctly.
+        """
+        mock_handle = MagicMock()
+        ti = mock_handle.torrent_file.return_value
+        ti.piece_length.return_value = 16384
+        ti.map_file.return_value = MagicMock(piece=10, start=100)
+        file_storage = ti.files.return_value
+        file_storage.file_size.return_value = 50000
+
+        # Mock the client's download method to raise an error
+        mock_client.download_and_read_piece.side_effect = IOError("Piece download failed")
+
+        with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+            reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
+            with pytest.raises(IOError, match="Piece download failed"):
+                await reader.read(100)
+
+def test_no_video_file_found(mock_client):
+    """
+    Tests the behavior when no video file is found in the torrent.
+    """
+    handle = MagicMock()
+    files_mock = handle.torrent_file.return_value.files.return_value
+    files_mock.num_files.return_value = 1
+    files_mock.file_path.return_value = "archive.zip" # No video files
+    files_mock.file_size.return_value = 100
+
+    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+        video_file = VideoFile(mock_client, handle)
+        assert video_file.file_index == -1
+
+@pytest.mark.asyncio
+async def test_download_keyframe_incomplete_read(mock_client, mock_handle):
+    """
+    Tests that download_keyframe_data returns None if the read is incomplete.
+    """
+    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+        video_file = VideoFile(mock_client, mock_handle)
+    keyframe_info = KeyframeInfo(pts=1, pos=123, size=456, timescale=1000)
+
+    with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
+        mock_reader_instance = MockReader.return_value
+        # Simulate reading less data than requested
+        mock_reader_instance.read = AsyncMock(return_value=b"a" * 100)
+
+        data = await video_file.download_keyframe_data(keyframe_info)
+
+        assert data is None
+
+@pytest.mark.asyncio
+@patch('screenshot.video.asyncio.get_running_loop')
+async def test_get_keyframes_parsing_fails(mock_loop, mock_client, mock_handle):
+    """
+    Tests get_keyframes_and_moov when keyframe parsing returns no keyframes.
+    """
+    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+        video_file = VideoFile(mock_client, mock_handle)
+        fake_moov_data = b"moov_data"
+
+        # Simulate finding the moov box
+        mock_executor = AsyncMock(return_value=fake_moov_data)
+        mock_loop.return_value.run_in_executor = mock_executor
+
+        # Simulate _parse_keyframes_from_stbl returning an empty list
+        video_file._parse_keyframes_from_stbl = MagicMock(return_value=[])
+
+        with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
+            mock_reader_instance = MockReader.return_value
+            mock_reader_instance.read = AsyncMock(return_value=b"head_data")
+            mock_reader_instance.file_size = 1024
+
+            keyframes, moov_data = await video_file.get_keyframes_and_moov()
+
+            assert keyframes is None
+            assert moov_data is None
