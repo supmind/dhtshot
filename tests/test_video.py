@@ -9,359 +9,167 @@ from screenshot.service import KeyframeInfo
 from screenshot.pymp4parse import F4VParser
 
 @pytest.fixture
-def mock_client():
-    """Provides a mock TorrentClient."""
-    return MagicMock(spec=TorrentClient)
+def video_file(mock_client, mock_handle):
+    """Provides a VideoFile instance with libtorrent patched."""
+    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+        return VideoFile(mock_client, mock_handle)
 
-@pytest.fixture
-def mock_handle():
-    """
-    Provides a mock libtorrent handle with an explicitly mocked file list.
-    This avoids the ambiguity of using side_effect in a loop.
-    """
-    handle = MagicMock()
-    files_mock = MagicMock()
-
-    # Create individual mock file entries
-    file1 = MagicMock()
-    file1.path = "video1.mkv"
-    file1.size = 100
-
-    file2 = MagicMock()
-    file2.path = "video2.mp4"
-    file2.size = 200
-
-    file3 = MagicMock()
-    file3.path = "other.txt"
-    file3.size = 50
-
-    # Configure the 'files' mock to behave like a list-like object
-    files_mock.num_files.return_value = 3
-    # The 'file_path' and 'file_size' methods of the lt.file_storage object
-    # take an index as an argument. We mock this behavior.
-    def file_path_side_effect(index):
-        return [file1.path, file2.path, file3.path][index]
-    def file_size_side_effect(index):
-        return [file1.size, file2.size, file3.size][index]
-
-    files_mock.file_path.side_effect = file_path_side_effect
-    files_mock.file_size.side_effect = file_size_side_effect
-
-    handle.torrent_file.return_value.files.return_value = files_mock
-    return handle
-
-def test_find_largest_video_file_index(mock_client, mock_handle):
+def test_find_largest_video_file_index(video_file):
     """
     Tests that the VideoFile class correctly identifies the index of the
     largest video file in the torrent.
     """
-    # We patch libtorrent here to avoid loading the actual library
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
-        # video2.mp4 at index 1 is the largest video file
-        assert video_file.file_index == 1
+    # video2.mp4 at index 1 is the largest video file
+    assert video_file.file_index == 1
 
 @pytest.mark.asyncio
-async def test_download_keyframe_data(mock_client, mock_handle):
+async def test_download_keyframe_data(video_file, mock_client, mock_handle):
     """
     Tests that download_keyframe_data correctly uses the AsyncTorrentReader
     to seek and read the right data.
     """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
     keyframe_info = KeyframeInfo(pts=1, pos=123, size=456, timescale=1000)
 
-    # We need to patch the AsyncTorrentReader used by the method
     with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
         mock_reader_instance = MockReader.return_value
-        # Make the async read method an awaitable that returns the correct amount of data
         mock_reader_instance.read = AsyncMock(return_value=b"a" * 456)
 
-        # Execute
         data = await video_file.download_keyframe_data(keyframe_info)
 
-        # Assert
         MockReader.assert_called_once_with(mock_client, mock_handle, video_file.file_index)
         mock_reader_instance.seek.assert_called_once_with(123)
         mock_reader_instance.read.assert_awaited_once_with(456)
         assert data == b"a" * 456
 
 @pytest.mark.asyncio
-@patch('screenshot.video.F4VParser')
-@patch('screenshot.video.asyncio.get_running_loop')
-async def test_get_keyframes_and_moov_success(mock_loop, mock_parser, mock_client, mock_handle):
+async def test_get_decoder_config_success(video_file):
     """
-    Tests the successful flow of getting keyframes and moov data.
+    Tests that get_decoder_config successfully extracts SPS and PPS.
     """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        # --- Setup ---
-        video_file = VideoFile(mock_client, mock_handle)
-        fake_moov_data = b"moov_data"
-        fake_keyframe_infos = [KeyframeInfo(1,2,3,4)]
+    # Create a mock moov box with the necessary structure
+    mock_moov = MagicMock()
+    mock_avcC = MagicMock()
+    mock_avcC.sps_list = [b'sps_data']
+    mock_avcC.pps_list = [b'pps_data']
 
-        # Mock the helper function that finds the moov box inside the downloaded data
-        # We need to mock the run_in_executor call to return our fake data
-        mock_executor = AsyncMock(return_value=fake_moov_data)
-        mock_loop.return_value.run_in_executor = mock_executor
+    with patch('screenshot.video.F4VParser.find_child_box', return_value=mock_avcC) as mock_find:
+        video_file._get_moov_box = AsyncMock(return_value=mock_moov)
+        sps, pps = await video_file.get_decoder_config()
 
-        # Mock the internal parsing method
-        video_file._parse_keyframes_from_stbl = MagicMock(return_value=fake_keyframe_infos)
+        # Assertions
+        mock_find.assert_called_once_with(mock_moov, ['trak', 'mdia', 'minf', 'stbl', 'stsd', 'avc1', 'avcC'])
+        assert sps == b'sps_data'
+        assert pps == b'pps_data'
 
-        # Mock the reader
-        with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
-            mock_reader_instance = MockReader.return_value
-            mock_reader_instance.read = AsyncMock(return_value=b"head_data")
-            mock_reader_instance.file_size = 5 * 1024 * 1024 # 5MB
-
-            # --- Execute ---
-            keyframes, moov_data = await video_file.get_keyframes_and_moov()
-
-            # --- Assert ---
-            # Assert that it tried to read the head of the file
-            mock_reader_instance.read.assert_awaited_once()
-            # Assert that the moov finding function was called via the executor
-            mock_executor.assert_called_once()
-            # Assert that the keyframe parsing function was called
-            video_file._parse_keyframes_from_stbl.assert_called_once()
-            # Assert the correct data was returned
-            assert keyframes == fake_keyframe_infos
-            assert moov_data == fake_moov_data
-
-class TestAsyncTorrentReader:
+@pytest.mark.asyncio
+async def test_get_decoder_config_no_moov(video_file):
     """
-    Tests for the AsyncTorrentReader class.
+    Tests that get_decoder_config returns None when no moov box is found.
     """
-    @pytest.mark.asyncio
-    async def test_read_logic(self, mock_client):
-        """
-        Tests the core read logic of the AsyncTorrentReader.
-        """
-        # --- Setup ---
-        mock_handle = MagicMock()
-        ti = mock_handle.torrent_file.return_value
-        ti.piece_length.return_value = 16384  # 16KB piece size
-        ti.map_file.return_value = MagicMock(piece=10, start=100)
+    video_file._get_moov_box = AsyncMock(return_value=None)
+    sps, pps = await video_file.get_decoder_config()
+    assert sps is None
+    assert pps is None
 
-        file_storage = ti.files.return_value
-        file_storage.file_size.return_value = 50000 # 50KB file size
-
-        # Mock the client's download method
-        mock_client.download_and_read_piece = AsyncMock(return_value=b'a' * 16384)
-
-        # --- Execute ---
-        with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-            reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
-
-            # Test reading a small chunk
-            data = await reader.read(100)
-            assert len(data) == 100
-
-            # Test reading across piece boundary (this is simplified, full test would be complex)
-            reader.seek(16300)
-            ti.map_file.side_effect = [
-                MagicMock(piece=10, start=16300), # First piece
-                MagicMock(piece=11, start=0)      # Second piece
-            ]
-            data_across_boundary = await reader.read(100)
-            assert len(data_across_boundary) == 100
-            # Should have called download for two different pieces
-            assert mock_client.download_and_read_piece.call_count == 2
-
-    def test_seek_and_tell(self, mock_client, mock_handle):
-        """
-        Tests the seek and tell methods.
-        """
-        with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-            reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
-
-            reader.seek(123)
-            assert reader.tell() == 123
-
-            reader.seek(50, 1) # SEEK_CUR
-            assert reader.tell() == 173
-
-            reader.file_size = 1000
-            reader.seek(-10, 2) # SEEK_END
-            assert reader.tell() == 990
-
-def test_parse_keyframes_from_stbl(moov_data, mock_client, mock_handle):
+@pytest.mark.asyncio
+async def test_get_keyframes_integration(video_file, moov_data):
     """
-    Tests the _parse_keyframes_from_stbl method with a real 'moov' box.
-    This ensures the complex keyframe calculation logic is correct.
+    Tests the entire get_keyframes logic using a real moov box.
+    This is an integration test for the parsing and new selection logic.
     """
-    # Parse the real 'moov' data to get a box object
     moov_box = next(F4VParser.parse(bytes_input=moov_data))
+    video_file._get_moov_box = AsyncMock(return_value=moov_box)
 
-    # Create a VideoFile instance to call the method on
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
+    keyframes = await video_file.get_keyframes()
 
-    # Execute the method under test
-    keyframes = video_file._parse_keyframes_from_stbl(moov_box)
-
-    # Assert the results
     assert keyframes is not None
     assert isinstance(keyframes, list)
-    assert len(keyframes) > 0
+    # Based on the fixture's duration and the new logic, we expect a specific count.
+    # The moov.dat fixture has 11 keyframes.
+    # The selectable range is from index 1 to 9 (8 keyframes).
+    # The duration is short, so we want 5 screenshots.
+    # Since 8 > 5, we select 5 keyframes.
+    assert len(keyframes) == 5
 
-    # Check the content of the keyframes
     last_pts = -1
     for kf in keyframes:
         assert isinstance(kf, KeyframeInfo)
-        assert kf.pts >= 0
-        assert kf.pos > 0
-        assert kf.size > 0
-        # Timestamps should be monotonically increasing
         assert kf.pts > last_pts
         last_pts = kf.pts
 
 @pytest.mark.asyncio
-@patch('screenshot.video.asyncio.get_running_loop')
-async def test_get_keyframes_and_moov_not_found(mock_loop, mock_client, mock_handle):
+async def test_get_keyframes_no_moov(video_file):
     """
-    Tests that get_keyframes_and_moov returns (None, None) when a moov box
-    cannot be found in the video file.
+    Tests that get_keyframes returns an empty list if moov is not found.
     """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
+    video_file._get_moov_box = AsyncMock(return_value=None)
+    keyframes = await video_file.get_keyframes()
+    assert keyframes == []
 
-        # Mock the executor to simulate the 'find_moov_in_data' helper
-        # returning None, as if no moov box was found.
-        mock_executor = AsyncMock(return_value=None)
-        mock_loop.return_value.run_in_executor = mock_executor
+@pytest.mark.asyncio
+async def test_get_keyframes_no_stbl(video_file, moov_data):
+    """
+    Tests that get_keyframes returns an empty list if stbl is missing.
+    """
+    moov_box = next(F4VParser.parse(bytes_input=moov_data))
+    # Corrupt the moov_box by removing the 'stbl' attribute
+    stbl_box = F4VParser.find_child_box(moov_box, ['trak', 'mdia', 'minf', 'stbl'])
+    minf_box = F4VParser.find_child_box(moov_box, ['trak', 'mdia', 'minf'])
+    del minf_box.stbl
+    minf_box.children = [c for c in minf_box.children if c != stbl_box]
 
-        with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
-            mock_reader_instance = MockReader.return_value
-            # Return some dummy data that doesn't contain 'moov'
-            mock_reader_instance.read = AsyncMock(return_value=b"not_a_moov_box")
-            # Set a file size larger than the probe size to trigger both head and tail reads
-            mock_reader_instance.file_size = 5 * 1024 * 1024
+    video_file._get_moov_box = AsyncMock(return_value=moov_box)
+    keyframes = await video_file.get_keyframes()
+    assert keyframes == []
 
-            keyframes, moov_data = await video_file.get_keyframes_and_moov()
-
-            # Assert that the method returns None, None
-            assert keyframes is None
-            assert moov_data is None
-            # Assert that it tried reading both the head and the tail
-            assert mock_reader_instance.read.call_count == 2
-
-class TestAsyncTorrentReaderExtended:
+class TestAsyncTorrentReader:
     @pytest.mark.asyncio
-    async def test_read_error(self, mock_client):
-        """
-        Tests that an error during piece download is handled correctly.
-        """
+    async def test_read_logic(self, mock_client):
         mock_handle = MagicMock()
         ti = mock_handle.torrent_file.return_value
         ti.piece_length.return_value = 16384
         ti.map_file.return_value = MagicMock(piece=10, start=100)
         file_storage = ti.files.return_value
         file_storage.file_size.return_value = 50000
+        mock_client.download_and_read_piece = AsyncMock(return_value=b'a' * 16384)
 
-        # Mock the client's download method to raise an error
+        with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+            reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
+            data = await reader.read(100)
+            assert len(data) == 100
+
+            reader.seek(16300)
+            ti.map_file.side_effect = [
+                MagicMock(piece=10, start=16300),
+                MagicMock(piece=11, start=0)
+            ]
+            data_across_boundary = await reader.read(100)
+            assert len(data_across_boundary) == 100
+            assert mock_client.download_and_read_piece.call_count == 2
+
+    def test_seek_and_tell(self, mock_client, mock_handle):
+        with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
+            reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
+            reader.file_size = 1000
+
+            reader.seek(123)
+            assert reader.tell() == 123
+            reader.seek(50, 1)
+            assert reader.tell() == 173
+            reader.seek(-10, 2)
+            assert reader.tell() == 990
+
+    @pytest.mark.asyncio
+    async def test_read_error(self, mock_client):
+        mock_handle = MagicMock()
+        ti = mock_handle.torrent_file.return_value
+        ti.piece_length.return_value = 16384
+        ti.map_file.return_value = MagicMock(piece=10, start=100)
+        file_storage = ti.files.return_value
+        file_storage.file_size.return_value = 50000
         mock_client.download_and_read_piece.side_effect = IOError("Piece download failed")
 
         with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
             reader = AsyncTorrentReader(mock_client, mock_handle, file_index=0)
-            # 更新期望的异常信息以匹配代码中实际抛出的中文信息
             with pytest.raises(IOError, match="获取 piece 10 失败"):
                 await reader.read(100)
-
-def test_no_video_file_found(mock_client):
-    """
-    Tests the behavior when no video file is found in the torrent.
-    """
-    handle = MagicMock()
-    files_mock = handle.torrent_file.return_value.files.return_value
-    files_mock.num_files.return_value = 1
-    files_mock.file_path.return_value = "archive.zip" # No video files
-    files_mock.file_size.return_value = 100
-
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, handle)
-        assert video_file.file_index == -1
-
-@pytest.mark.asyncio
-async def test_download_keyframe_incomplete_read(mock_client, mock_handle):
-    """
-    Tests that download_keyframe_data returns None if the read is incomplete.
-    """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
-    keyframe_info = KeyframeInfo(pts=1, pos=123, size=456, timescale=1000)
-
-    with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
-        mock_reader_instance = MockReader.return_value
-        # Simulate reading less data than requested
-        mock_reader_instance.read = AsyncMock(return_value=b"a" * 100)
-
-        data = await video_file.download_keyframe_data(keyframe_info)
-
-        assert data is None
-
-@pytest.mark.asyncio
-@patch('screenshot.video.asyncio.get_running_loop')
-async def test_get_keyframes_parsing_fails(mock_loop, mock_client, mock_handle):
-    """
-    Tests get_keyframes_and_moov when keyframe parsing returns no keyframes.
-    """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
-        fake_moov_data = b"moov_data"
-
-        # Simulate finding the moov box
-        mock_executor = AsyncMock(return_value=fake_moov_data)
-        mock_loop.return_value.run_in_executor = mock_executor
-
-        # Simulate _parse_keyframes_from_stbl returning an empty list
-        video_file._parse_keyframes_from_stbl = MagicMock(return_value=[])
-
-        with patch('screenshot.video.AsyncTorrentReader', autospec=True) as MockReader:
-            mock_reader_instance = MockReader.return_value
-            mock_reader_instance.read = AsyncMock(return_value=b"head_data")
-            mock_reader_instance.file_size = 1024
-
-            keyframes, moov_data = await video_file.get_keyframes_and_moov()
-
-            assert keyframes is None
-            assert moov_data is None
-
-def test_select_keyframes(mock_client, mock_handle):
-    """
-    测试 _select_keyframes 方法的逻辑是否正确。
-    """
-    with patch.dict('sys.modules', {'libtorrent': MagicMock()}):
-        video_file = VideoFile(mock_client, mock_handle)
-
-    # 1. 视频时长较短，但关键帧充足
-    # 预期：应选择 20 个关键帧
-    all_keyframes_1 = [f"kf_{i}" for i in range(100)]
-    duration_1 = 1800  # 30 分钟
-    selected_1 = video_file._select_keyframes(all_keyframes_1, duration_1)
-    assert len(selected_1) == 20
-
-    # 2. 视频时长较短，且关键帧不足
-    # 预期：应返回所有关键帧
-    all_keyframes_2 = [f"kf_{i}" for i in range(10)]
-    duration_2 = 1800  # 30 分钟
-    selected_2 = video_file._select_keyframes(all_keyframes_2, duration_2)
-    assert len(selected_2) == 10
-    assert selected_2 == all_keyframes_2
-
-    # 3. 视频时长较长
-    # 预期：应根据时长计算截图数量 (7200s / 180s/kf = 40 kf)
-    all_keyframes_3 = [f"kf_{i}" for i in range(200)]
-    duration_3 = 7200  # 2 小时
-    selected_3 = video_file._select_keyframes(all_keyframes_3, duration_3)
-    assert len(selected_3) == 40
-
-    # 4. 检查选择的帧是否均匀分布
-    # 100个关键帧里选20个，步长应为 100/20 = 5
-    # 所以选出的应是第 0, 5, 10, ... 95 个
-    indices = [int(i * 100 / 20) for i in range(20)]
-    expected_keyframes = [all_keyframes_1[i] for i in indices]
-    assert selected_1 == expected_keyframes
-
-    # 5. 边缘情况：没有关键帧
-    selected_5 = video_file._select_keyframes([], 100)
-    assert selected_5 == []

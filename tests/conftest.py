@@ -7,6 +7,9 @@ import struct
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
 MOOV_DAT_PATH = os.path.join(FIXTURE_DIR, 'moov.dat')
 
+from unittest.mock import MagicMock
+from screenshot.client import TorrentClient
+
 @pytest.fixture(scope="session")
 def moov_data():
     """
@@ -22,3 +25,33 @@ def moov_data():
 
     assert data is not None and len(data) > 0, f"测试失败：未能从 {MOOV_DAT_PATH} 文件中读取到有效数据。"
     return data
+
+@pytest.fixture
+def mock_client():
+    """Provides a mock TorrentClient."""
+    return MagicMock(spec=TorrentClient)
+
+@pytest.fixture
+def mock_handle():
+    """
+    Provides a mock libtorrent handle with an explicitly mocked file list.
+    """
+    handle = MagicMock()
+    files_mock = MagicMock()
+
+    # Create individual mock file entries
+    file1 = MagicMock(path="video1.mkv", size=100)
+    file2 = MagicMock(path="video2.mp4", size=200)
+    file3 = MagicMock(path="other.txt", size=50)
+
+    files_mock.num_files.return_value = 3
+    def file_path_side_effect(index):
+        return [file1.path, file2.path, file3.path][index]
+    def file_size_side_effect(index):
+        return [file1.size, file2.size, file3.size][index]
+
+    files_mock.file_path.side_effect = file_path_side_effect
+    files_mock.file_size.side_effect = file_size_side_effect
+
+    handle.torrent_file.return_value.files.return_value = files_mock
+    return handle

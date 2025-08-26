@@ -112,12 +112,14 @@ class VideoFile:
                     break
             return moov_data
 
+        self.log.debug(f"Probing for 'moov' box in the first {PROBE_SIZE} bytes.")
         reader.seek(0)
         head_data = await reader.read(min(PROBE_SIZE, file_size))
         moov_data = await find_moov_in_data(head_data)
 
         if not moov_data and file_size > PROBE_SIZE:
             seek_pos = max(0, file_size - PROBE_SIZE)
+            self.log.debug(f"Probing for 'moov' box in the last {PROBE_SIZE} bytes (from position {seek_pos}).")
             reader.seek(seek_pos)
             tail_data = await reader.read(PROBE_SIZE)
             moov_sig_pos = tail_data.find(b'moov')
@@ -191,7 +193,7 @@ class VideoFile:
                 current_chunk_offset += sample_size
                 current_sample_in_chunk += 1
         except StopIteration:
-            self.log.warning("在计算样本偏移量时，块偏移或 STSC 数据提前结束。")
+            self.log.warning("Incomplete MP4 metadata: Reached end of 'stco' or 'stsc' box data prematurely. Keyframe list may be incomplete.")
             pass
 
         mdhd = F4VParser.find_child_box(moov_box, ['trak', 'mdia', 'mdhd'])
@@ -211,12 +213,42 @@ class VideoFile:
         duration = tkhd.duration if tkhd else sum(c * d for c, d in stts.entries)
         duration_sec = duration / timescale
 
-        # Selection logic
-        num_screenshots = 20
+        # --- Keyframe Selection Logic ---
+        # Aim for one screenshot every 3 minutes (180 seconds), with a minimum of 5 and a maximum of 50.
+        MIN_SCREENSHOTS = 5
+        MAX_SCREENSHOTS = 50
+        TARGET_INTERVAL_SEC = 180
+
+        if duration_sec > 0:
+            num_screenshots = int(duration_sec / TARGET_INTERVAL_SEC)
+            num_screenshots = max(MIN_SCREENSHOTS, num_screenshots)
+            num_screenshots = min(MAX_SCREENSHOTS, num_screenshots)
+        else:
+            # Fallback for cases where duration is unknown
+            num_screenshots = 20
+
+        # If we have fewer keyframes than desired screenshots, just take all of them.
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
-        indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
-        return [all_keyframes[i] for i in indices]
+
+        # To avoid intro/outro frames, we select keyframes from the 10% to 90% mark of the video.
+        start_index = int(len(all_keyframes) * 0.1)
+        end_index = int(len(all_keyframes) * 0.9)
+
+        # Ensure we have a valid range
+        if start_index >= end_index:
+            return all_keyframes[1:-1] if len(all_keyframes) > 2 else all_keyframes
+
+        selectable_keyframes = all_keyframes[start_index:end_index]
+
+        # If the selectable range is smaller than our target, just return them.
+        if len(selectable_keyframes) <= num_screenshots:
+            return selectable_keyframes
+
+        # Select evenly spaced keyframes from the selectable range
+        indices = [int(i * len(selectable_keyframes) / num_screenshots) for i in range(num_screenshots)]
+
+        return [selectable_keyframes[i] for i in sorted(list(set(indices)))]
 
     async def download_keyframe_data(self, keyframe_info):
         reader = self.create_reader()

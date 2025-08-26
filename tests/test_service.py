@@ -56,7 +56,7 @@ async def test_handle_task_invalid_handle(service_instance):
         await service_instance._handle_screenshot_task({'infohash': fake_infohash})
 
         # Assert that an error was logged and the function exited early
-        mock_log_error.assert_called_once_with(f"无法为 {fake_infohash} 获取有效的 torrent 句柄。")
+        mock_log_error.assert_called_once_with(f"Could not get a valid torrent handle for {fake_infohash}.")
         # The generator's generate method should not have been called
         mock_generate.assert_not_called()
 
@@ -78,69 +78,71 @@ def test_stop_service(service_instance):
     service_instance.client.stop.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_handle_task_no_video_file():
+@patch('screenshot.service.VideoFile')
+async def test_generate_screenshots_no_video_file(MockVideoFile, service_instance):
     """
     Tests handling of a torrent with no video file.
     """
-    with patch('screenshot.service.TorrentClient', autospec=True) as MockClient, \
-         patch('screenshot.service.VideoFile', autospec=True) as MockVideoFile, \
-         patch('screenshot.service.ScreenshotGenerator', autospec=True):
+    mock_video_file_instance = MockVideoFile.return_value
+    mock_video_file_instance.file_index = -1
+    mock_handle = MagicMock()
+    infohash_hex = 'c' * 40
 
-        service = ScreenshotService(loop=MagicMock())
-        service.client.add_torrent = AsyncMock(return_value=MagicMock())
-
-        # Simulate no video file found
-        mock_video_file_instance = MockVideoFile.return_value
-        mock_video_file_instance.file_index = -1
-
-        with patch.object(service.log, 'warning') as mock_log_warning:
-            await service._handle_screenshot_task({'infohash': 'c' * 40})
-            mock_log_warning.assert_called_once()
-            args, _ = mock_log_warning.call_args
-            assert "中未找到视频文件" in args[0]
+    with patch.object(service_instance.log, 'warning') as mock_log_warning:
+        await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
+        mock_log_warning.assert_called_once_with(f"No video file found in torrent {infohash_hex}.")
 
 @pytest.mark.asyncio
-async def test_handle_task_no_keyframes():
+@patch('screenshot.service.VideoFile')
+async def test_generate_screenshots_no_decoder_config(MockVideoFile, service_instance):
+    """
+    Tests handling of a video file where SPS/PPS cannot be extracted.
+    """
+    mock_video_file_instance = MockVideoFile.return_value
+    mock_video_file_instance.file_index = 0
+    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(None, None))
+    mock_handle = MagicMock()
+    infohash_hex = 'd' * 40
+
+    with patch.object(service_instance.log, 'error') as mock_log_error:
+        await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
+        mock_log_error.assert_called_once_with(f"Could not extract SPS/PPS from {infohash_hex}. Assuming not H.264 or file is corrupt.")
+
+@pytest.mark.asyncio
+@patch('screenshot.service.VideoFile')
+async def test_generate_screenshots_no_keyframes(MockVideoFile, service_instance):
     """
     Tests handling of a video file where keyframes cannot be extracted.
     """
-    with patch('screenshot.service.TorrentClient', autospec=True) as MockClient, \
-         patch('screenshot.service.VideoFile', autospec=True) as MockVideoFile, \
-         patch('screenshot.service.ScreenshotGenerator', autospec=True):
+    mock_video_file_instance = MockVideoFile.return_value
+    mock_video_file_instance.file_index = 0
+    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(b'sps', b'pps'))
+    mock_video_file_instance.get_keyframes = AsyncMock(return_value=[]) # No keyframes
+    mock_handle = MagicMock()
+    infohash_hex = 'e' * 40
 
-        service = ScreenshotService(loop=MagicMock())
-        service.client.add_torrent = AsyncMock(return_value=MagicMock())
-
-        mock_video_file_instance = MockVideoFile.return_value
-        mock_video_file_instance.file_index = 0
-        # Simulate failure to get keyframes
-        mock_video_file_instance.get_keyframes_and_moov = AsyncMock(return_value=(None, None))
-
-        with patch.object(service.log, 'error') as mock_log_error:
-            await service._handle_screenshot_task({'infohash': 'd' * 40})
-            mock_log_error.assert_called_once_with("无法为 dddddddddddddddddddddddddddddddddddddddd 提取关键帧或 moov_data。")
+    with patch.object(service_instance.log, 'error') as mock_log_error:
+        await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
+        mock_log_error.assert_called_once_with(f"Could not extract keyframes from {infohash_hex}.")
 
 @pytest.mark.asyncio
-async def test_handle_task_keyframe_download_fails():
+@patch('screenshot.service.VideoFile')
+async def test_generate_screenshots_keyframe_download_fails(MockVideoFile, service_instance):
     """
     Tests the case where a single keyframe download fails.
-    The service should log a warning and continue.
+    The service should log a warning and continue without calling the generator for that frame.
     """
-    with patch('screenshot.service.TorrentClient', autospec=True), \
-         patch('screenshot.service.VideoFile', autospec=True) as MockVideoFile, \
-         patch('screenshot.service.ScreenshotGenerator', autospec=True) as MockGenerator:
+    mock_video_file_instance = MockVideoFile.return_value
+    mock_video_file_instance.file_index = 0
+    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(b'sps', b'pps'))
+    kf_info = KeyframeInfo(pts=123, pos=1, size=2, timescale=1000)
+    mock_video_file_instance.get_keyframes = AsyncMock(return_value=[kf_info])
+    mock_video_file_instance.download_keyframe_data = AsyncMock(return_value=None) # Download fails
+    mock_handle = MagicMock()
+    infohash_hex = 'f' * 40
 
-        service = ScreenshotService(loop=MagicMock())
-        service.client.add_torrent = AsyncMock(return_value=MagicMock())
-
-        mock_video_file_instance = MockVideoFile.return_value
-        mock_video_file_instance.file_index = 0
-        kf_info = KeyframeInfo(1,2,3,1000)
-        mock_video_file_instance.get_keyframes_and_moov = AsyncMock(return_value=([kf_info], b'moov'))
-        # Simulate download failure
-        mock_video_file_instance.download_keyframe_data = AsyncMock(return_value=None)
-
-        with patch.object(service.log, 'warning') as mock_log_warning:
-            await service._handle_screenshot_task({'infohash': 'e' * 40})
-            mock_log_warning.assert_called_once_with(f"因下载失败，跳过帧 (PTS: {kf_info.pts})。")
-            service.generator.generate.assert_not_called()
+    service_instance.generator.generate = AsyncMock()
+    with patch.object(service_instance.log, 'warning') as mock_log_warning:
+        await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
+        mock_log_warning.assert_called_once_with(f"Skipping frame (PTS: {kf_info.pts}) due to download failure.")
+        service_instance.generator.generate.assert_not_called()

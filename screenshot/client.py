@@ -77,14 +77,14 @@ class TorrentClient:
 
         handle = self.ses.add_torrent(params)
 
-        # DHT 引导可能需要很长时间，而且对于通过磁力链接中的跟踪器获取元数据来说，
-        # 这不是严格必需的。移除阻塞等待，以提高在困难网络环境中的鲁棒性。
-        # self.log.debug("等待 DHT 引导...")
-        # try:
-        #     await asyncio.wait_for(self.dht_ready.wait(), timeout=90)
-        # except asyncio.TimeoutError:
-        #     self.log.error("DHT 引导超时。")
-        #     raise LibtorrentError("DHT bootstrap timed out")
+        # Wait for DHT to bootstrap, but with a timeout. This helps with trackerless torrents
+        # without blocking indefinitely.
+        self.log.debug("Waiting for DHT bootstrap...")
+        try:
+            await asyncio.wait_for(self.dht_ready.wait(), timeout=30)
+            self.log.info("DHT bootstrap successful.")
+        except asyncio.TimeoutError:
+            self.log.warning("DHT bootstrap timed out, proceeding without it.")
 
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:
@@ -104,31 +104,36 @@ class TorrentClient:
             self.ses.remove_torrent(handle, lt.session.delete_files)
             self.log.info(f"已移除 torrent: {infohash}")
 
-    async def download_and_read_piece(self, handle, piece_index):
-        """异步下载并读取单个 piece。"""
-        if not handle.have_piece(piece_index):
-            self.log.debug(f"Piece {piece_index}: 不可用，设置为高优先级并等待下载。")
-            handle.piece_priority(piece_index, 7)
-            future = self.loop.create_future()
-            self.piece_download_futures[piece_index].append(future)
+    async def download_and_read_piece(self, handle, piece_index, timeout=120.0):
+        """
+        Asynchronously downloads and reads a single piece with a total timeout.
+        """
+        async def _download_and_read():
+            if not handle.have_piece(piece_index):
+                self.log.debug(f"Piece {piece_index}: Not available, setting high priority and waiting for download.")
+                handle.piece_priority(piece_index, 7)
+                download_future = self.loop.create_future()
+                self.piece_download_futures[piece_index].append(download_future)
+                await download_future
+                # No need to check have_piece again, if the future resolved, it's downloaded.
 
-            try:
-                await asyncio.wait_for(future, timeout=60.0)
-            except asyncio.TimeoutError:
-                self.log.error(f"Piece {piece_index}: 等待下载超时。")
-                if not handle.have_piece(piece_index):
-                    raise LibtorrentError("Piece 下载超时且 piece 仍然不可用。")
-
-        read_future = self.loop.create_future()
-        with self.pending_reads_lock:
-            self.pending_reads[piece_index].append(read_future)
-        handle.read_piece(piece_index)
+            read_future = self.loop.create_future()
+            with self.pending_reads_lock:
+                self.pending_reads[piece_index].append(read_future)
+            handle.read_piece(piece_index)
+            return await read_future
 
         try:
-            return await asyncio.wait_for(read_future, timeout=60.0)
+            return await asyncio.wait_for(_download_and_read(), timeout=timeout)
         except asyncio.TimeoutError:
-            self.log.error(f"Piece {piece_index}: 读取操作超时。")
-            raise LibtorrentError("Piece 读取超时。")
+            # Clean up futures to prevent memory leaks
+            self.piece_download_futures.pop(piece_index, None)
+            with self.pending_reads_lock:
+                self.pending_reads.pop(piece_index, None)
+
+            error_msg = f"Timeout occurred while downloading or reading piece {piece_index}."
+            self.log.error(error_msg)
+            raise LibtorrentError(error_msg)
 
     def _handle_metadata_received(self, alert):
         """处理接收到元数据的警报。"""
