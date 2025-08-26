@@ -3,8 +3,8 @@ import pytest
 import os
 import struct
 
-# 定义测试视频文件的路径
-TEST_VIDEO_PATH = os.path.join(os.path.dirname(__file__), 'Big_Buck_Bunny_720_10s_10MB.mp4')
+# 定义测试视频文件的路径，使用新下载的视频
+TEST_VIDEO_PATH = os.path.join(os.path.dirname(__file__), 'test_video.mp4')
 
 def find_box_data(file_path, box_type_str):
     """

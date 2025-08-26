@@ -235,10 +235,31 @@ class VideoFile:
         duration = tkhd.duration if tkhd else sum(c * d for c, d in stts.entries)
         duration_sec = duration / timescale
 
+        return self._select_keyframes(all_keyframes, duration_sec)
+
+    def _select_keyframes(self, all_keyframes, duration_sec):
+        """
+        根据视频时长和关键帧总数，从所有关键帧中均匀选取一部分。
+
+        :param all_keyframes: 包含所有关键帧信息的列表。
+        :param duration_sec: 视频的总时长（秒）。
+        :return: 经过筛选的关键帧列表。
+        """
+        if not all_keyframes:
+            return []
+
         # 根据视频时长决定截图数量
+        # 如果视频时长小于等于1小时（3600秒），则最多选择20张截图
+        # 如果视频时长超过1小时，则大约每3分钟（180秒）选择一张截图
         num_screenshots = 20 if duration_sec <= 3600 else int(duration_sec / 180)
+
+        # 如果总关键帧数小于等于期望的截图数，则返回所有关键帧
+        if len(all_keyframes) <= num_screenshots:
+            return all_keyframes
+
         # 从所有关键帧中均匀选取指定数量的样本
-        selected_keyframes = all_keyframes if len(all_keyframes) <= num_screenshots else \
-                             [all_keyframes[int(i * len(all_keyframes) / num_screenshots)] for i in range(num_screenshots)]
+        # 这是一种简单的采样算法，确保截图在整个视频中均匀分布
+        indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
+        selected_keyframes = [all_keyframes[i] for i in indices]
 
         return selected_keyframes

@@ -44,7 +44,7 @@ def test_save_frame_to_jpeg(mock_makedirs):
 @patch('logging.getLogger')
 async def test_generate_success(mock_get_logger):
     """
-    Tests the generate method's success path.
+    测试 generate 方法的成功路径。
     """
     mock_log = mock_get_logger.return_value
     loop = asyncio.get_running_loop()
@@ -59,3 +59,63 @@ async def test_generate_success(mock_get_logger):
 
     mock_image.save.assert_called_once()
     assert mock_log.exception.call_count == 0
+
+@pytest.mark.asyncio
+@patch('logging.getLogger')
+async def test_generate_av_open_fails(mock_get_logger):
+    """
+    测试当 av.open 失败时（例如，由于数据损坏），异常会被记录。
+    """
+    mock_log = mock_get_logger.return_value
+    loop = asyncio.get_running_loop()
+    generator = ScreenshotGenerator(loop=loop)
+
+    # 模拟 av.open 调用时抛出异常
+    av_mock.AVError = type('AVError', (Exception,), {}) # 创建一个模拟的 AVError
+    av_mock.open.side_effect = av_mock.AVError("Invalid data")
+
+    await generator.generate(b'moov', b'keyframe', MagicMock(), 'infohash', 'ts_av_error')
+
+    # 验证 .exception() 方法被调用，表示错误已被记录
+    mock_log.exception.assert_called_once()
+
+@pytest.mark.asyncio
+@patch('logging.getLogger')
+async def test_generate_no_frames_decoded(mock_get_logger):
+    """
+    测试当视频流中没有可解码的帧时，异常会被记录。
+    """
+    mock_log = mock_get_logger.return_value
+    loop = asyncio.get_running_loop()
+    generator = ScreenshotGenerator(loop=loop)
+
+    # 模拟 container.decode 返回一个空迭代器
+    mock_container = av_mock.open.return_value.__enter__.return_value
+    mock_container.decode.return_value = iter([])
+
+    await generator.generate(b'moov', b'keyframe', MagicMock(), 'infohash', 'ts_no_frames')
+
+    # 验证 .exception() 方法被调用
+    mock_log.exception.assert_called_once()
+
+@pytest.mark.asyncio
+@patch('logging.getLogger')
+async def test_generate_save_fails(mock_get_logger):
+    """
+    测试当保存 JPG 文件失败时，异常会被记录。
+    """
+    mock_log = mock_get_logger.return_value
+    loop = asyncio.get_running_loop()
+    generator = ScreenshotGenerator(loop=loop)
+
+    # 模拟解码成功，但保存失败
+    mock_frame = MagicMock()
+    mock_container = av_mock.open.return_value.__enter__.return_value
+    mock_container.decode.return_value = iter([mock_frame])
+
+    # 在实例上 patch _save_frame_to_jpeg 方法，使其抛出 IOError
+    with patch.object(generator, '_save_frame_to_jpeg', side_effect=IOError("Disk full")):
+        await generator.generate(b'moov', b'keyframe', MagicMock(), 'infohash', 'ts_save_error')
+
+        # 验证 .exception() 方法被调用
+        mock_log.exception.assert_called_once()

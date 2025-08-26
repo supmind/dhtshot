@@ -10,8 +10,25 @@ from screenshot.service import ScreenshotService
 # 使用公开的、有源的 Sintel 种子进行测试
 SINTEL_INFOHASH = "08ada5a7a6183aae1e09d831df6748d566095a10"
 TEST_OUTPUT_DIR = "./screenshots_output_test"
-# 增加超时时间，因为网络测试依赖于寻源和下载
-TEST_TIMEOUT = 180
+# 定义一个更合理的超时时间
+TEST_TIMEOUT = 60 # 秒
+
+async def wait_for_screenshots(output_dir, infohash, timeout):
+    """
+    一个辅助函数，用于轮询输出目录，等待截图文件的出现。
+    这比固定的 sleep 更健壮、更高效。
+    """
+    start_time = asyncio.get_event_loop().time()
+    while True:
+        output_files = glob.glob(os.path.join(output_dir, f"{infohash}_*.jpg"))
+        if output_files:
+            print(f"\n在 {asyncio.get_event_loop().time() - start_time:.2f} 秒后找到截图。")
+            return output_files
+
+        if asyncio.get_event_loop().time() - start_time > timeout:
+            raise asyncio.TimeoutError(f"在 {timeout} 秒内未找到截图文件。")
+
+        await asyncio.sleep(1) # 每秒轮询一次
 
 @pytest.mark.asyncio
 async def test_full_screenshot_process_network():
@@ -44,22 +61,16 @@ async def test_full_screenshot_process_network():
         await service.submit_task(infohash=SINTEL_INFOHASH)
 
         # --- 3. 等待任务完成 ---
-        # 这是一个简化的等待逻辑。我们等待固定时间，期望服务能在这段时间内
-        # 完成元数据下载、部分 piece 下载和截图。
-        # 一个更健壮的测试可能会轮询输出目录或检查服务内部状态。
-        print(f"\n等待 {TEST_TIMEOUT} 秒，让服务处理任务...")
-        await asyncio.sleep(TEST_TIMEOUT)
-
-        # 检查任务队列是否已空
-        # 注意：由于我们只有一个任务，并且服务可能仍在运行其他后台活动，
-        # 所以 task_queue 可能不是判断完成的完美指标，但可以作为参考。
-        assert service.task_queue.empty(), "任务队列在超时后仍未清空"
+        # 使用新的轮询函数代替固定的 sleep，以提高测试的稳定性和效率
+        try:
+            print(f"\n在最多 {TEST_TIMEOUT} 秒内等待截图生成...")
+            output_files = await wait_for_screenshots(TEST_OUTPUT_DIR, SINTEL_INFOHASH, TEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            pytest.fail(f"测试超时：在 {TEST_TIMEOUT} 秒内未能生成任何截图文件。")
 
         # --- 4. 断言结果 ---
-        output_files = glob.glob(os.path.join(TEST_OUTPUT_DIR, f"{SINTEL_INFOHASH}_*.jpg"))
         print(f"在 {TEST_OUTPUT_DIR} 中找到的截图文件: {output_files}")
-
-        assert len(output_files) > 0, "服务在指定时间内未能生成任何截图文件"
+        assert len(output_files) > 0, "即使 wait_for_screenshots 成功，仍然没有找到文件，这不应该发生"
 
         # 检查第一个文件是否有效
         first_file = output_files[0]

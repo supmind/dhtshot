@@ -69,7 +69,8 @@ class TorrentClient:
         ]
         magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
         params = lt.parse_magnet_uri(magnet_uri)
-        params['save_path'] = save_dir
+        # 为 add_torrent_params 对象设置 save_path 属性，而不是通过字典赋值
+        params.save_path = save_dir
 
         handle = self.ses.add_torrent(params)
 
