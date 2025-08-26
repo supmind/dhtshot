@@ -201,8 +201,15 @@ class F4VParser(object):
             except (bitstring.ReadError, ValueError) as e:
                 # 如果解析过程中出错，记录错误并跳过这个 Box
                 log.warning(f"解析 Box '{box_type_str}' 失败: {e}。正在跳过。")
-                # 将流的位置移动到当前 Box 的末尾，继续解析下一个 Box
-                bs.bytepos = header.start_offset + header.header_size + header.box_size
+                # 为了安全恢复，计算下一个 box 的起始位置
+                next_box_pos = header.start_offset + header.header_size + header.box_size
+                # 只有在下一个位置在流的范围内时才进行跳转
+                if next_box_pos * 8 < bs.len:
+                    bs.bytepos = next_box_pos
+                else:
+                    # 如果下一个位置超出范围，说明无法安全恢复，终止解析
+                    log.warning(f"无法安全地恢复解析，因为下一个 box 的位置 ({next_box_pos}) 超出范围。")
+                    break
                 continue
 
     @staticmethod

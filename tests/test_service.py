@@ -13,13 +13,6 @@ def service_instance():
     """Provides a ScreenshotService instance with a mock loop."""
     return ScreenshotService(loop=MagicMock())
 
-@pytest.mark.skip(reason="This test requires a valid moov_data fixture, which is currently broken due to missing test files.")
-def test_create_minimal_mp4(service_instance):
-    """
-    Tests _create_minimal_mp4 function's ability to assemble a valid MP4 file.
-    """
-    pass
-
 @pytest.mark.asyncio
 async def test_service_orchestration_flow(service_instance):
     """
@@ -72,3 +65,23 @@ async def test_service_orchestration_flow(service_instance):
         assert kwargs['keyframe_data'] == fake_keyframe_data
 
         mock_client_instance.remove_torrent.assert_called_once_with(mock_handle)
+
+@pytest.mark.asyncio
+async def test_handle_task_invalid_handle(service_instance):
+    """
+    Tests that the service correctly handles a case where it receives an
+    invalid torrent handle from the client.
+    """
+    fake_infohash = "b" * 40
+    # Mock the client to return an invalid handle
+    service_instance.client.add_torrent = AsyncMock(return_value=None)
+
+    # Mock the logger to check if an error was logged
+    with patch.object(service_instance.log, 'error') as mock_log_error, \
+         patch.object(service_instance.generator, 'generate') as mock_generate:
+        await service_instance._handle_screenshot_task({'infohash': fake_infohash})
+
+        # Assert that an error was logged and the function exited early
+        mock_log_error.assert_called_once_with(f"无法为 {fake_infohash} 获取有效的 torrent 句柄。")
+        # The generator's generate method should not have been called
+        mock_generate.assert_not_called()

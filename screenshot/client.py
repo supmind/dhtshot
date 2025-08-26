@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-This module contains the TorrentClient class, which is responsible for
-all direct interactions with the libtorrent library.
+该模块包含 TorrentClient 类，它负责所有与 libtorrent 库的直接交互。
 """
 import asyncio
 import logging
@@ -11,13 +10,20 @@ from collections import defaultdict
 from concurrent.futures import Future
 
 class LibtorrentError(Exception):
-    """Custom exception to clearly pass specific errors from the libtorrent core."""
-    def __init__(self, error_code):
-        self.error_code = error_code
-        super().__init__(f"Libtorrent error: {error_code.message()}")
+    """自定义异常，用于清晰地传递来自 libtorrent 核心的特定错误。"""
+    def __init__(self, error_code_or_message):
+        if hasattr(error_code_or_message, 'message'):
+            # It's a libtorrent error code object
+            self.error_code = error_code_or_message
+            message = self.error_code.message()
+        else:
+            # It's a simple string message
+            self.error_code = None
+            message = str(error_code_or_message)
+        super().__init__(f"Libtorrent 错误: {message}")
 
 class TorrentClient:
-    """A wrapper around a libtorrent session to handle torrenting operations."""
+    """一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。"""
     def __init__(self, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
@@ -36,23 +42,23 @@ class TorrentClient:
         self.piece_download_futures = defaultdict(list)
 
     async def start(self):
-        """Starts the torrent client's alert loop."""
-        self.log.info("Starting TorrentClient...")
+        """启动 torrent 客户端的警报循环。"""
+        self.log.info("正在启动 TorrentClient...")
         self._running = True
         self.alert_task = self.loop.create_task(self._alert_loop())
-        self.log.info("TorrentClient started.")
+        self.log.info("TorrentClient 已启动。")
 
     def stop(self):
-        """Stops the torrent client's alert loop."""
-        self.log.info("Stopping TorrentClient...")
+        """停止 torrent 客户端的警报循环。"""
+        self.log.info("正在停止 TorrentClient...")
         self._running = False
         if self.alert_task:
             self.alert_task.cancel()
-        self.log.info("TorrentClient stopped.")
+        self.log.info("TorrentClient 已停止。")
 
     async def add_torrent(self, infohash: str):
-        """Adds a torrent via infohash and returns the handle once metadata is received."""
-        self.log.info(f"Adding torrent for infohash: {infohash}")
+        """通过 infohash 添加 torrent，并在收到元数据后返回句柄。"""
+        self.log.info(f"正在为 infohash 添加 torrent: {infohash}")
         save_dir = f"/dev/shm/{infohash}"
 
         meta_future = self.loop.create_future()
@@ -68,23 +74,23 @@ class TorrentClient:
         handle = self.ses.add_torrent(params)
 
         await self.dht_ready.wait()
-        self.log.debug(f"Waiting for metadata for {infohash}...")
+        self.log.debug(f"正在等待 {infohash} 的元数据...")
         handle = await asyncio.wait_for(meta_future, timeout=180)
 
         return handle
 
     def remove_torrent(self, handle):
-        """Removes a torrent from the session."""
+        """从会话中移除一个 torrent。"""
         if handle and handle.is_valid():
             infohash = str(handle.info_hash())
             self.pending_metadata.pop(infohash, None)
             self.ses.remove_torrent(handle, lt.session.delete_files)
-            self.log.info(f"Removed torrent: {infohash}")
+            self.log.info(f"已移除 torrent: {infohash}")
 
     async def download_and_read_piece(self, handle, piece_index):
-        """Asynchronously downloads and reads a single piece."""
+        """异步下载并读取单个 piece。"""
         if not handle.have_piece(piece_index):
-            self.log.debug(f"Piece {piece_index}: Not available, setting high priority and waiting for download.")
+            self.log.debug(f"Piece {piece_index}: 不可用，设置为高优先级并等待下载。")
             handle.piece_priority(piece_index, 7)
             future = self.loop.create_future()
             self.piece_download_futures[piece_index].append(future)
@@ -92,9 +98,9 @@ class TorrentClient:
             try:
                 await asyncio.wait_for(future, timeout=60.0)
             except asyncio.TimeoutError:
-                self.log.error(f"Piece {piece_index}: Timed out waiting for download.")
+                self.log.error(f"Piece {piece_index}: 等待下载超时。")
                 if not handle.have_piece(piece_index):
-                    raise LibtorrentError("Piece download timed out and piece not available.")
+                    raise LibtorrentError("Piece 下载超时且 piece 仍然不可用。")
 
         read_future = self.loop.create_future()
         with self.pending_reads_lock:
@@ -104,23 +110,27 @@ class TorrentClient:
         try:
             return await asyncio.wait_for(read_future, timeout=60.0)
         except asyncio.TimeoutError:
-            self.log.error(f"Piece {piece_index}: Read operation timed out.")
-            raise LibtorrentError("Piece read timed out.")
+            self.log.error(f"Piece {piece_index}: 读取操作超时。")
+            raise LibtorrentError("Piece 读取超时。")
 
     def _handle_metadata_received(self, alert):
+        """处理接收到元数据的警报。"""
         infohash_str = str(alert.handle.info_hash())
         if infohash_str in self.pending_metadata and not self.pending_metadata[infohash_str].done():
             self.pending_metadata[infohash_str].set_result(alert.handle)
 
     def _handle_piece_finished(self, alert):
+        """处理 piece 下载完成的警报。"""
         futures = self.piece_download_futures.pop(alert.piece_index, [])
         for future in futures:
             if not future.done(): future.set_result(True)
 
     def _handle_dht_bootstrap(self, alert):
+        """处理 DHT 引导完成的警报。"""
         if not self.dht_ready.is_set(): self.dht_ready.set()
 
     def _handle_read_piece(self, alert):
+        """处理 piece 读取完成的警报。"""
         with self.pending_reads_lock:
             futures = self.pending_reads.pop(alert.piece, [])
         if alert.error and alert.error.value() != 0:
@@ -133,13 +143,13 @@ class TorrentClient:
             if not future.done(): future.set_result(data)
 
     async def _alert_loop(self):
-        """The main alert processing loop for the libtorrent session."""
+        """libtorrent 会话的主警报处理循环。"""
         while self._running:
             try:
                 alerts = self.ses.pop_alerts()
                 for alert in alerts:
-                    if alert.category() & lt.alert_category.error: self.log.error(f"Libtorrent Alert: {alert}")
-                    else: self.log.debug(f"Libtorrent Alert: {alert}")
+                    if alert.category() & lt.alert_category.error: self.log.error(f"Libtorrent 警报: {alert}")
+                    else: self.log.debug(f"Libtorrent 警报: {alert}")
                     if isinstance(alert, lt.metadata_received_alert): self._handle_metadata_received(alert)
                     elif isinstance(alert, lt.piece_finished_alert): self._handle_piece_finished(alert)
                     elif isinstance(alert, lt.read_piece_alert): self._handle_read_piece(alert)
@@ -148,4 +158,4 @@ class TorrentClient:
             except asyncio.CancelledError:
                 break
             except Exception:
-                self.log.exception("Error in libtorrent alert loop.")
+                self.log.exception("libtorrent 警报循环中发生错误。")
