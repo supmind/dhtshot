@@ -75,7 +75,12 @@ class TorrentClient:
 
         await self.dht_ready.wait()
         self.log.debug(f"正在等待 {infohash} 的元数据...")
-        handle = await asyncio.wait_for(meta_future, timeout=180)
+        try:
+            handle = await asyncio.wait_for(meta_future, timeout=180)
+        except asyncio.TimeoutError:
+            self.log.error(f"为 {infohash} 获取元数据超时。")
+            self.pending_metadata.pop(infohash, None)
+            raise
 
         return handle
 

@@ -48,9 +48,10 @@ async def test_add_torrent_success():
     assert returned_handle == mock_handle
 
 @pytest.mark.asyncio
-async def test_add_torrent_timeout():
+@patch('screenshot.client.asyncio.wait_for')
+async def test_add_torrent_timeout(mock_wait_for):
     """
-    Tests that add_torrent correctly times out if metadata is not received.
+    Tests that add_torrent correctly times out and cleans up.
     """
     # --- Setup ---
     loop = asyncio.get_running_loop()
@@ -60,11 +61,15 @@ async def test_add_torrent_timeout():
     mock_handle.info_hash.return_value = fake_infohash
     client.ses.add_torrent.return_value = mock_handle
 
+    # Configure the mock to simulate a timeout
+    mock_wait_for.side_effect = asyncio.TimeoutError
+
     # --- Execute & Assert ---
     with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(client.add_torrent(fake_infohash), timeout=0.1)
+        await client.add_torrent(fake_infohash)
 
-    assert fake_infohash in client.pending_metadata
+    # After a timeout, the pending metadata for that infohash should be cleaned up.
+    assert fake_infohash not in client.pending_metadata
 
 @pytest.mark.asyncio
 async def test_handle_piece_finished():
