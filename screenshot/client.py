@@ -77,11 +77,14 @@ class TorrentClient:
 
         handle = self.ses.add_torrent(params)
 
-        try:
-            await asyncio.wait_for(self.dht_ready.wait(), timeout=90)
-        except asyncio.TimeoutError:
-            self.log.error("DHT 引导超时。")
-            raise LibtorrentError("DHT bootstrap timed out")
+        # DHT 引导可能需要很长时间，而且对于通过磁力链接中的跟踪器获取元数据来说，
+        # 这不是严格必需的。移除阻塞等待，以提高在困难网络环境中的鲁棒性。
+        # self.log.debug("等待 DHT 引导...")
+        # try:
+        #     await asyncio.wait_for(self.dht_ready.wait(), timeout=90)
+        # except asyncio.TimeoutError:
+        #     self.log.error("DHT 引导超时。")
+        #     raise LibtorrentError("DHT bootstrap timed out")
 
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:

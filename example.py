@@ -6,12 +6,12 @@ from screenshot import ScreenshotService
 
 # Configure logging to see the output from the service
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# Set the service log level to INFO to reduce verbosity
-logging.getLogger("ScreenshotService").setLevel(logging.INFO)
+# Set the service log level to DEBUG to see all messages
+logging.getLogger("ScreenshotService").setLevel(logging.DEBUG)
 
 
 async def main():
