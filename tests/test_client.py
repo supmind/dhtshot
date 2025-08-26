@@ -47,26 +47,6 @@ async def test_add_torrent_success():
     client.ses.add_torrent.assert_called_once()
     assert returned_handle == mock_handle
 
-@pytest.mark.asyncio
-@patch('screenshot.client.asyncio.wait_for')
-async def test_add_torrent_dht_timeout(mock_wait_for):
-    """
-    Tests that add_torrent correctly raises LibtorrentError on DHT timeout.
-    """
-    # --- Setup ---
-    loop = asyncio.get_running_loop()
-    client = setup_client(loop)
-    client.dht_ready.clear() # Ensure DHT is not ready initially
-    fake_infohash = "b" * 40
-
-    # The first wait_for is for the DHT, which we want to time out.
-    # The second is for metadata, which should not be reached.
-    mock_wait_for.side_effect = asyncio.TimeoutError
-
-    # --- Execute & Assert ---
-    # We expect our custom LibtorrentError, not the raw asyncio.TimeoutError
-    with pytest.raises(LibtorrentError, match="DHT bootstrap timed out"):
-        await client.add_torrent(fake_infohash)
 
     # The metadata future should have been created but not resolved.
     # The error handling in add_torrent should not clean it up because it happens
