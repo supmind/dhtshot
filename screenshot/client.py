@@ -85,9 +85,6 @@ class TorrentClient:
         magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
         params = lt.parse_magnet_uri(magnet_uri)
         params.save_path = save_dir
-        # Start with all pieces downloaded so we can manually select them
-        params.flags |= lt.torrent_flags.seed_mode
-
         handle = self.ses.add_torrent(params)
 
         self.log.debug("Waiting for DHT bootstrap...")
