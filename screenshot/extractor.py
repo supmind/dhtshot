@@ -51,10 +51,12 @@ class H264KeyframeExtractor:
     def _parse_boxes(self, stream: BinaryIO) -> Generator[Tuple[str, BytesIO], None, None]:
         """同步解析一个流中的所有 box。"""
         while True:
+            current_offset = stream.tell()
             header_data = stream.read(8)
             if not header_data or len(header_data) < 8: break
             size, box_type_bytes = struct.unpack('>I4s', header_data)
             box_type = box_type_bytes.decode('ascii', 'ignore')
+            log.debug(f"在偏移量 {current_offset} 处找到 Box '{box_type}'，大小为 {size}")
             header_size = 8
             if size == 1:
                 size_64_data = stream.read(8)
