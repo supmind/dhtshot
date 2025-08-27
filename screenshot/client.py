@@ -104,6 +104,13 @@ class TorrentClient:
             self.pending_metadata.pop(infohash, None)
             raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
 
+        # After getting metadata, set all pieces to priority 0
+        ti = handle.get_torrent_info()
+        if ti:
+            self.log.info(f"为 {infohash} 设置所有 piece 优先级为 0。")
+            for i in range(ti.num_pieces()):
+                handle.piece_priority(i, 0)
+
         return handle
 
     def remove_torrent(self, handle):
@@ -124,12 +131,10 @@ class TorrentClient:
 
         if pieces_to_download:
             self.log.info(f"需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
-            # Set priorities: high for wanted, none for others.
-            # Note: This is a simple strategy. In a multi-task client, we'd need more complex priority management.
-            priorities = [0] * handle.get_torrent_info().num_pieces()
+            # Set priorities for the pieces we want to download.
+            self.log.info(f"为 pieces {pieces_to_download} 设置高优先级。")
             for p in pieces_to_download:
-                priorities[p] = 7
-            handle.prioritize_pieces(priorities)
+                handle.piece_priority(p, 7)  # 7 is the highest priority
             handle.resume()
 
             # Create a future to wait for all pieces in this batch to download
