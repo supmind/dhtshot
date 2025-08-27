@@ -3,10 +3,9 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from screenshot.service import ScreenshotService, KeyframeInfo
-from screenshot.client import TorrentClient
-from screenshot.video import VideoFile
-from screenshot.generator import ScreenshotGenerator
+from screenshot.service import ScreenshotService
+from screenshot.extractor import Keyframe
+
 
 @pytest.fixture
 def service_instance():
@@ -94,29 +93,12 @@ async def test_generate_screenshots_no_video_file(MockVideoFile, service_instanc
 
 @pytest.mark.asyncio
 @patch('screenshot.service.VideoFile')
-async def test_generate_screenshots_no_decoder_config(MockVideoFile, service_instance):
-    """
-    Tests handling of a video file where SPS/PPS cannot be extracted.
-    """
-    mock_video_file_instance = MockVideoFile.return_value
-    mock_video_file_instance.file_index = 0
-    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(None, None))
-    mock_handle = MagicMock()
-    infohash_hex = 'd' * 40
-
-    with patch.object(service_instance.log, 'error') as mock_log_error:
-        await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
-        mock_log_error.assert_called_once_with(f"Could not extract SPS/PPS from {infohash_hex}. Assuming not H.264 or file is corrupt.")
-
-@pytest.mark.asyncio
-@patch('screenshot.service.VideoFile')
 async def test_generate_screenshots_no_keyframes(MockVideoFile, service_instance):
     """
     Tests handling of a video file where keyframes cannot be extracted.
     """
     mock_video_file_instance = MockVideoFile.return_value
     mock_video_file_instance.file_index = 0
-    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(b'sps', b'pps'))
     mock_video_file_instance.get_keyframes = AsyncMock(return_value=[]) # No keyframes
     mock_handle = MagicMock()
     infohash_hex = 'e' * 40
@@ -134,9 +116,9 @@ async def test_generate_screenshots_keyframe_download_fails(MockVideoFile, servi
     """
     mock_video_file_instance = MockVideoFile.return_value
     mock_video_file_instance.file_index = 0
-    mock_video_file_instance.get_decoder_config = AsyncMock(return_value=(b'sps', b'pps'))
-    kf_info = KeyframeInfo(pts=123, pos=1, size=2, timescale=1000)
-    mock_video_file_instance.get_keyframes = AsyncMock(return_value=[kf_info])
+    # The new Keyframe object includes an index for the keyframe list
+    kf = Keyframe(index=0, sample_index=1, pts=123, timescale=1000)
+    mock_video_file_instance.get_keyframes = AsyncMock(return_value=[kf])
     mock_video_file_instance.download_keyframe_data = AsyncMock(return_value=None) # Download fails
     mock_handle = MagicMock()
     infohash_hex = 'f' * 40
@@ -144,5 +126,5 @@ async def test_generate_screenshots_keyframe_download_fails(MockVideoFile, servi
     service_instance.generator.generate = AsyncMock()
     with patch.object(service_instance.log, 'warning') as mock_log_warning:
         await service_instance._generate_screenshots_from_torrent(mock_handle, infohash_hex)
-        mock_log_warning.assert_called_once_with(f"Skipping frame (PTS: {kf_info.pts}) due to download failure.")
+        mock_log_warning.assert_called_once_with(f"Skipping frame (PTS: {kf.pts}) due to download failure.")
         service_instance.generator.generate.assert_not_called()

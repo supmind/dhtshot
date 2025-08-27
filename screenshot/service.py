@@ -7,9 +7,6 @@ from .client import TorrentClient
 from .video import VideoFile
 from .generator import ScreenshotGenerator
 
-# This is defined here because the service is the main entry point,
-# but it's used by the VideoFile to create the info objects.
-KeyframeInfo = namedtuple('KeyframeInfo', ['pts', 'pos', 'size', 'timescale'])
 
 class ScreenshotService:
     """
@@ -56,13 +53,7 @@ class ScreenshotService:
             self.log.warning(f"No video file found in torrent {infohash_hex}.")
             return
 
-        # 1. Get decoder configuration (SPS/PPS for H.264)
-        sps, pps = await video_file.get_decoder_config()
-        if not sps or not pps:
-            self.log.error(f"Could not extract SPS/PPS from {infohash_hex}. Assuming not H.264 or file is corrupt.")
-            return
-
-        # 2. Get the list of keyframes to screenshot
+        # 1. Get the list of keyframes to screenshot
         keyframes = await video_file.get_keyframes()
         if not keyframes:
             self.log.error(f"Could not extract keyframes from {infohash_hex}.")
@@ -71,24 +62,28 @@ class ScreenshotService:
         self.log.info(f"Found {len(keyframes)} keyframes to process for {infohash_hex}.")
 
         decode_tasks = []
-        for keyframe_info in keyframes:
-            # 3. Download the data for each keyframe
-            keyframe_data = await video_file.download_keyframe_data(keyframe_info)
-            if not keyframe_data:
-                self.log.warning(f"Skipping frame (PTS: {keyframe_info.pts}) due to download failure.")
+        for keyframe in keyframes:
+            # 2. Download the data for each keyframe
+            packet_info = await video_file.download_keyframe_data(keyframe.index)
+            if not packet_info:
+                self.log.warning(f"Skipping frame (PTS: {keyframe.pts}) due to download failure.")
                 continue
 
-            # 4. Calculate timestamp string for the filename
-            ts_sec = keyframe_info.pts / keyframe_info.timescale
-            m, s = divmod(ts_sec, 60)
-            h, m = divmod(m, 60)
-            timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+            extradata, packet_data = packet_info
 
-            # 5. Call the generator with the required data
+            # 3. Calculate timestamp string for the filename
+            if keyframe.timescale > 0:
+                ts_sec = keyframe.pts / keyframe.timescale
+                m, s = divmod(ts_sec, 60)
+                h, m = divmod(m, 60)
+                timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+            else:
+                timestamp_str = f"keyframe_{keyframe.index}"
+
+            # 4. Call the generator with the required data
             task = self.generator.generate(
-                sps=sps,
-                pps=pps,
-                keyframe_data=keyframe_data,
+                extradata=extradata,
+                packet_data=packet_data,
                 infohash_hex=infohash_hex,
                 timestamp_str=timestamp_str
             )

@@ -2,7 +2,7 @@
 """
 Screenshot Service Package
 """
-from .service import ScreenshotService, KeyframeInfo
+from .service import ScreenshotService
 
 # Define what gets imported with a 'from screenshot import *'
-__all__ = ['ScreenshotService', 'KeyframeInfo']
+__all__ = ['ScreenshotService']

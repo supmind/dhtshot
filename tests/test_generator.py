@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import pytest
-import asyncio
+import av as real_av
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from screenshot.generator import ScreenshotGenerator
@@ -31,73 +31,99 @@ def test_save_frame_to_jpeg(mock_av, mock_makedirs, generator):
 @patch('screenshot.generator.av')
 async def test_generate_calls_executor(mock_av, generator):
     """
-    Tests that the main `generate` method correctly builds the stream
-    and calls the executor with the `_decode_and_save` method.
+    Tests that the main `generate` method calls the executor with the correct data.
     """
     generator.loop.run_in_executor = AsyncMock()
 
     await generator.generate(
-        sps=b'sps', pps=b'pps', keyframe_data=b'keyframe',
+        extradata=b'extra', packet_data=b'packet',
         infohash_hex='infohash', timestamp_str='ts'
     )
 
-    expected_stream = b'\x00\x00\x00\x01sps\x00\x00\x00\x01pps\x00\x00\x00\x01keyframe'
-
     generator.loop.run_in_executor.assert_awaited_once_with(
-        None, generator._decode_and_save, expected_stream, 'infohash', 'ts'
+        None, generator._decode_and_save, b'extra', b'packet', 'infohash', 'ts'
     )
 
 @patch('screenshot.generator.av')
-def test_decode_and_save_success(mock_av, generator):
+def test_decode_and_save_success_with_extradata(mock_av, generator):
     """
-    Tests the success path of the synchronous `_decode_and_save` method.
+    Tests the success path of `_decode_and_save` when extradata is provided.
     """
     mock_codec_ctx = mock_av.CodecContext.create.return_value
-    mock_packet = MagicMock()
-    mock_codec_ctx.parse.return_value = [mock_packet]
+    mock_frame = MagicMock()
+    mock_codec_ctx.decode.return_value = [mock_frame]
+    mock_packet_instance = mock_av.Packet.return_value
+
+    with patch.object(generator, '_save_frame_to_jpeg') as mock_save:
+        generator._decode_and_save(b'extradata', b'packetdata', 'infohash', 'ts')
+
+        mock_av.CodecContext.create.assert_called_once_with('h264', 'r')
+        assert mock_codec_ctx.extradata == b'extradata'
+        mock_av.Packet.assert_called_once_with(b'packetdata')
+        mock_codec_ctx.decode.assert_called_once_with(mock_packet_instance)
+        mock_save.assert_called_once_with(mock_frame, 'infohash', 'ts')
+
+@patch('screenshot.generator.av')
+def test_decode_and_save_success_no_extradata(mock_av, generator):
+    """
+    Tests the success path of `_decode_and_save` when no extradata is provided.
+    """
+    mock_codec_ctx = mock_av.CodecContext.create.return_value
     mock_frame = MagicMock()
     mock_codec_ctx.decode.return_value = [mock_frame]
 
     with patch.object(generator, '_save_frame_to_jpeg') as mock_save:
-        generator._decode_and_save(b'stream', 'infohash', 'ts')
-
-        mock_av.CodecContext.create.assert_called_once_with('h264', 'r')
-        mock_codec_ctx.parse.assert_called_once_with(b'stream')
-        mock_codec_ctx.decode.assert_called_once_with(mock_packet)
+        generator._decode_and_save(None, b'packetdata', 'infohash', 'ts')
+        # The 'extradata' attribute is not set on the mock codec context
+        mock_codec_ctx.decode.assert_called_once()
         mock_save.assert_called_once_with(mock_frame, 'infohash', 'ts')
 
 @patch('screenshot.generator.av')
-def test_decode_and_save_parsing_fails(mock_av, generator):
+def test_decode_and_save_decoding_fails_with_flush(mock_av, generator):
     """
-    Tests that a warning is logged if parsing the stream fails.
-    """
-    mock_codec_ctx = mock_av.CodecContext.create.return_value
-    mock_codec_ctx.parse.return_value = [] # Simulate no packets found
-
-    with patch.object(generator.log, 'warning') as mock_log_warning:
-        generator._decode_and_save(b'stream', 'infohash', 'ts')
-        mock_log_warning.assert_called_once_with("无法从时间戳 ts 的码流中解析出数据包。")
-
-@patch('screenshot.generator.av')
-def test_decode_and_save_decoding_fails(mock_av, generator):
-    """
-    Tests that a warning is logged if decoding the packet fails.
+    Tests that a warning is logged and flush is attempted if decoding fails.
     """
     mock_codec_ctx = mock_av.CodecContext.create.return_value
-    mock_packet = MagicMock()
-    mock_codec_ctx.parse.return_value = [mock_packet]
-    mock_codec_ctx.decode.return_value = [] # Simulate no frames decoded
+    mock_packet = mock_av.Packet.return_value
+    # First decode returns nothing, second (flush) returns a frame
+    mock_codec_ctx.decode.side_effect = [[], [MagicMock()]]
 
-    with patch.object(generator.log, 'warning') as mock_log_warning:
-        generator._decode_and_save(b'stream', 'infohash', 'ts')
-        mock_log_warning.assert_called_once_with("无法从时间戳 ts 的数据包中解码出帧。")
+    with patch.object(generator.log, 'warning') as mock_log_warning, \
+         patch.object(generator, '_save_frame_to_jpeg') as mock_save:
+        generator._decode_and_save(None, b'packet', 'infohash', 'ts')
+
+        mock_log_warning.assert_called_once_with("第一次解码未返回帧，尝试发送一个空的刷新包...")
+        assert mock_codec_ctx.decode.call_count == 2
+        mock_codec_ctx.decode.assert_any_call(mock_packet)
+        mock_codec_ctx.decode.assert_any_call(None)
+        mock_save.assert_called_once()
 
 @patch('screenshot.generator.av')
-def test_decode_and_save_generic_exception(mock_av, generator):
+def test_decode_and_save_decoding_fails_completely(mock_av, generator):
     """
-    Tests that a generic exception during the sync operation is caught, logged and re-raised.
+    Tests that an error is logged if both decoding and flushing fail.
     """
-    mock_av.CodecContext.create.side_effect = ValueError("Test AV Error")
+    mock_codec_ctx = mock_av.CodecContext.create.return_value
+    mock_codec_ctx.decode.side_effect = [[], []] # Both calls return nothing
 
-    with pytest.raises(ValueError, match="Test AV Error"):
-        generator._decode_and_save(b'stream', 'infohash', 'ts')
+    with patch.object(generator.log, 'error') as mock_log_error, \
+         patch.object(generator, '_save_frame_to_jpeg') as mock_save:
+        generator._decode_and_save(None, b'packet', 'infohash', 'ts')
+        mock_log_error.assert_called_once_with("解码失败：解码器未能从时间戳 ts 的数据包中解码出任何帧。")
+        mock_save.assert_not_called()
+
+@patch('screenshot.generator.av')
+def test_decode_and_save_invalid_data_error(mock_av, generator):
+    """
+    Tests that a specific pyav error is caught and logged.
+    """
+    # Make the mock use the real av.error module so that the exception
+    # type is caught correctly.
+    mock_av.error = real_av.error
+    mock_codec_ctx = mock_av.CodecContext.create.return_value
+    mock_codec_ctx.decode.side_effect = real_av.error.InvalidDataError(1, "Invalid data")
+
+    with patch.object(generator.log, 'error') as mock_log_error:
+        generator._decode_and_save(None, b'packet', 'infohash', 'ts')
+        mock_log_error.assert_called_once()
+        assert "解码器报告无效数据" in mock_log_error.call_args[0][0]
