@@ -122,10 +122,29 @@ class VideoFile:
             self.log.debug(f"Probing for 'moov' box in the last {PROBE_SIZE} bytes (from position {seek_pos}).")
             reader.seek(seek_pos)
             tail_data = await reader.read(PROBE_SIZE)
-            moov_sig_pos = tail_data.find(b'moov')
+
+            # Use rfind to find the last occurrence of 'moov', as it's likely at the end of the file.
+            moov_sig_pos = tail_data.rfind(b'moov')
+
             if moov_sig_pos != -1 and moov_sig_pos >= 4:
                 box_start_pos = moov_sig_pos - 4
-                moov_data = await find_moov_in_data(tail_data[box_start_pos:])
+
+                # Perform a basic validation by checking the box size.
+                try:
+                    # Read the 4-byte size from before the 'moov' signature.
+                    box_size = struct.unpack('>I', tail_data[box_start_pos:moov_sig_pos])[0]
+
+                    # A plausible box should have a size that is at least 8 (for the header)
+                    # and should not extend beyond the bounds of the data we have.
+                    if box_size >= 8 and (box_start_pos + box_size) <= len(tail_data):
+                        # This seems like a valid 'moov' box. Attempt to parse it from this slice.
+                        moov_data_slice = tail_data[box_start_pos:]
+                        moov_data = await find_moov_in_data(moov_data_slice)
+                except struct.error:
+                    # If struct.unpack fails, it's not a valid box.
+                    # We can ignore this and moov_data will remain None.
+                    self.log.debug("Found a 'moov' signature, but the size field was invalid.")
+                    pass
 
         if moov_data:
             self._moov_box = next(F4VParser.parse(bytes_input=moov_data))
