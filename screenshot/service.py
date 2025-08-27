@@ -46,52 +46,52 @@ class ScreenshotService:
         await self.task_queue.put({'infohash': infohash})
         self.log.info(f"Submitted new task for infohash: {infohash}")
 
+    def _get_pieces_for_range(self, offset_in_torrent, size, piece_length):
+        """Calculates piece indices for a given byte range in the torrent."""
+        if size <= 0: return []
+        start_piece = offset_in_torrent // piece_length
+        end_piece = (offset_in_torrent + size - 1) // piece_length
+        return list(range(start_piece, end_piece + 1))
+
+    def _assemble_data_from_pieces(self, pieces_data, offset_in_torrent, size, piece_length):
+        """Assembles a byte range from a dictionary of piece data."""
+        buffer = bytearray(size)
+        buffer_offset = 0
+
+        start_piece = offset_in_torrent // piece_length
+        end_piece = (offset_in_torrent + size - 1) // piece_length
+
+        for piece_index in range(start_piece, end_piece + 1):
+            if piece_index not in pieces_data: continue
+
+            piece_data = pieces_data[piece_index]
+
+            # Determine the slice of the piece to use
+            copy_from_start = 0
+            if piece_index == start_piece:
+                copy_from_start = offset_in_torrent % piece_length
+
+            copy_to_end = piece_length
+            if piece_index == end_piece:
+                copy_to_end = (offset_in_torrent + size - 1) % piece_length + 1
+
+            chunk = piece_data[copy_from_start:copy_to_end]
+
+            # Determine where to place the chunk in the buffer
+            bytes_to_copy = len(chunk)
+            if (buffer_offset + bytes_to_copy) > size:
+                bytes_to_copy = size - buffer_offset
+
+            if bytes_to_copy > 0:
+                buffer[buffer_offset : buffer_offset + bytes_to_copy] = chunk[:bytes_to_copy]
+                buffer_offset += bytes_to_copy
+
+        return bytes(buffer)
+
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
         """Handles the detailed logic of generating screenshots for a given torrent."""
         ti = handle.get_torrent_info()
         piece_length = ti.piece_length()
-
-        def _get_pieces_for_range(offset_in_torrent, size):
-            """Calculates piece indices for a given byte range in the torrent."""
-            if size <= 0: return []
-            start_piece = offset_in_torrent // piece_length
-            end_piece = (offset_in_torrent + size - 1) // piece_length
-            return list(range(start_piece, end_piece + 1))
-
-        def _assemble_data_from_pieces(pieces_data, offset_in_torrent, size):
-            """Assembles a byte range from a dictionary of piece data."""
-            buffer = bytearray(size)
-            buffer_offset = 0
-
-            start_piece = offset_in_torrent // piece_length
-            end_piece = (offset_in_torrent + size - 1) // piece_length
-
-            for piece_index in range(start_piece, end_piece + 1):
-                if piece_index not in pieces_data: continue
-
-                piece_data = pieces_data[piece_index]
-                piece_start_in_torrent = piece_index * piece_length
-
-                # Determine the slice of the piece to use
-                copy_from_start = 0
-                if piece_index == start_piece:
-                    copy_from_start = offset_in_torrent % piece_length
-
-                copy_to_end = piece_length
-                if piece_index == end_piece:
-                    copy_to_end = (offset_in_torrent + size - 1) % piece_length + 1
-
-                chunk = piece_data[copy_from_start:copy_to_end]
-
-                # Determine where to place the chunk in the buffer
-                bytes_to_copy = len(chunk)
-                if (buffer_offset + bytes_to_copy) > size:
-                    bytes_to_copy = size - buffer_offset
-
-                buffer[buffer_offset : buffer_offset + bytes_to_copy] = chunk[:bytes_to_copy]
-                buffer_offset += bytes_to_copy
-
-            return bytes(buffer)
 
         # 1. Find the largest video file in the torrent
         video_file_index, video_file_size, video_file_offset = -1, -1, -1
@@ -112,12 +112,12 @@ class ScreenshotService:
 
         head_offset = video_file_offset
         head_size = min(PROBE_SIZE, video_file_size)
-        head_pieces = _get_pieces_for_range(head_offset, head_size)
+        head_pieces = self._get_pieces_for_range(head_offset, head_size, piece_length)
 
         tail_file_offset = max(0, video_file_size - PROBE_SIZE)
         tail_torrent_offset = video_file_offset + tail_file_offset
         tail_size = min(PROBE_SIZE, video_file_size - tail_file_offset)
-        tail_pieces = _get_pieces_for_range(tail_torrent_offset, tail_size)
+        tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
 
         moov_piece_indices = list(set(head_pieces + tail_pieces))
 
@@ -127,8 +127,8 @@ class ScreenshotService:
             self.log.error(f"Failed to fetch pieces for moov atom: {e}")
             return
 
-        head_data = _assemble_data_from_pieces(moov_pieces_data, head_offset, head_size)
-        tail_data = _assemble_data_from_pieces(moov_pieces_data, tail_torrent_offset, tail_size)
+        head_data = self._assemble_data_from_pieces(moov_pieces_data, head_offset, head_size, piece_length)
+        tail_data = self._assemble_data_from_pieces(moov_pieces_data, tail_torrent_offset, tail_size, piece_length)
 
         # Find moov atom in the assembled data
         moov_data = None
@@ -178,10 +178,10 @@ class ScreenshotService:
             try:
                 sample = extractor.samples[keyframe.sample_index - 1]
                 keyframe_torrent_offset = video_file_offset + sample.offset
-                keyframe_piece_indices = _get_pieces_for_range(keyframe_torrent_offset, sample.size)
+                keyframe_piece_indices = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
 
                 keyframe_pieces_data = await self.client.fetch_pieces(handle, keyframe_piece_indices)
-                packet_data_bytes = _assemble_data_from_pieces(keyframe_pieces_data, keyframe_torrent_offset, sample.size)
+                packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, keyframe_torrent_offset, sample.size, piece_length)
 
                 if len(packet_data_bytes) != sample.size:
                     self.log.warning(f"Incomplete data for keyframe {keyframe.index}, skipping.")
