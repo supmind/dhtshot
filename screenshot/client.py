@@ -148,9 +148,11 @@ class TorrentClient:
                 }
 
             try:
+                self.log.info(f"开始等待 pieces 下载: {pieces_to_download}")
                 await asyncio.wait_for(request_future, timeout=timeout)
+                self.log.info(f"成功等到 pieces: {pieces_to_download}")
             except asyncio.TimeoutError:
-                self.log.error(f"下载 pieces {pieces_to_download} 超时。")
+                self.log.error(f"等待 pieces {pieces_to_download} 超时。")
                 with self.fetch_lock: self.pending_fetches.pop(fetch_id, None)
                 raise LibtorrentError(f"下载 pieces {pieces_to_download} 超时。")
 
@@ -179,6 +181,7 @@ class TorrentClient:
 
     def _handle_piece_finished(self, alert):
         """处理 piece 下载完成的警报。"""
+        self.log.info(f"收到 piece 下载完成通知: piece #{alert.piece_index}")
         piece_index = alert.piece_index
         with self.fetch_lock:
             # Using list() to avoid issues with modifying dict during iteration

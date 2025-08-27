@@ -69,8 +69,11 @@ class TestFetchPieces:
 
         result = await client.fetch_pieces(mock_handle, [0, 1, 2])
 
-        # Check that priorities were set correctly (7 for 0 and 1, 0 for 2)
-        mock_handle.prioritize_pieces.assert_called_once_with([7, 7, 0])
+        from unittest.mock import call
+        # Check that priorities were set correctly for the pieces to be downloaded
+        calls = [call(0, 7), call(1, 7)]
+        mock_handle.piece_priority.assert_has_calls(calls, any_order=True)
+        assert mock_handle.piece_priority.call_count == 2
         assert result == {0: b'data0', 1: b'data1', 2: b'data2'}
 
     @pytest.mark.asyncio
