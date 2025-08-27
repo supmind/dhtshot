@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+import time
 import libtorrent as lt
 import threading
 from collections import defaultdict
@@ -44,6 +45,7 @@ class TorrentClient:
         self.pending_fetches = {}
         self.fetch_lock = threading.Lock()
         self.next_fetch_id = 0
+        self.last_dht_log_time = 0
 
     async def start(self):
         """启动 torrent 客户端的警报循环。"""
@@ -226,6 +228,13 @@ class TorrentClient:
                                     f"| 下载速度: {s.download_rate / 1000:.1f} kB/s "
                                     f"| 节点: {s.num_peers} ({s.num_seeds} 种子)"
                                 )
+
+                now = time.time()
+                if now - self.last_dht_log_time > 10:
+                    status = self.ses.status()
+                    self.log.info(f"DHT 状态: {status.dht_nodes} 个节点。")
+                    self.last_dht_log_time = now
+
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 break
