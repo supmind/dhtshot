@@ -142,7 +142,100 @@ class VideoFile:
             return avcC_box.sps_list[0], avcC_box.pps_list[0]
         return None, None
 
+    def _calculate_sample_info(self, sample_to_find, stts, stsc, chunk_offsets, stsz):
+        """
+        为一个样本（sample）计算其时间戳（timestamp）和文件偏移量（file offset）。
+        这是一个复杂的查找过程，需要解析多个MP4元数据表来精确计算一个样本的位置和时间。
+        这个函数是性能优化的核心，它避免了一次性加载所有样本信息。
+
+        :param sample_to_find: 要查找的样本序号（从1开始计数）。
+        :param stts: 解析后的 Time-to-Sample box ('stts')。
+        :param stsc: 解析后的 Sample-to-Chunk box ('stsc')。
+        :param chunk_offsets: 解析后的 Chunk-Offset box ('stco' 或 'co64') 的条目列表。
+        :param stsz: 解析后的 Sample-Size box ('stsz')。
+        :return: 一个包含 (timestamp, offset, size) 的元组，如果找不到则返回 (None, None, None)。
+        """
+        # 1. 计算时间戳 (pts)
+        sample_time = None
+        sample_count_so_far = 0
+        current_time = 0
+        for count, duration in stts.entries:
+            if sample_count_so_far + count >= sample_to_find:
+                # 目标样本在此时间段内
+                sample_time = current_time + (sample_to_find - sample_count_so_far - 1) * duration
+                break
+            sample_count_so_far += count
+            current_time += count * duration
+        if sample_time is None:
+            self.log.warning(f"无法为样本 {sample_to_find} 找到时间戳。")
+            return None, None, None
+
+        # 2. 计算文件偏移量 (pos)
+        sample_size = stsz.entries[sample_to_find - 1] if stsz.sample_size == 0 else stsz.sample_size
+
+        # 确定目标样本所在的区块 (chunk)
+        target_chunk_index = -1
+        samples_in_chunk = -1
+        first_sample_in_chunk = -1
+
+        stsc_entries = stsc.entries
+        current_sample = 1
+        for i, (first_chunk, num_samples, desc_id) in enumerate(stsc_entries):
+            is_last_stsc_entry = (i + 1 == len(stsc_entries))
+
+            if is_last_stsc_entry:
+                # 如果是最后一个stsc条目，它适用于所有剩余的区块
+                chunk_group_len = len(chunk_offsets) - first_chunk + 1
+            else:
+                next_first_chunk = stsc_entries[i+1][0]
+                chunk_group_len = next_first_chunk - first_chunk
+
+            num_samples_in_group = chunk_group_len * num_samples
+
+            if current_sample + num_samples_in_group > sample_to_find:
+                # 目标样本在此区块组中
+                chunk_offset_in_group = (sample_to_find - current_sample) // num_samples
+                target_chunk_index = first_chunk + chunk_offset_in_group - 1
+                samples_in_chunk = num_samples
+
+                # 计算此区块的第一个样本的序号
+                samples_before_this_group = current_sample - 1
+                samples_in_prev_chunks_of_group = chunk_offset_in_group * num_samples
+                first_sample_in_chunk = samples_before_this_group + samples_in_prev_chunks_of_group + 1
+                break
+
+            current_sample += num_samples_in_group
+
+        if target_chunk_index == -1:
+            self.log.warning(f"无法为样本 {sample_to_find} 找到对应的区块。")
+            return None, None, None
+
+        # 计算从区块开始到目标样本的偏移量
+        chunk_start_offset = chunk_offsets[target_chunk_index]
+        offset_within_chunk = 0
+
+        # 使用 stsz box 来累加此区块内、目标样本之前所有样本的大小
+        if stsz.sample_size == 0: # 如果每个样本大小不同
+            start_idx = first_sample_in_chunk - 1
+            end_idx = sample_to_find - 1
+            offset_within_chunk = sum(stsz.entries[i] for i in range(start_idx, end_idx))
+        else: # 如果所有样本大小相同
+            num_samples_before = sample_to_find - first_sample_in_chunk
+            offset_within_chunk = num_samples_before * stsz.sample_size
+
+        sample_offset = chunk_start_offset + offset_within_chunk
+
+        return sample_time, sample_offset, sample_size
+
     async def get_keyframes(self):
+        """
+        从视频文件中提取并筛选用于截图的关键帧信息。
+        此方法实现了性能优化的流程：
+        1. 解析 'moov' box 获取元数据。
+        2. 获取所有关键帧的样本序号。
+        3. 根据视频时长和设定的数量范围，对序号列表进行筛选。
+        4. 只为筛选后的关键帧，按需计算其精确的时间戳和文件偏移。
+        """
         from screenshot.service import KeyframeInfo
         moov_box = await self._get_moov_box()
         if not moov_box:
@@ -160,95 +253,61 @@ class VideoFile:
 
         if not all([stss, stts, stsc, stsz, (stco or co64)]): return []
 
-        keyframe_samples = stss.entries
-        chunk_offsets = stco.entries if stco else co64.entries
-        sample_sizes = stsz.entries if stsz.sample_size == 0 else [stsz.sample_size] * stsz.sample_count
+        # 1. 获取所有关键帧的样本序号
+        all_keyframe_samples = stss.entries
+        if not all_keyframe_samples:
+            return []
 
-        sample_timestamps = []
-        current_time = 0
-        for count, duration in stts.entries:
-            for _ in range(count):
-                sample_timestamps.append(current_time)
-                current_time += duration
-
-        sample_offsets = []
-        try:
-            stsc_entries_iter = iter(stsc.entries)
-            chunk_offsets_iter = iter(chunk_offsets)
-            current_stsc = next(stsc_entries_iter, None)
-            next_stsc = next(stsc_entries_iter, None)
-            current_chunk_num = 1
-            current_sample_in_chunk = 0
-            current_chunk_offset = next(chunk_offsets_iter)
-            for sample_size in sample_sizes:
-                if current_stsc and (next_stsc is None or current_chunk_num < next_stsc[0]):
-                    if current_sample_in_chunk >= current_stsc[1]:
-                        current_chunk_num += 1
-                        current_sample_in_chunk = 0
-                        current_chunk_offset = next(chunk_offsets_iter)
-                elif current_stsc and next_stsc and current_chunk_num >= next_stsc[0]:
-                    current_stsc = next_stsc
-                    next_stsc = next(stsc_entries_iter, None)
-                sample_offsets.append(current_chunk_offset)
-                current_chunk_offset += sample_size
-                current_sample_in_chunk += 1
-        except StopIteration:
-            self.log.warning("Incomplete MP4 metadata: Reached end of 'stco' or 'stsc' box data prematurely. Keyframe list may be incomplete.")
-            pass
-
+        # 2. 应用筛选逻辑来选择要处理的样本序号
         mdhd = F4VParser.find_child_box(moov_box, ['trak', 'mdia', 'mdhd'])
         timescale = mdhd.timescale if mdhd and mdhd.timescale > 0 else 1000
-
-        all_keyframes = []
-        for s_num in keyframe_samples:
-            idx = s_num - 1
-            if idx < len(sample_offsets) and idx < len(sample_timestamps) and idx < len(sample_sizes):
-                all_keyframes.append(KeyframeInfo(
-                    sample_timestamps[idx], sample_offsets[idx], sample_sizes[idx], timescale
-                ))
-
-        if not all_keyframes: return []
-
         tkhd = F4VParser.find_child_box(moov_box, ['trak', 'tkhd'])
         duration = tkhd.duration if tkhd else sum(c * d for c, d in stts.entries)
         duration_sec = duration / timescale
 
-        # --- Keyframe Selection Logic ---
-        # Aim for one screenshot every 3 minutes (180 seconds), with a minimum of 5 and a maximum of 50.
         MIN_SCREENSHOTS = 5
         MAX_SCREENSHOTS = 50
         TARGET_INTERVAL_SEC = 180
 
         if duration_sec > 0:
             num_screenshots = int(duration_sec / TARGET_INTERVAL_SEC)
-            num_screenshots = max(MIN_SCREENSHOTS, num_screenshots)
-            num_screenshots = min(MAX_SCREENSHOTS, num_screenshots)
+            num_screenshots = max(MIN_SCREENSHOTS, min(num_screenshots, MAX_SCREENSHOTS))
         else:
-            # Fallback for cases where duration is unknown
-            num_screenshots = 20
+            num_screenshots = 20 # 对于未知时长的视频，使用默认值
 
-        # If we have fewer keyframes than desired screenshots, just take all of them.
-        if len(all_keyframes) <= num_screenshots:
-            return all_keyframes
+        if len(all_keyframe_samples) <= num_screenshots:
+            selectable_samples = all_keyframe_samples
+        else:
+            # 在视频的 10% 到 90% 区间内选择
+            start_idx = int(len(all_keyframe_samples) * 0.1)
+            end_idx = int(len(all_keyframe_samples) * 0.9)
 
-        # To avoid intro/outro frames, we select keyframes from the 10% to 90% mark of the video.
-        start_index = int(len(all_keyframes) * 0.1)
-        end_index = int(len(all_keyframes) * 0.9)
+            if start_idx >= end_idx:
+                # 区间无效时，回退到使用所有关键帧（除去首尾）
+                selectable_samples = all_keyframe_samples[1:-1] if len(all_keyframe_samples) > 2 else all_keyframe_samples
+            else:
+                # 在有效区间内，均匀选取
+                candidate_samples = all_keyframe_samples[start_idx:end_idx]
+                if len(candidate_samples) <= num_screenshots:
+                    selectable_samples = candidate_samples
+                else:
+                    indices = [int(i * len(candidate_samples) / num_screenshots) for i in range(num_screenshots)]
+                    selectable_samples = [candidate_samples[i] for i in sorted(list(set(indices)))]
 
-        # Ensure we have a valid range
-        if start_index >= end_index:
-            return all_keyframes[1:-1] if len(all_keyframes) > 2 else all_keyframes
+        if not selectable_samples:
+            return []
 
-        selectable_keyframes = all_keyframes[start_index:end_index]
+        # 3. 只为筛选后的关键帧计算详细信息
+        selected_keyframes = []
+        chunk_offsets = stco.entries if stco else co64.entries
+        for s_num in selectable_samples:
+            pts, pos, size = self._calculate_sample_info(s_num, stts, stsc, chunk_offsets, stsz)
+            if all(v is not None for v in [pts, pos, size]):
+                selected_keyframes.append(KeyframeInfo(pts, pos, size, timescale))
+            else:
+                self.log.warning(f"无法计算样本 {s_num} 的完整信息，已跳过。")
 
-        # If the selectable range is smaller than our target, just return them.
-        if len(selectable_keyframes) <= num_screenshots:
-            return selectable_keyframes
-
-        # Select evenly spaced keyframes from the selectable range
-        indices = [int(i * len(selectable_keyframes) / num_screenshots) for i in range(num_screenshots)]
-
-        return [selectable_keyframes[i] for i in sorted(list(set(indices)))]
+        return selected_keyframes
 
     async def download_keyframe_data(self, keyframe_info):
         reader = self.create_reader()
