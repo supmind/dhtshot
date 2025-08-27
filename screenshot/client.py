@@ -85,6 +85,8 @@ class TorrentClient:
         magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
         params = lt.parse_magnet_uri(magnet_uri)
         params.save_path = save_dir
+        # Add the torrent in a paused state so we can set piece priorities before downloading.
+        params.flags |= lt.torrent_flags.paused
         handle = self.ses.add_torrent(params)
 
         self.log.debug("Waiting for DHT bootstrap...")
@@ -128,6 +130,7 @@ class TorrentClient:
             for p in pieces_to_download:
                 priorities[p] = 7
             handle.prioritize_pieces(priorities)
+            handle.resume()
 
             # Create a future to wait for all pieces in this batch to download
             request_future = self.loop.create_future()
