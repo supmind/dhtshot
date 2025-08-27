@@ -12,7 +12,7 @@ class ScreenshotService:
     """
     Orchestrates the screenshot generation process.
     """
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output'):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path='/dev/shm'):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
         self.output_dir = output_dir
@@ -20,7 +20,7 @@ class ScreenshotService:
         self.task_queue = asyncio.Queue()
         self.workers = []
         self._running = False
-        self.client = TorrentClient(loop=self.loop)
+        self.client = TorrentClient(loop=self.loop, save_path=torrent_save_path)
         self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.output_dir)
 
     async def run(self):

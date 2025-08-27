@@ -10,6 +10,7 @@ from screenshot.service import ScreenshotService
 # 使用公开的、有源的 Sintel 种子进行测试
 SINTEL_INFOHASH = "08ada5a7a6183aae1e09d831df6748d566095a10"
 TEST_OUTPUT_DIR = "./screenshots_output_test"
+TEST_DATA_DIR = "./torrent_data_test"
 # 定义一个更合理的超时时间
 TEST_TIMEOUT = 300 # 秒
 
@@ -30,7 +31,6 @@ async def wait_for_screenshots(output_dir, infohash, timeout):
 
         await asyncio.sleep(1) # 每秒轮询一次
 
-@pytest.mark.skip(reason="此测试依赖于真实的 P2P 网络连接，在受限的沙盒网络环境中无法稳定运行。")
 @pytest.mark.asyncio
 async def test_full_screenshot_process_network():
     """
@@ -39,21 +39,21 @@ async def test_full_screenshot_process_network():
     因此，它依赖于网络连接和种子的健康度。
     """
     # --- 1. 设置 ---
-    # 清理旧的测试输出
-    if os.path.exists(TEST_OUTPUT_DIR):
-        shutil.rmtree(TEST_OUTPUT_DIR)
-    os.makedirs(TEST_OUTPUT_DIR)
-
-    # 清理可能的旧下载数据
-    torrent_data_path = f"/dev/shm/{SINTEL_INFOHASH}"
-    if os.path.exists(torrent_data_path):
-        shutil.rmtree(torrent_data_path)
+    # 清理旧的测试输出和数据
+    for dir_path in [TEST_OUTPUT_DIR, TEST_DATA_DIR]:
+        if os.path.exists(dir_path):
+            shutil.rmtree(dir_path)
+        os.makedirs(dir_path)
 
     service = None
     try:
         # --- 2. 运行服务并提交任务 ---
         loop = asyncio.get_running_loop()
-        service = ScreenshotService(loop=loop, output_dir=TEST_OUTPUT_DIR)
+        service = ScreenshotService(
+            loop=loop,
+            output_dir=TEST_OUTPUT_DIR,
+            torrent_save_path=TEST_DATA_DIR
+        )
 
         # 在后台运行服务
         service_task = loop.create_task(service.run())
@@ -87,7 +87,6 @@ async def test_full_screenshot_process_network():
             await asyncio.sleep(1)
 
         # 再次清理，确保所有资源被释放
-        if os.path.exists(TEST_OUTPUT_DIR):
-            shutil.rmtree(TEST_OUTPUT_DIR)
-        if os.path.exists(torrent_data_path):
-            shutil.rmtree(torrent_data_path)
+        for dir_path in [TEST_OUTPUT_DIR, TEST_DATA_DIR]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)

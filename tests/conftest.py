@@ -8,7 +8,6 @@ FIXTURE_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
 MOOV_DAT_PATH = os.path.join(FIXTURE_DIR, 'moov.dat')
 
 from unittest.mock import MagicMock
-from screenshot.client import TorrentClient
 
 @pytest.fixture(scope="session")
 def moov_data():
@@ -29,6 +28,7 @@ def moov_data():
 @pytest.fixture
 def mock_client():
     """Provides a mock TorrentClient."""
+    from screenshot.client import TorrentClient
     return MagicMock(spec=TorrentClient)
 
 @pytest.fixture

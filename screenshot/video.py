@@ -135,7 +135,7 @@ class VideoFile:
 
         # Probe at the beginning
         self.log.debug(f"正在文件的开头 {PROBE_SIZE} 字节中探测 'moov' box。")
-        await reader.seek(0)
+        reader.seek(0)
         head_data = await reader.read(min(PROBE_SIZE, file_size))
         moov_data = await find_moov_in_chunk(head_data, 0)
         if moov_data:
@@ -145,7 +145,7 @@ class VideoFile:
         if file_size > PROBE_SIZE:
             seek_pos = max(0, file_size - PROBE_SIZE)
             self.log.debug(f"正在文件的末尾 {PROBE_SIZE} 字节中探测 'moov' box (从 {seek_pos} 开始)。")
-            await reader.seek(seek_pos)
+            reader.seek(seek_pos)
             tail_data = await reader.read(PROBE_SIZE)
             moov_data = await find_moov_in_chunk(tail_data, seek_pos)
             if moov_data:

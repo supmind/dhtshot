@@ -4,6 +4,7 @@
 """
 import asyncio
 import logging
+import os
 import libtorrent as lt
 import threading
 from collections import defaultdict
@@ -24,9 +25,10 @@ class LibtorrentError(Exception):
 
 class TorrentClient:
     """一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。"""
-    def __init__(self, loop=None):
+    def __init__(self, loop=None, save_path='/dev/shm'):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
+        self.save_path = save_path
         settings = {
             'listen_interfaces': '0.0.0.0:6881', 'enable_dht': True,
             'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage,
@@ -59,7 +61,7 @@ class TorrentClient:
     async def add_torrent(self, infohash: str):
         """通过 infohash 添加 torrent，并在收到元数据后返回句柄。"""
         self.log.info(f"正在为 infohash 添加 torrent: {infohash}")
-        save_dir = f"/dev/shm/{infohash}"
+        save_dir = os.path.join(self.save_path, infohash)
 
         meta_future = self.loop.create_future()
         self.pending_metadata[infohash] = meta_future
@@ -178,7 +180,15 @@ class TorrentClient:
                     elif isinstance(alert, lt.piece_finished_alert): self._handle_piece_finished(alert)
                     elif isinstance(alert, lt.read_piece_alert): self._handle_read_piece(alert)
                     elif isinstance(alert, lt.dht_bootstrap_alert): self._handle_dht_bootstrap(alert)
-                await asyncio.sleep(0.1)
+                    elif isinstance(alert, lt.state_update_alert):
+                        for s in alert.status:
+                            self.log.info(
+                                f"  状态更新 - {s.name}: {s.state_str} {s.progress * 100:.2f}% "
+                                f"| 下载速度: {s.download_rate / 1000:.1f} kB/s "
+                                f"| 上传速度: {s.upload_rate / 1000:.1f} kB/s "
+                                f"| 节点: {s.num_peers} ({s.num_seeds} 种子)"
+                            )
+                await asyncio.sleep(1) # Increase sleep time to avoid log spam
             except asyncio.CancelledError:
                 break
             except Exception:

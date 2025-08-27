@@ -3,13 +3,13 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from screenshot.service import ScreenshotService
 from screenshot.extractor import Keyframe
 
 
 @pytest.fixture
 def service_instance():
     """Provides a ScreenshotService instance with a mock loop."""
+    from screenshot.service import ScreenshotService
     return ScreenshotService(loop=MagicMock())
 
 @pytest.mark.asyncio
