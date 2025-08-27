@@ -104,7 +104,7 @@ class TorrentClient:
             self.ses.remove_torrent(handle, lt.session.delete_files)
             self.log.info(f"已移除 torrent: {infohash}")
 
-    async def download_and_read_piece(self, handle, piece_index, timeout=120.0):
+    async def download_and_read_piece(self, handle, piece_index, timeout=240.0):
         """
         Asynchronously downloads and reads a single piece with a total timeout.
         """

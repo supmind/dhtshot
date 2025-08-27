@@ -102,14 +102,17 @@ class VideoFile:
         file_size = reader.file_size
 
         async def find_moov_in_data(data):
-            # ... (omitted for brevity, assume a simple find)
             moov_data = None
             stream = io.BytesIO(data)
-            for box in F4VParser.parse(bytes_input=data):
-                if box.header.box_type == 'moov':
-                    stream.seek(box.header.start_offset)
-                    moov_data = stream.read(box.header.box_size + box.header.header_size)
-                    break
+            try:
+                for box in F4VParser.parse(bytes_input=data):
+                    if box.header.box_type == 'moov':
+                        stream.seek(box.header.start_offset)
+                        moov_data = stream.read(box.header.box_size + box.header.header_size)
+                        break
+            except Exception:
+                self.log.exception("F4VParser.parse failed inside find_moov_in_data")
+                return None
             return moov_data
 
         self.log.debug(f"Probing for 'moov' box in the first {PROBE_SIZE} bytes.")
@@ -123,27 +126,35 @@ class VideoFile:
             reader.seek(seek_pos)
             tail_data = await reader.read(PROBE_SIZE)
 
-            # Use rfind to find the last occurrence of 'moov', as it's likely at the end of the file.
+            # Use rfind to find the last occurrence of 'moov' and then validate it.
             moov_sig_pos = tail_data.rfind(b'moov')
 
             if moov_sig_pos != -1 and moov_sig_pos >= 4:
                 box_start_pos = moov_sig_pos - 4
-
-                # Perform a basic validation by checking the box size.
                 try:
-                    # Read the 4-byte size from before the 'moov' signature.
                     box_size = struct.unpack('>I', tail_data[box_start_pos:moov_sig_pos])[0]
 
-                    # A plausible box should have a size that is at least 8 (for the header)
-                    # and should not extend beyond the bounds of the data we have.
-                    if box_size >= 8 and (box_start_pos + box_size) <= len(tail_data):
-                        # This seems like a valid 'moov' box. Attempt to parse it from this slice.
+                    # Stricter validation:
+                    # 1. Check if the box size is plausible.
+                    # 2. Check for the 'mvhd' signature which should be right after the 'moov' header.
+                    moov_header_size = 8
+                    mvhd_header_size = 8
+
+                    # The 'mvhd' box should start immediately after the 'moov' header.
+                    mvhd_box_start = box_start_pos + moov_header_size
+                    mvhd_sig_pos = mvhd_box_start + 4 # 4 bytes for mvhd box size
+
+                    if (box_size >= (moov_header_size + mvhd_header_size) and
+                        (box_start_pos + box_size) <= len(tail_data) and
+                        (mvhd_sig_pos + 4) <= len(tail_data) and
+                        tail_data[mvhd_sig_pos : mvhd_sig_pos + 4] == b'mvhd'):
+
+                        # This is very likely a real 'moov' box.
                         moov_data_slice = tail_data[box_start_pos:]
                         moov_data = await find_moov_in_data(moov_data_slice)
-                except struct.error:
-                    # If struct.unpack fails, it's not a valid box.
-                    # We can ignore this and moov_data will remain None.
-                    self.log.debug("Found a 'moov' signature, but the size field was invalid.")
+
+                except (struct.error, IndexError):
+                    self.log.debug("Found a 'moov' signature, but it failed validation.")
                     pass
 
         if moov_data:
