@@ -30,12 +30,16 @@ class TorrentClient:
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
         self.save_path = save_path
+        self.ses = lt.session()
         settings = {
-            'listen_interfaces': '0.0.0.0:6881', 'enable_dht': True,
+            'listen_interfaces': '0.0.0.0:6881',
+            'enable_dht': True,
             'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage,
             'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
+            'user_agent': 'qBittorrent/4.5.2',
+            'peer_fingerprint': 'qB4520',
         }
-        self.ses = lt.session(settings)
+        self.ses.apply_settings(settings)
         self.alert_task = None
         self._running = False
         self.dht_ready = asyncio.Event()

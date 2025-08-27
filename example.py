@@ -28,7 +28,7 @@ async def main():
     # Submit a few screenshot tasks to the service.
     # The user should replace these with real infohashes and desired timestamps.
     # Sintel - an open-source movie torrent
-    infohash_to_submit = "92e65594b02476083ba0007cc079dbe82767b067"
+    infohash_to_submit = "08ada5a7a6183aae1e09d831df6748d566095a10"
 
     await service.submit_task(infohash_to_submit)
 
