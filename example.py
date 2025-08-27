@@ -2,7 +2,7 @@ import asyncio
 import signal
 import logging
 
-from screenshot import ScreenshotService
+from screenshot.service import ScreenshotService
 
 # Configure logging to see the output from the service
 logging.basicConfig(
