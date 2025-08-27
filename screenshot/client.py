@@ -75,6 +75,8 @@ class TorrentClient:
             "udp://open.stealth.si:80/announce",
             "udp://exodus.desync.com:6969/announce",
             "udp://tracker.bittor.pw:1337/announce",
+            "http://sukebei.tracker.wf:8888/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
         ]
         magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
         params = lt.parse_magnet_uri(magnet_uri)
