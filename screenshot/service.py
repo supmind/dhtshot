@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import logging
-from collections import namedtuple
-
+import io
+import struct
 from .client import TorrentClient
-from .video import VideoFile
+from .extractor import H264KeyframeExtractor, Keyframe
 from .generator import ScreenshotGenerator
 
 
@@ -48,48 +48,135 @@ class ScreenshotService:
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
         """Handles the detailed logic of generating screenshots for a given torrent."""
-        video_file = VideoFile(self.client, handle)
-        if video_file.file_index == -1:
+        ti = handle.get_torrent_info()
+
+        # 1. Find the largest video file in the torrent
+        video_file_index, video_file_size = -1, -1
+        for i in range(ti.num_files()):
+            file_entry = ti.file_at(i)
+            if file_entry.path.lower().endswith(('.mp4', '.mkv', '.avi')) and file_entry.size > video_file_size:
+                video_file_size = file_entry.size
+                video_file_index = i
+
+        if video_file_index == -1:
             self.log.warning(f"No video file found in torrent {infohash_hex}.")
             return
 
-        # 1. Get the list of keyframes to screenshot
-        keyframes = await video_file.get_keyframes()
-        if not keyframes:
+        # 2. Phase 1: Fetch pieces for moov atom
+        self.log.info("Phase 1: Fetching pieces for moov atom.")
+        PROBE_SIZE = 2 * 1024 * 1024
+
+        # Calculate piece indices for head and tail
+        head_slices = ti.map_file(video_file_index, 0, min(PROBE_SIZE, video_file_size))
+        tail_offset = max(0, video_file_size - PROBE_SIZE)
+        tail_slices = ti.map_file(video_file_index, tail_offset, min(PROBE_SIZE, video_file_size - tail_offset))
+
+        moov_piece_indices = list(set([s.piece_index for s in head_slices] + [s.piece_index for s in tail_slices]))
+
+        try:
+            moov_pieces_data = await self.client.fetch_pieces(handle, moov_piece_indices)
+        except Exception as e:
+            self.log.error(f"Failed to fetch pieces for moov atom: {e}")
+            return
+
+        # Assemble head and tail data from pieces
+        def assemble_data(slices, pieces_data):
+            buffer = bytearray()
+            for s in slices:
+                if s.piece_index in pieces_data:
+                    piece_data = pieces_data[s.piece_index]
+                    buffer.extend(piece_data[s.start:s.start + s.size])
+            return bytes(buffer)
+
+        head_data = assemble_data(head_slices, moov_pieces_data)
+        tail_data = assemble_data(tail_slices, moov_pieces_data)
+
+        # Find moov atom in the assembled data
+        moov_data = None
+        # Simplified moov search, assuming it's in the tail first, then head
+        for chunk in [tail_data, head_data]:
+            pos = len(chunk)
+            while pos >= 8:
+                found_pos = chunk.rfind(b'moov', 0, pos)
+                if found_pos == -1: break
+                size_pos = found_pos - 4
+                if size_pos < 0:
+                    pos = found_pos
+                    continue
+                try:
+                    size = struct.unpack('>I', chunk[size_pos:found_pos])[0]
+                    if size >= 8 and (size_pos + size) <= len(chunk):
+                        moov_data = chunk[size_pos : size_pos + size]
+                        break
+                except struct.error: pass
+                pos = found_pos
+            if moov_data: break
+
+        if not moov_data:
+            self.log.error(f"Could not find moov atom for {infohash_hex}.")
+            return
+
+        # 3. Initialize extractor and select keyframes
+        extractor = H264KeyframeExtractor(moov_data)
+        all_keyframes = extractor.keyframes
+        if not all_keyframes:
             self.log.error(f"Could not extract keyframes from {infohash_hex}.")
             return
 
-        self.log.info(f"Found {len(keyframes)} keyframes to process for {infohash_hex}.")
+        # Frame selection logic (simplified from VideoFile)
+        MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
+        duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
+        num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
 
-        decode_tasks = []
-        for keyframe in keyframes:
-            # 2. Download the data for each keyframe
-            packet_info = await video_file.download_keyframe_data(keyframe.index)
-            if not packet_info:
-                self.log.warning(f"Skipping frame (PTS: {keyframe.pts}) due to download failure.")
-                continue
+        if len(all_keyframes) <= num_screenshots:
+            selected_keyframes = all_keyframes
+        else:
+            indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
+            selected_keyframes = [all_keyframes[i] for i in sorted(list(set(indices)))]
 
-            extradata, packet_data = packet_info
+        self.log.info(f"Found {len(selected_keyframes)} keyframes to process for {infohash_hex}.")
 
-            # 3. Calculate timestamp string for the filename
-            if keyframe.timescale > 0:
-                ts_sec = keyframe.pts / keyframe.timescale
+        # 4. Phase 2: Fetch pieces for each keyframe and generate screenshot
+        for keyframe in selected_keyframes:
+            try:
+                sample = extractor.samples[keyframe.sample_index - 1]
+                keyframe_slices = ti.map_file(video_file_index, sample.offset, sample.size)
+                keyframe_piece_indices = list(set([s.piece_index for s in keyframe_slices]))
+
+                keyframe_pieces_data = await self.client.fetch_pieces(handle, keyframe_piece_indices)
+
+                packet_data_bytes = assemble_data(keyframe_slices, keyframe_pieces_data)
+
+                if len(packet_data_bytes) != sample.size:
+                    self.log.warning(f"Incomplete data for keyframe {keyframe.index}, skipping.")
+                    continue
+
+                if extractor.mode == 'avc1':
+                    annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
+                    while cursor < len(packet_data_bytes):
+                        nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + extractor.nal_length_size], 'big')
+                        cursor += extractor.nal_length_size
+                        nal_data = packet_data_bytes[cursor : cursor + nal_length]
+                        annexb_data.extend(start_code + nal_data)
+                        cursor += nal_length
+                    packet_data = bytes(annexb_data)
+                else:
+                    packet_data = packet_data_bytes
+
+                ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
                 m, s = divmod(ts_sec, 60)
                 h, m = divmod(m, 60)
                 timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
-            else:
-                timestamp_str = f"keyframe_{keyframe.index}"
 
-            # 4. Call the generator with the required data
-            task = self.generator.generate(
-                extradata=extradata,
-                packet_data=packet_data,
-                infohash_hex=infohash_hex,
-                timestamp_str=timestamp_str
-            )
-            decode_tasks.append(task)
+                await self.generator.generate(
+                    extradata=extractor.extradata,
+                    packet_data=packet_data,
+                    infohash_hex=infohash_hex,
+                    timestamp_str=timestamp_str
+                )
+            except Exception as e:
+                self.log.error(f"Failed to process keyframe {keyframe.index}: {e}", exc_info=True)
 
-        await asyncio.gather(*decode_tasks)
         self.log.info(f"Screenshot task for {infohash_hex} completed.")
 
     async def _handle_screenshot_task(self, task_info: dict):
