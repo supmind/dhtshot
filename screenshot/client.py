@@ -34,7 +34,7 @@ class TorrentClient:
         settings = {
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
-            'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage|lt.alert_category.progress,
+            'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage|lt.alert_category.all,
             'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
             'user_agent': 'qBittorrent/4.5.2',
             'peer_fingerprint': 'qB4520',
