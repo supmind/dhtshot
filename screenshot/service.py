@@ -89,8 +89,8 @@ class ScreenshotService:
 
         return bytes(buffer)
 
-    def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes], None, None]:
-        """A robust parser for MP4 boxes, yielding the box type and its full data."""
+    def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
+        """A robust parser for MP4 boxes, yielding the box type, its full data, offset and size."""
         # Use getbuffer() to have a view of the entire byte array, which is efficient.
         stream_buffer = stream.getbuffer()
         buffer_size = len(stream_buffer)
@@ -98,12 +98,19 @@ class ScreenshotService:
         current_offset = stream.tell()
         while current_offset <= buffer_size - 8:
             stream.seek(current_offset)
-            header_data = stream.read(8)
-            if not header_data:
+
+            try:
+                header_data = stream.read(8)
+                if not header_data or len(header_data) < 8:
+                    break
+                size, box_type_bytes = struct.unpack('>I4s', header_data)
+                box_type = box_type_bytes.decode('ascii', 'ignore')
+            except struct.error:
+                self.log.warning(f"Could not unpack box header at offset {current_offset}. Incomplete data.")
                 break
 
-            size, box_type_bytes = struct.unpack('>I4s', header_data)
-            box_type = box_type_bytes.decode('ascii', 'ignore')
+            original_size = size
+            box_header_size = 8
 
             if size == 1:
                 if current_offset + 16 > buffer_size:
@@ -111,27 +118,113 @@ class ScreenshotService:
                     break
                 size_64_data = stream.read(8)
                 size = struct.unpack('>Q', size_64_data)[0]
+                box_header_size = 16
             elif size == 0:
-                # Box extends to the end of the file/stream.
                 size = buffer_size - current_offset
 
-            if size < 8:
+            if size < box_header_size:
                 self.log.warning(f"Box '{box_type}' has an invalid size {size}. Stopping parse.")
                 break
 
             # Check if the full box is available in the buffer.
             if current_offset + size > buffer_size:
-                self.log.warning(f"Box '{box_type}' with size {size} extends beyond the available data. Cannot parse.")
-                # This is the end of our parsable data.
+                self.log.warning(f"Box '{box_type}' with size {size} extends beyond the available data. Cannot parse fully.")
+                # We can still yield the partial data we have
+                full_box_data = stream_buffer[current_offset:buffer_size]
+                yield box_type, bytes(full_box_data), current_offset, size
                 break
 
-            # Yield the full box data.
-            # Slicing the buffer view is efficient.
             full_box_data = stream_buffer[current_offset:current_offset + size]
-            yield box_type, bytes(full_box_data)
+            yield box_type, bytes(full_box_data), current_offset, size
 
             # Move to the next box.
             current_offset += size
+
+    async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length) -> bytes | None:
+        """
+        Smartly finds and fetches the moov atom data.
+        It first probes the head of the file, parsing boxes to find the moov atom precisely.
+        If not found, it falls back to probing the tail.
+        """
+        self.log.info("Smartly searching for moov atom...")
+        mdat_size_from_head = 0
+
+        # --- Head Probe ---
+        self.log.info("Phase 1: Probing file head for moov atom...")
+        initial_probe_size = 256 * 1024  # 256KB
+        head_size = min(initial_probe_size, video_file_size)
+        head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
+
+        try:
+            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=120)
+            head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
+
+            stream = io.BytesIO(head_data)
+            for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
+                self.log.info(f"Found box '{box_type}' at offset {box_offset} with size {box_size} in head.")
+                if box_type == 'moov':
+                    self.log.info("Found 'moov' atom in head probe.")
+                    if len(partial_box_data) < box_size:
+                        self.log.info(f"Initial probe got {len(partial_box_data)}/{box_size} bytes of moov. Fetching remainder.")
+                        full_moov_offset_in_torrent = video_file_offset + box_offset
+                        needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
+
+                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=120)
+                        return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
+                    else:
+                        return partial_box_data
+
+                if box_type == 'mdat':
+                    if box_size > video_file_size * 0.8:
+                         self.log.info("Found large 'mdat' box in head. Assuming 'moov' is at the tail.")
+                         mdat_size_from_head = box_size
+                         break
+        except Exception as e:
+            self.log.error(f"Error during head probe for moov atom: {e}", exc_info=True)
+
+        # --- Tail Probe (Fallback) ---
+        self.log.info("Phase 2: Moov not in head, probing file tail.")
+
+        if mdat_size_from_head > 0:
+            tail_probe_size = video_file_size - mdat_size_from_head
+            self.log.info(f"Using dynamic tail probe size based on mdat: {tail_probe_size} bytes.")
+        else:
+            tail_probe_size = 10 * 1024 * 1024
+            self.log.info(f"Using fixed tail probe size: {tail_probe_size} bytes.")
+
+        tail_file_offset = max(0, video_file_size - tail_probe_size)
+        tail_torrent_offset = video_file_offset + tail_file_offset
+        tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
+        tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
+
+        try:
+            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=180)
+            tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
+
+            search_pos = len(tail_data)
+            while search_pos > 4:
+                found_pos = tail_data.rfind(b'moov', 0, search_pos)
+                if found_pos == -1:
+                    break
+                potential_start_pos = found_pos - 4
+                if potential_start_pos < 0:
+                    search_pos = found_pos
+                    continue
+                try:
+                    stream = io.BytesIO(tail_data)
+                    stream.seek(potential_start_pos)
+                    box_type, full_box_data, _, _ = next(self._parse_mp4_boxes(stream), (None, None, None, None))
+
+                    if box_type == 'moov':
+                        self.log.info(f"Successfully parsed 'moov' atom from tail with size {len(full_box_data)}.")
+                        return full_box_data
+                except Exception:
+                    pass
+                search_pos = found_pos
+        except Exception as e:
+            self.log.error(f"Error during tail probe for moov atom: {e}", exc_info=True)
+
+        return None
 
     async def _process_and_generate_screenshot(self, keyframe, extractor, handle, video_file_offset, piece_length, infohash_hex):
         """Helper to process a single keyframe once its pieces are downloaded."""
@@ -192,52 +285,11 @@ class ScreenshotService:
             self.log.warning(f"No video file found in torrent {infohash_hex}.")
             return
 
-        # 2. Phase 1: Fetch pieces for moov atom
-        self.log.info("Phase 1: Fetching pieces for moov atom.")
-        PROBE_SIZE = 10 * 1024 * 1024
-        head_offset = video_file_offset
-        head_size = min(PROBE_SIZE, video_file_size)
-        head_pieces = self._get_pieces_for_range(head_offset, head_size, piece_length)
-        tail_file_offset = max(0, video_file_size - PROBE_SIZE)
-        tail_torrent_offset = video_file_offset + tail_file_offset
-        tail_size = min(PROBE_SIZE, video_file_size - tail_file_offset)
-        tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-        moov_piece_indices = list(set(head_pieces + tail_pieces))
-        try:
-            moov_pieces_data = await self.client.fetch_pieces(handle, moov_piece_indices)
-        except Exception as e:
-            self.log.error(f"Failed to fetch pieces for moov atom: {e}")
-            return
-        head_data = self._assemble_data_from_pieces(moov_pieces_data, head_offset, head_size, piece_length)
-        tail_data = self._assemble_data_from_pieces(moov_pieces_data, tail_torrent_offset, tail_size, piece_length)
-        moov_data = None
-        for data_chunk in [tail_data, head_data]:
-            if not data_chunk:
-                continue
-            search_pos = len(data_chunk)
-            while search_pos > 4:
-                found_pos = data_chunk.rfind(b'moov', 0, search_pos)
-                if found_pos == -1:
-                    break
-                potential_start_pos = found_pos - 4
-                if potential_start_pos < 0:
-                    search_pos = found_pos
-                    continue
-                try:
-                    stream = io.BytesIO(data_chunk)
-                    stream.seek(potential_start_pos)
-                    box_type, full_box_data = next(self._parse_mp4_boxes(stream), (None, None))
-                    if box_type == 'moov':
-                        self.log.info(f"Successfully parsed 'moov' atom with size {len(full_box_data)}.")
-                        moov_data = full_box_data
-                        break
-                except Exception:
-                    pass
-                search_pos = found_pos
-            if moov_data:
-                break
+        # 2. Phase 1: Smartly find and fetch the moov atom
+        moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
+
         if not moov_data:
-            self.log.error(f"Could not find moov atom for {infohash_hex}.")
+            self.log.error(f"Could not find or parse moov atom for {infohash_hex}.")
             return
 
         # 3. Initialize extractor and select keyframes
