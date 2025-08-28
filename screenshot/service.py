@@ -3,10 +3,38 @@ import asyncio
 import logging
 import io
 import struct
-from typing import Generator, Tuple
+from dataclasses import dataclass, field
+from typing import Generator, Tuple, Optional, Dict, Any, Callable
 from .client import TorrentClient
 from .extractor import H264KeyframeExtractor, Keyframe
 from .generator import ScreenshotGenerator
+
+
+# --- Result Data Classes ---
+
+@dataclass
+class FatalErrorResult:
+    """Represents a final, unrecoverable error."""
+    infohash: str
+    reason: str
+
+@dataclass
+class AllSuccessResult:
+    """Represents the successful completion of a task."""
+    infohash: str
+    screenshots_count: int
+
+@dataclass
+class PartialSuccessResult:
+    """
+    Represents a recoverable error. The task was interrupted but can be resumed.
+    This is used for any recoverable error, regardless of how many screenshots were
+    successfully generated (if any).
+    """
+    infohash: str
+    screenshots_count: int
+    reason: str
+    resume_data: Dict[str, Any] = field(default_factory=dict)
 
 
 class ScreenshotService:
@@ -42,9 +70,22 @@ class ScreenshotService:
             worker.cancel()
         self.log.info("ScreenshotService stopped.")
 
-    async def submit_task(self, infohash: str):
-        """Submits a new screenshot task by infohash."""
-        await self.task_queue.put({'infohash': infohash})
+    async def submit_task(self, infohash: str, resume_data: Optional[Dict[str, Any]] = None, on_complete: Optional[Callable] = None):
+        """
+        Submits a new screenshot task.
+
+        Args:
+            infohash: The infohash of the torrent.
+            resume_data: Optional data to resume a partial task.
+            on_complete: A callback function to be called when the task is complete.
+                         The callback will receive a result object as its only argument.
+        """
+        task = {
+            'infohash': infohash,
+            'resume_data': resume_data,
+            'on_complete': on_complete
+        }
+        await self.task_queue.put(task)
         self.log.info(f"Submitted new task for infohash: {infohash}")
 
     def _get_pieces_for_range(self, offset_in_torrent, size, piece_length):
@@ -267,12 +308,17 @@ class ScreenshotService:
         except Exception as e:
             self.log.error(f"Failed to process keyframe {keyframe.index}: {e}", exc_info=True)
 
-    async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
-        """Handles the detailed logic of generating screenshots for a given torrent."""
+    async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data: Optional[Dict[str, Any]] = None):
+        """
+        Handles the detailed logic of generating screenshots for a given torrent.
+        Returns a result object (AllSuccess, FatalError, or PartialSuccess).
+        """
         ti = handle.get_torrent_info()
         piece_length = ti.piece_length()
 
-        # 1. Find the largest video file in the torrent
+        # --- Phase 1: Find video file and metadata ---
+
+        # Find the largest video file
         video_file_index, video_file_size, video_file_offset = -1, -1, -1
         fs = ti.files()
         for i in range(fs.num_files()):
@@ -282,126 +328,167 @@ class ScreenshotService:
                 video_file_offset = fs.file_offset(i)
 
         if video_file_index == -1:
-            self.log.warning(f"No video file found in torrent {infohash_hex}.")
-            return
+            self.log.warning(f"No .mp4 video file found in torrent {infohash_hex}.")
+            return FatalErrorResult(infohash=infohash_hex, reason="No .mp4 video file found in torrent")
 
         video_file_path = fs.file_path(video_file_index)
-        self.log.info(f"Found largest video file: '{video_file_path}' with size {video_file_size} bytes.")
+        self.log.info(f"Found video file: '{video_file_path}' ({video_file_size} bytes).")
 
-        # 2. Phase 1: Smartly find and fetch the moov atom
-        moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
+        # Get the moov atom (contains metadata)
+        try:
+            moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
+            if not moov_data:
+                self.log.error(f"Could not find or parse moov atom for {infohash_hex}.")
+                return FatalErrorResult(infohash=infohash_hex, reason="Could not find or parse moov atom")
+        except asyncio.TimeoutError:
+             return PartialSuccessResult(infohash=infohash_hex, screenshots_count=0, reason="Timeout fetching moov atom", resume_data={})
+        except Exception as e:
+            self.log.error(f"Error getting moov atom for {infohash_hex}: {e}", exc_info=True)
+            return FatalErrorResult(infohash=infohash_hex, reason=f"Error getting moov atom: {e}")
 
-        if not moov_data:
-            self.log.error(f"Could not find or parse moov atom for {infohash_hex}.")
-            return
 
-        # 3. Initialize extractor and select keyframes
-        extractor = H264KeyframeExtractor(moov_data)
-        all_keyframes = extractor.keyframes
+        # --- Phase 2: Extract and select keyframes ---
+
+        try:
+            extractor = H264KeyframeExtractor(moov_data)
+            all_keyframes = extractor.keyframes
+        except Exception as e:
+            self.log.error(f"Failed to initialize H264KeyframeExtractor for {infohash_hex}: {e}", exc_info=True)
+            return FatalErrorResult(infohash=infohash_hex, reason=f"Failed to parse video metadata: {e}")
+
         if not all_keyframes:
-            self.log.error(f"Could not extract keyframes from {infohash_hex}.")
-            return
-        MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
-        duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
-        num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
-        if len(all_keyframes) <= num_screenshots:
-            selected_keyframes = all_keyframes
-        else:
-            indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
-            selected_keyframes = [all_keyframes[i] for i in sorted(list(set(indices)))]
-        self.log.info(f"Found {len(selected_keyframes)} keyframes to process for {infohash_hex}.")
+            self.log.error(f"Could not extract any keyframes from {infohash_hex}.")
+            return FatalErrorResult(infohash=infohash_hex, reason="Could not extract any keyframes from video file")
 
-        # 4. Phase 2: Setup for event-driven screenshot generation
+        # If resuming, filter to only unprocessed keyframes. Otherwise, select a fresh set.
+        unprocessed_kf_indices = resume_data.get('unprocessed_kf_indices') if resume_data else None
+        if unprocessed_kf_indices is not None:
+            self.log.info(f"Resuming task, filtering for {len(unprocessed_kf_indices)} remaining keyframes.")
+            selected_keyframes = [kf for kf in all_keyframes if kf.index in unprocessed_kf_indices]
+        else:
+            MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
+            duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
+            num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
+            if len(all_keyframes) <= num_screenshots:
+                selected_keyframes = all_keyframes
+            else:
+                indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
+                selected_keyframes = [all_keyframes[i] for i in sorted(list(set(indices)))]
+
+        if not selected_keyframes:
+            self.log.info(f"No keyframes remaining to process for {infohash_hex}.")
+            return AllSuccessResult(infohash=infohash_hex, screenshots_count=0)
+
+        self.log.info(f"Selected {len(selected_keyframes)} keyframes to process for {infohash_hex}.")
+
+        # --- Phase 3: Download and process keyframes ---
+
         keyframe_info = {}
         piece_to_keyframes = {}
         all_needed_pieces = set()
-
         for kf in selected_keyframes:
             sample = extractor.samples[kf.sample_index - 1]
             keyframe_torrent_offset = video_file_offset + sample.offset
             needed = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
-
-            keyframe_info[kf.index] = {
-                'keyframe': kf,
-                'needed_pieces': set(needed)
-            }
+            keyframe_info[kf.index] = {'keyframe': kf, 'needed_pieces': set(needed)}
             for piece_idx in needed:
-                if piece_idx not in piece_to_keyframes:
-                    piece_to_keyframes[piece_idx] = []
-                piece_to_keyframes[piece_idx].append(kf.index)
+                piece_to_keyframes.setdefault(piece_idx, []).append(kf.index)
             all_needed_pieces.update(needed)
 
         self.client.request_pieces(handle, list(all_needed_pieces))
 
-        # 5. Phase 3: Consume finished pieces and trigger screenshot generation
-        processed_keyframes = 0
+        processed_keyframes_count = 0
         generation_tasks = []
-        timeout = 300 # 5 minutes timeout for the whole process
+        timeout = getattr(self, 'TIMEOUT_FOR_TESTING', 300)  # Allow overriding for tests
         try:
-            while processed_keyframes < len(selected_keyframes):
+            while processed_keyframes_count < len(selected_keyframes):
                 finished_piece = await asyncio.wait_for(self.client.finished_piece_queue.get(), timeout=timeout)
+                if finished_piece not in piece_to_keyframes: continue
 
-                if finished_piece not in piece_to_keyframes:
-                    continue
-
-                # Using .pop() is safe because we won't get the same piece index again from the queue
                 affected_kf_indices = piece_to_keyframes.pop(finished_piece)
                 for kf_index in affected_kf_indices:
                     info = keyframe_info.get(kf_index)
-                    if not info: continue # Already processed
+                    if not info or not info['needed_pieces']: continue
 
-                    if finished_piece in info['needed_pieces']:
-                        info['needed_pieces'].remove(finished_piece)
-
+                    info['needed_pieces'].remove(finished_piece)
                     if not info['needed_pieces']:
-                        # All pieces for this keyframe are ready
-                        self.log.info(f"All pieces for keyframe {kf_index} are ready. Spawning generation task.")
-                        kf = info['keyframe']
+                        self.log.info(f"All pieces for keyframe {kf_index} ready. Spawning generation task.")
                         task = asyncio.create_task(self._process_and_generate_screenshot(
-                            kf, extractor, handle, video_file_offset, piece_length, infohash_hex
+                            info['keyframe'], extractor, handle, video_file_offset, piece_length, infohash_hex
                         ))
                         generation_tasks.append(task)
-                        processed_keyframes += 1
-                        # Remove from dict to prevent reprocessing
-                        keyframe_info.pop(kf_index)
+                        processed_keyframes_count += 1
+                        # Mark as processed by clearing the needed_pieces set
+                        info['needed_pieces'].clear()
 
                 self.client.finished_piece_queue.task_done()
         except asyncio.TimeoutError:
-            self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Processed {processed_keyframes}/{len(selected_keyframes)} keyframes.")
+            self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Generated {processed_keyframes_count}/{len(selected_keyframes)} keyframes.")
+            unprocessed_indices = [idx for idx, info in keyframe_info.items() if info.get('needed_pieces')]
+            resume_payload = {'unprocessed_kf_indices': unprocessed_indices}
+            return PartialSuccessResult(
+                infohash=infohash_hex,
+                screenshots_count=processed_keyframes_count,
+                reason=f"Timeout waiting for pieces. Processed {processed_keyframes_count} of {len(selected_keyframes)} keyframes.",
+                resume_data=resume_payload
+            )
 
-        # Wait for all spawned screenshot tasks to complete before returning
         if generation_tasks:
             self.log.info(f"Waiting for {len(generation_tasks)} screenshot generation tasks to complete.")
             await asyncio.gather(*generation_tasks)
 
-        self.log.info(f"Screenshot task for {infohash_hex} completed.")
+        self.log.info(f"Screenshot task for {infohash_hex} completed successfully.")
+        return AllSuccessResult(infohash=infohash_hex, screenshots_count=processed_keyframes_count)
 
     async def _handle_screenshot_task(self, task_info: dict):
         """Full lifecycle of a screenshot task, including torrent handle management."""
-        infohash_hex = task_info['infohash']
-        self.log.info(f"Processing task: {infohash_hex}")
-        handle = None
-        try:
-            handle = await self.client.add_torrent(infohash_hex)
-            if not handle or not handle.is_valid():
-                self.log.error(f"Could not get a valid torrent handle for {infohash_hex}.")
-                return
+        infohash = task_info['infohash']
+        resume_data = task_info['resume_data']
+        on_complete = task_info['on_complete']
 
-            await self._generate_screenshots_from_torrent(handle, infohash_hex)
-        except Exception:
-            self.log.exception(f"An unknown error occurred while processing {infohash_hex}.")
+        self.log.info(f"Processing task for infohash: {infohash}")
+        handle = None
+        result = None
+        try:
+            handle = await self.client.add_torrent(infohash)
+            if not handle or not handle.is_valid():
+                self.log.error(f"Could not get a valid torrent handle for {infohash}.")
+                result = FatalErrorResult(infohash=infohash, reason="Failed to get valid torrent handle")
+            else:
+                # This will be modified in the next step to return a result object.
+                # For now, it returns None, so the callback will get None.
+                result = await self._generate_screenshots_from_torrent(handle, infohash, resume_data)
+
+        except Exception as e:
+            self.log.exception(f"An unexpected error occurred while processing {infohash}.")
+            result = FatalErrorResult(infohash=infohash, reason=f"Unexpected worker error: {str(e)}")
         finally:
             if handle:
                 self.client.remove_torrent(handle)
+
+            if on_complete:
+                try:
+                    # Allow the callback to be a regular function or a coroutine
+                    if asyncio.iscoroutinefunction(on_complete):
+                        await on_complete(result)
+                    else:
+                        on_complete(result)
+                except Exception:
+                    self.log.exception(f"Error executing on_complete callback for {infohash}")
 
     async def _worker(self):
         """The worker coro that pulls tasks from the queue."""
         while self._running:
             try:
                 task_info = await self.task_queue.get()
+                # The _handle_screenshot_task is now responsible for all error handling
+                # and ensuring the on_complete callback is called.
                 await self._handle_screenshot_task(task_info)
                 self.task_queue.task_done()
             except asyncio.CancelledError:
+                self.log.info("Worker cancelled.")
                 break
             except Exception:
-                self.log.exception("Error in screenshot worker.")
+                # This block should ideally not be reached if _handle_screenshot_task is robust.
+                # It's a final safety net.
+                self.log.exception("Critical unhandled error in screenshot worker loop.")
