@@ -3,6 +3,7 @@ import asyncio
 import logging
 import io
 import struct
+from typing import Generator, Tuple
 from .client import TorrentClient
 from .extractor import H264KeyframeExtractor, Keyframe
 from .generator import ScreenshotGenerator
@@ -88,6 +89,50 @@ class ScreenshotService:
 
         return bytes(buffer)
 
+    def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes], None, None]:
+        """A robust parser for MP4 boxes, yielding the box type and its full data."""
+        # Use getbuffer() to have a view of the entire byte array, which is efficient.
+        stream_buffer = stream.getbuffer()
+        buffer_size = len(stream_buffer)
+
+        current_offset = stream.tell()
+        while current_offset <= buffer_size - 8:
+            stream.seek(current_offset)
+            header_data = stream.read(8)
+            if not header_data:
+                break
+
+            size, box_type_bytes = struct.unpack('>I4s', header_data)
+            box_type = box_type_bytes.decode('ascii', 'ignore')
+
+            if size == 1:
+                if current_offset + 16 > buffer_size:
+                    self.log.warning(f"Box '{box_type}' has a 64-bit size but not enough data for the header.")
+                    break
+                size_64_data = stream.read(8)
+                size = struct.unpack('>Q', size_64_data)[0]
+            elif size == 0:
+                # Box extends to the end of the file/stream.
+                size = buffer_size - current_offset
+
+            if size < 8:
+                self.log.warning(f"Box '{box_type}' has an invalid size {size}. Stopping parse.")
+                break
+
+            # Check if the full box is available in the buffer.
+            if current_offset + size > buffer_size:
+                self.log.warning(f"Box '{box_type}' with size {size} extends beyond the available data. Cannot parse.")
+                # This is the end of our parsable data.
+                break
+
+            # Yield the full box data.
+            # Slicing the buffer view is efficient.
+            full_box_data = stream_buffer[current_offset:current_offset + size]
+            yield box_type, bytes(full_box_data)
+
+            # Move to the next box.
+            current_offset += size
+
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
         """Handles the detailed logic of generating screenshots for a given torrent."""
         ti = handle.get_torrent_info()
@@ -130,25 +175,45 @@ class ScreenshotService:
         head_data = self._assemble_data_from_pieces(moov_pieces_data, head_offset, head_size, piece_length)
         tail_data = self._assemble_data_from_pieces(moov_pieces_data, tail_torrent_offset, tail_size, piece_length)
 
-        # Find moov atom in the assembled data
+        # Find moov atom using a hybrid of searching and parsing
         moov_data = None
-        for chunk in [tail_data, head_data]:
-            pos = len(chunk)
-            while pos >= 8:
-                found_pos = chunk.rfind(b'moov', 0, pos)
-                if found_pos == -1: break
-                size_pos = found_pos - 4
-                if size_pos < 0:
-                    pos = found_pos
+        for data_chunk in [tail_data, head_data]:
+            if not data_chunk:
+                continue
+
+            # Search for the 'moov' signature from the end of the chunk
+            search_pos = len(data_chunk)
+            while search_pos > 4:
+                found_pos = data_chunk.rfind(b'moov', 0, search_pos)
+                if found_pos == -1:
+                    break # No more 'moov' signatures in this chunk
+
+                # We found a candidate. Let's try to parse from its size field.
+                potential_start_pos = found_pos - 4
+                if potential_start_pos < 0:
+                    search_pos = found_pos # Continue searching before this find
                     continue
+
                 try:
-                    size = struct.unpack('>I', chunk[size_pos:found_pos])[0]
-                    if size >= 8 and (size_pos + size) <= len(chunk):
-                        moov_data = chunk[size_pos : size_pos + size]
-                        break
-                except struct.error: pass
-                pos = found_pos
-            if moov_data: break
+                    stream = io.BytesIO(data_chunk)
+                    stream.seek(potential_start_pos)
+
+                    # We only expect to parse one box here. If it's not a valid 'moov', we continue searching.
+                    box_type, full_box_data = next(self._parse_mp4_boxes(stream), (None, None))
+
+                    if box_type == 'moov':
+                        self.log.info(f"Successfully parsed 'moov' atom with size {len(full_box_data)}.")
+                        moov_data = full_box_data
+                        break # Found it, exit the while loop
+                except Exception:
+                    # This position was not a valid box, so continue searching.
+                    pass
+
+                # Move position to continue searching backwards from where we found the signature
+                search_pos = found_pos
+
+            if moov_data:
+                break # Exit the for loop
 
         if not moov_data:
             self.log.error(f"Could not find moov atom for {infohash_hex}.")
