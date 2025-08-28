@@ -47,17 +47,17 @@ class TorrentClient:
         self._running = False
         self.dht_ready = asyncio.Event()
 
-        # --- Caching and State Management ---
-        self.handles = {} # Cache for torrent handles {infohash: handle}
-        self.pending_metadata = {} # {infohash: Future}
-        self.pending_reads = defaultdict(list)
-        self.pending_reads_lock = threading.Lock()
-        self.pending_fetches = {}
-        self.fetch_lock = threading.Lock()
-        self.next_fetch_id = 0
+        # --- 缓存与状态管理 ---
+        self.handles = {}  # torrent 句柄的缓存 {infohash: handle}
+        self.pending_metadata = {}  # 等待元数据的 Future {infohash: Future}
+        self.pending_reads = defaultdict(list) # 等待读取 piece 的 Future
+        self.pending_reads_lock = threading.Lock() # pending_reads 的锁
+        self.pending_fetches = {} # 等待下载 piece 的 Future
+        self.fetch_lock = threading.Lock() # pending_fetches 的锁
+        self.next_fetch_id = 0 # 下一个 fetch 请求的 ID
 
         self.last_dht_log_time = 0
-        self.finished_piece_queue = asyncio.Queue()
+        self.finished_piece_queue = asyncio.Queue() # 已完成 piece 的队列
 
     async def start(self):
         """启动 torrent 客户端的警报循环。"""
@@ -79,12 +79,12 @@ class TorrentClient:
         通过 infohash 添加 torrent 或获取现有 torrent 的句柄。
         在收到元数据后返回句柄。
         """
-        # Check cache first
+        # 首先检查缓存
         if infohash in self.handles and self.handles[infohash].is_valid():
             self.log.info(f"从缓存返回 {infohash} 的现有句柄。")
             return self.handles[infohash]
 
-        # If not in cache or invalid, add it
+        # 如果不在缓存中或无效，则添加它
         self.log.info(f"为 infohash 添加新 torrent: {infohash}")
         save_dir = os.path.join(self.save_path, infohash)
 
@@ -93,18 +93,24 @@ class TorrentClient:
 
         params = lt.parse_magnet_uri(f"magnet:?xt=urn:btih:{infohash}")
         params.save_path = save_dir
-        params.flags |= lt.torrent_flags.paused
         handle = self.ses.add_torrent(params)
-        self.handles[infohash] = handle # Add to cache immediately
+        self.handles[infohash] = handle  # 立即添加到缓存
 
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:
+            # 等待元数据，设置超时
             await asyncio.wait_for(meta_future, timeout=180)
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
+            # 超时后清理
             self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
             raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
+
+        # 成功获取元数据后，暂停 torrent 并将所有 piece 优先级设为 0，
+        # 这样我们就只下载明确请求的 piece。
+        self.log.info(f"成功获取 {infohash} 的元数据。暂停 torrent。")
+        handle.pause()
 
         ti = handle.get_torrent_info()
         if ti:
@@ -132,11 +138,14 @@ class TorrentClient:
             return
 
         unique_indices = sorted(list(set(piece_indices)))
+        # 只请求尚未拥有的 piece
         pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
 
         if pieces_to_request:
+            # 将需要的 piece 优先级设为最高 (7)
             for p in pieces_to_request:
                 handle.piece_priority(p, 7)
+            # 恢复 torrent 开始下载
             handle.resume()
 
     async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
@@ -172,6 +181,7 @@ class TorrentClient:
                 raise LibtorrentError(f"下载 pieces {pieces_to_download} 超时。")
 
         async def _read_piece(piece_index):
+            """辅助函数，用于异步读取单个 piece。"""
             read_future = self.loop.create_future()
             with self.pending_reads_lock:
                 self.pending_reads[piece_index].append(read_future)
@@ -221,6 +231,7 @@ class TorrentClient:
 
         error = None
         if alert.error and alert.error.value() != 0:
+            # 忽略非错误的 "success" 消息
             if "success" not in alert.error.message().lower():
                 error = LibtorrentError(alert.error)
 
@@ -238,6 +249,7 @@ class TorrentClient:
             try:
                 alerts = self.ses.pop_alerts()
                 for alert in alerts:
+                    # 记录所有错误警报
                     if alert.category() & lt.alert_category.error:
                         self.log.error(f"Libtorrent 警报: {alert}")
 
@@ -252,6 +264,7 @@ class TorrentClient:
                         self._handle_dht_bootstrap(alert)
 
                 now = time.time()
+                # 每隔 10 秒记录一次 DHT 状态
                 if now - self.last_dht_log_time > 10:
                     status = self.ses.status()
                     self.log.info(f"DHT 状态: {status.dht_nodes} 个节点。")

@@ -42,9 +42,9 @@ class ScreenshotGenerator:
             if not frames:
                 self.log.warning("第一次解码未返回帧，尝试发送一个空的刷新包...")
                 try:
-                    frames = codec.decode(None) # Flushing packet
+                    frames = codec.decode(None) # 发送刷新包
                 except av.EOFError:
-                    pass # Expected when flushing
+                    pass # 刷新时可能出现 EOFError，属于正常现象
 
             if not frames:
                 self.log.error(f"解码失败：解码器未能从时间戳 {timestamp_str} 的数据包中解码出任何帧。")

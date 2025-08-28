@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Screenshot Service Package
+截图服务包
 """
 
-# Define what gets imported with a 'from screenshot import *'
+# 定义 'from screenshot import *' 时要导入的模块
 __all__ = ['ScreenshotService']
