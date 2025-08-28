@@ -280,6 +280,7 @@ class ScreenshotService:
 
         # 5. Phase 3: Consume finished pieces and trigger screenshot generation
         processed_keyframes = 0
+        generation_tasks = []
         timeout = 300 # 5 minutes timeout for the whole process
         try:
             while processed_keyframes < len(selected_keyframes):
@@ -288,9 +289,12 @@ class ScreenshotService:
                 if finished_piece not in piece_to_keyframes:
                     continue
 
+                # Using .pop() is safe because we won't get the same piece index again from the queue
                 affected_kf_indices = piece_to_keyframes.pop(finished_piece)
                 for kf_index in affected_kf_indices:
-                    info = keyframe_info[kf_index]
+                    info = keyframe_info.get(kf_index)
+                    if not info: continue # Already processed
+
                     if finished_piece in info['needed_pieces']:
                         info['needed_pieces'].remove(finished_piece)
 
@@ -298,17 +302,22 @@ class ScreenshotService:
                         # All pieces for this keyframe are ready
                         self.log.info(f"All pieces for keyframe {kf_index} are ready. Spawning generation task.")
                         kf = info['keyframe']
-                        asyncio.create_task(self._process_and_generate_screenshot(
+                        task = asyncio.create_task(self._process_and_generate_screenshot(
                             kf, extractor, handle, video_file_offset, piece_length, infohash_hex
                         ))
+                        generation_tasks.append(task)
                         processed_keyframes += 1
-                        # We can remove this from keyframe_info to avoid reprocessing
-                        # although the logic already prevents it.
-                        # keyframe_info.pop(kf_index)
+                        # Remove from dict to prevent reprocessing
+                        keyframe_info.pop(kf_index)
 
                 self.client.finished_piece_queue.task_done()
         except asyncio.TimeoutError:
             self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Processed {processed_keyframes}/{len(selected_keyframes)} keyframes.")
+
+        # Wait for all spawned screenshot tasks to complete before returning
+        if generation_tasks:
+            self.log.info(f"Waiting for {len(generation_tasks)} screenshot generation tasks to complete.")
+            await asyncio.gather(*generation_tasks)
 
         self.log.info(f"Screenshot task for {infohash_hex} completed.")
 
