@@ -153,7 +153,7 @@ class ScreenshotService:
 
         # 2. Phase 1: Fetch pieces for moov atom
         self.log.info("Phase 1: Fetching pieces for moov atom.")
-        PROBE_SIZE = 5 * 1024 * 1024
+        PROBE_SIZE = 10 * 1024 * 1024
 
         head_offset = video_file_offset
         head_size = min(PROBE_SIZE, video_file_size)
