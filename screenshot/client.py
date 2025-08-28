@@ -94,13 +94,6 @@ class TorrentClient:
         params.flags |= lt.torrent_flags.paused
         handle = self.ses.add_torrent(params)
 
-        self.log.debug("Waiting for DHT bootstrap...")
-        try:
-            await asyncio.wait_for(self.dht_ready.wait(), timeout=30)
-            self.log.info("DHT bootstrap successful.")
-        except asyncio.TimeoutError:
-            self.log.warning("DHT bootstrap timed out, proceeding without it.")
-
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:
             handle = await asyncio.wait_for(meta_future, timeout=180)
