@@ -133,6 +133,47 @@ class ScreenshotService:
             # Move to the next box.
             current_offset += size
 
+    async def _process_and_generate_screenshot(self, keyframe, extractor, handle, video_file_offset, piece_length, infohash_hex):
+        """Helper to process a single keyframe once its pieces are downloaded."""
+        try:
+            sample = extractor.samples[keyframe.sample_index - 1]
+            keyframe_torrent_offset = video_file_offset + sample.offset
+            keyframe_piece_indices = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
+
+            # Fetch pieces (should be fast as they are already downloaded)
+            keyframe_pieces_data = await self.client.fetch_pieces(handle, keyframe_piece_indices, timeout=60)
+            packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, keyframe_torrent_offset, sample.size, piece_length)
+
+            if len(packet_data_bytes) != sample.size:
+                self.log.warning(f"Incomplete data for keyframe {keyframe.index}, skipping.")
+                return
+
+            if extractor.mode == 'avc1':
+                annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
+                while cursor < len(packet_data_bytes):
+                    nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + extractor.nal_length_size], 'big')
+                    cursor += extractor.nal_length_size
+                    nal_data = packet_data_bytes[cursor : cursor + nal_length]
+                    annexb_data.extend(start_code + nal_data)
+                    cursor += nal_length
+                packet_data = bytes(annexb_data)
+            else:
+                packet_data = packet_data_bytes
+
+            ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
+            m, s = divmod(ts_sec, 60)
+            h, m = divmod(m, 60)
+            timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+
+            await self.generator.generate(
+                extradata=extractor.extradata,
+                packet_data=packet_data,
+                infohash_hex=infohash_hex,
+                timestamp_str=timestamp_str
+            )
+        except Exception as e:
+            self.log.error(f"Failed to process keyframe {keyframe.index}: {e}", exc_info=True)
+
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
         """Handles the detailed logic of generating screenshots for a given torrent."""
         ti = handle.get_torrent_info()
@@ -154,67 +195,47 @@ class ScreenshotService:
         # 2. Phase 1: Fetch pieces for moov atom
         self.log.info("Phase 1: Fetching pieces for moov atom.")
         PROBE_SIZE = 10 * 1024 * 1024
-
         head_offset = video_file_offset
         head_size = min(PROBE_SIZE, video_file_size)
         head_pieces = self._get_pieces_for_range(head_offset, head_size, piece_length)
-
         tail_file_offset = max(0, video_file_size - PROBE_SIZE)
         tail_torrent_offset = video_file_offset + tail_file_offset
         tail_size = min(PROBE_SIZE, video_file_size - tail_file_offset)
         tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-
         moov_piece_indices = list(set(head_pieces + tail_pieces))
-
         try:
             moov_pieces_data = await self.client.fetch_pieces(handle, moov_piece_indices)
         except Exception as e:
             self.log.error(f"Failed to fetch pieces for moov atom: {e}")
             return
-
         head_data = self._assemble_data_from_pieces(moov_pieces_data, head_offset, head_size, piece_length)
         tail_data = self._assemble_data_from_pieces(moov_pieces_data, tail_torrent_offset, tail_size, piece_length)
-
-        # Find moov atom using a hybrid of searching and parsing
         moov_data = None
         for data_chunk in [tail_data, head_data]:
             if not data_chunk:
                 continue
-
-            # Search for the 'moov' signature from the end of the chunk
             search_pos = len(data_chunk)
             while search_pos > 4:
                 found_pos = data_chunk.rfind(b'moov', 0, search_pos)
                 if found_pos == -1:
-                    break # No more 'moov' signatures in this chunk
-
-                # We found a candidate. Let's try to parse from its size field.
+                    break
                 potential_start_pos = found_pos - 4
                 if potential_start_pos < 0:
-                    search_pos = found_pos # Continue searching before this find
+                    search_pos = found_pos
                     continue
-
                 try:
                     stream = io.BytesIO(data_chunk)
                     stream.seek(potential_start_pos)
-
-                    # We only expect to parse one box here. If it's not a valid 'moov', we continue searching.
                     box_type, full_box_data = next(self._parse_mp4_boxes(stream), (None, None))
-
                     if box_type == 'moov':
                         self.log.info(f"Successfully parsed 'moov' atom with size {len(full_box_data)}.")
                         moov_data = full_box_data
-                        break # Found it, exit the while loop
+                        break
                 except Exception:
-                    # This position was not a valid box, so continue searching.
                     pass
-
-                # Move position to continue searching backwards from where we found the signature
                 search_pos = found_pos
-
             if moov_data:
-                break # Exit the for loop
-
+                break
         if not moov_data:
             self.log.error(f"Could not find moov atom for {infohash_hex}.")
             return
@@ -225,58 +246,69 @@ class ScreenshotService:
         if not all_keyframes:
             self.log.error(f"Could not extract keyframes from {infohash_hex}.")
             return
-
         MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
         duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
         num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
-
         if len(all_keyframes) <= num_screenshots:
             selected_keyframes = all_keyframes
         else:
             indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
             selected_keyframes = [all_keyframes[i] for i in sorted(list(set(indices)))]
-
         self.log.info(f"Found {len(selected_keyframes)} keyframes to process for {infohash_hex}.")
 
-        # 4. Phase 2: Fetch pieces for each keyframe and generate screenshot
-        for keyframe in selected_keyframes:
-            try:
-                sample = extractor.samples[keyframe.sample_index - 1]
-                keyframe_torrent_offset = video_file_offset + sample.offset
-                keyframe_piece_indices = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
+        # 4. Phase 2: Setup for event-driven screenshot generation
+        keyframe_info = {}
+        piece_to_keyframes = {}
+        all_needed_pieces = set()
 
-                keyframe_pieces_data = await self.client.fetch_pieces(handle, keyframe_piece_indices)
-                packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, keyframe_torrent_offset, sample.size, piece_length)
+        for kf in selected_keyframes:
+            sample = extractor.samples[kf.sample_index - 1]
+            keyframe_torrent_offset = video_file_offset + sample.offset
+            needed = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
 
-                if len(packet_data_bytes) != sample.size:
-                    self.log.warning(f"Incomplete data for keyframe {keyframe.index}, skipping.")
+            keyframe_info[kf.index] = {
+                'keyframe': kf,
+                'needed_pieces': set(needed)
+            }
+            for piece_idx in needed:
+                if piece_idx not in piece_to_keyframes:
+                    piece_to_keyframes[piece_idx] = []
+                piece_to_keyframes[piece_idx].append(kf.index)
+            all_needed_pieces.update(needed)
+
+        self.client.request_pieces(handle, list(all_needed_pieces))
+
+        # 5. Phase 3: Consume finished pieces and trigger screenshot generation
+        processed_keyframes = 0
+        timeout = 300 # 5 minutes timeout for the whole process
+        try:
+            while processed_keyframes < len(selected_keyframes):
+                finished_piece = await asyncio.wait_for(self.client.finished_piece_queue.get(), timeout=timeout)
+
+                if finished_piece not in piece_to_keyframes:
                     continue
 
-                if extractor.mode == 'avc1':
-                    annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
-                    while cursor < len(packet_data_bytes):
-                        nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + extractor.nal_length_size], 'big')
-                        cursor += extractor.nal_length_size
-                        nal_data = packet_data_bytes[cursor : cursor + nal_length]
-                        annexb_data.extend(start_code + nal_data)
-                        cursor += nal_length
-                    packet_data = bytes(annexb_data)
-                else:
-                    packet_data = packet_data_bytes
+                affected_kf_indices = piece_to_keyframes.pop(finished_piece)
+                for kf_index in affected_kf_indices:
+                    info = keyframe_info[kf_index]
+                    if finished_piece in info['needed_pieces']:
+                        info['needed_pieces'].remove(finished_piece)
 
-                ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
-                m, s = divmod(ts_sec, 60)
-                h, m = divmod(m, 60)
-                timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+                    if not info['needed_pieces']:
+                        # All pieces for this keyframe are ready
+                        self.log.info(f"All pieces for keyframe {kf_index} are ready. Spawning generation task.")
+                        kf = info['keyframe']
+                        asyncio.create_task(self._process_and_generate_screenshot(
+                            kf, extractor, handle, video_file_offset, piece_length, infohash_hex
+                        ))
+                        processed_keyframes += 1
+                        # We can remove this from keyframe_info to avoid reprocessing
+                        # although the logic already prevents it.
+                        # keyframe_info.pop(kf_index)
 
-                await self.generator.generate(
-                    extradata=extractor.extradata,
-                    packet_data=packet_data,
-                    infohash_hex=infohash_hex,
-                    timestamp_str=timestamp_str
-                )
-            except Exception as e:
-                self.log.error(f"Failed to process keyframe {keyframe.index}: {e}", exc_info=True)
+                self.client.finished_piece_queue.task_done()
+        except asyncio.TimeoutError:
+            self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Processed {processed_keyframes}/{len(selected_keyframes)} keyframes.")
 
         self.log.info(f"Screenshot task for {infohash_hex} completed.")
 

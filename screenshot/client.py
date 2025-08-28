@@ -55,6 +55,7 @@ class TorrentClient:
         self.fetch_lock = threading.Lock()
         self.next_fetch_id = 0
         self.last_dht_log_time = 0
+        self.finished_piece_queue = asyncio.Queue()
 
     async def start(self):
         """启动 torrent 客户端的警报循环。"""
@@ -119,6 +120,20 @@ class TorrentClient:
             self.ses.remove_torrent(handle, lt.session.delete_files)
             self.log.info(f"已移除 torrent: {infohash}")
 
+    def request_pieces(self, handle, piece_indices: list[int]):
+        """按需请求一组特定的 piece，但不等待它们完成。"""
+        if not piece_indices:
+            return
+
+        unique_indices = sorted(list(set(piece_indices)))
+        pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
+
+        if pieces_to_request:
+            self.log.info(f"为 pieces {pieces_to_request} 设置高优先级。")
+            for p in pieces_to_request:
+                handle.piece_priority(p, 7)  # 7 is the highest priority
+            handle.resume()
+
     async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         """按需下载、读取并返回一组特定的 piece。"""
         if not piece_indices:
@@ -181,6 +196,10 @@ class TorrentClient:
         """处理 piece 下载完成的警报。"""
         self.log.info(f"收到 piece 下载完成通知: piece #{alert.piece_index}")
         piece_index = alert.piece_index
+
+        # Notify listeners that a piece is finished
+        self.finished_piece_queue.put_nowait(piece_index)
+
         with self.fetch_lock:
             # Using list() to avoid issues with modifying dict during iteration
             for fetch_id, request in list(self.pending_fetches.items()):
