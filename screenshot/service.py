@@ -285,6 +285,9 @@ class ScreenshotService:
             self.log.warning(f"No video file found in torrent {infohash_hex}.")
             return
 
+        video_file_path = fs.file_path(video_file_index)
+        self.log.info(f"Found largest video file: '{video_file_path}' with size {video_file_size} bytes.")
+
         # 2. Phase 1: Smartly find and fetch the moov atom
         moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
 
