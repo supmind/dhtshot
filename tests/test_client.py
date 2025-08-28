@@ -92,3 +92,41 @@ class TestFetchPieces:
 
         # Ensure the pending fetch request is cleaned up
         assert not client.pending_fetches
+
+
+class TestAddTorrent:
+    @pytest.mark.asyncio
+    async def test_add_torrent_with_trackers(self, client, mock_loop, monkeypatch):
+        """
+        Tests that add_torrent correctly constructs a magnet URI with trackers.
+        """
+        mock_parse_magnet_uri = MagicMock()
+        monkeypatch.setattr("libtorrent.parse_magnet_uri", mock_parse_magnet_uri)
+
+        # Mock the async wait so the function doesn't hang
+        async def mock_wait_for(future, timeout):
+            # Simulate metadata received alert to resolve the future
+            client._handle_metadata_received(MagicMock(handle=MagicMock()))
+            return await future
+
+        monkeypatch.setattr("asyncio.wait_for", mock_wait_for)
+
+        # Set up mock handles and torrent info
+        mock_handle = MagicMock()
+        mock_handle.get_torrent_info.return_value = MagicMock()
+        client.ses.add_torrent.return_value = mock_handle
+        mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
+
+        infohash = "0123456789abcdef0123456789abcdef0123"
+        await client.add_torrent(infohash)
+
+        # Verify that parse_magnet_uri was called
+        mock_parse_magnet_uri.assert_called_once()
+
+        # Check the magnet URI that was passed to it
+        call_args, _ = mock_parse_magnet_uri.call_args
+        magnet_uri = call_args[0]
+
+        assert f"magnet:?xt=urn:btih:{infohash}" in magnet_uri
+        for tracker in client.trackers:
+            assert f"&tr={tracker}" in magnet_uri
