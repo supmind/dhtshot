@@ -276,7 +276,7 @@ class ScreenshotService:
         video_file_index, video_file_size, video_file_offset = -1, -1, -1
         fs = ti.files()
         for i in range(fs.num_files()):
-            if fs.file_path(i).lower().endswith(('.mp4', '.mkv', '.avi')) and fs.file_size(i) > video_file_size:
+            if fs.file_path(i).lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
                 video_file_size = fs.file_size(i)
                 video_file_index = i
                 video_file_offset = fs.file_offset(i)
