@@ -319,6 +319,7 @@ class ScreenshotService:
         # --- 阶段 1: 恢复或重新开始 ---
         is_resume = resume_data and resume_data.get('moov_data_b64')
 
+        screenshots_generated_so_far = 0 # 初始化截至目前生成的截图总数
         if is_resume:
             self.log.info(f"使用丰富的 resume_data 恢复任务 {infohash_hex}。")
             try:
@@ -326,6 +327,8 @@ class ScreenshotService:
                 video_file_offset = resume_data['video_file_offset']
                 all_kf_indices = resume_data['all_kf_indices']
                 already_processed_indices = set(resume_data.get('processed_kf_indices', []))
+                # 恢复之前运行中已生成的截图数量
+                screenshots_generated_so_far = resume_data.get('screenshots_generated_so_far', 0)
 
                 extractor = H264KeyframeExtractor(moov_data)
                 all_keyframes = extractor.keyframes
@@ -436,17 +439,21 @@ class ScreenshotService:
 
             # 为下次恢复创建丰富的 resume data
             final_processed_indices = sorted(list(already_processed_indices.union(newly_processed_indices)))
+            new_screenshots_this_run = len(newly_processed_indices)
+            total_screenshots_so_far = screenshots_generated_so_far + new_screenshots_this_run
+
             rich_resume_data = {
                 "moov_data_b64": base64.b64encode(moov_data).decode('ascii'),
                 "video_file_offset": video_file_offset,
                 "piece_length": piece_length,
                 "all_kf_indices": all_kf_indices,
                 "processed_kf_indices": final_processed_indices,
+                "screenshots_generated_so_far": total_screenshots_so_far, # 保存累积总数以供下次恢复
             }
             return PartialSuccessResult(
                 infohash=infohash_hex,
-                screenshots_count=len(newly_processed_indices),
-                reason=f"等待 pieces 超时。本次运行处理了 {len(keyframes_to_process)} 帧中的 {len(newly_processed_indices)} 帧。",
+                screenshots_count=new_screenshots_this_run, # 本次运行生成的数量
+                reason=f"等待 pieces 超时。本次运行处理了 {len(keyframes_to_process)} 帧中的 {new_screenshots_this_run} 帧。",
                 resume_data=rich_resume_data
             )
 
@@ -455,8 +462,9 @@ class ScreenshotService:
             results = await asyncio.gather(*generation_tasks)
             screenshots_generated_in_this_run = sum(1 for r in results if r is True)
 
-        self.log.info(f"{infohash_hex} 的截图任务完成。本次运行生成了 {screenshots_generated_in_this_run} 张截图。")
-        return AllSuccessResult(infohash=infohash_hex, screenshots_count=screenshots_generated_in_this_run)
+        total_screenshots = screenshots_generated_so_far + screenshots_generated_in_this_run
+        self.log.info(f"{infohash_hex} 的截图任务完成。本次运行生成了 {screenshots_generated_in_this_run} 张截图，总计 {total_screenshots} 张。")
+        return AllSuccessResult(infohash=infohash_hex, screenshots_count=total_screenshots)
 
     async def _handle_screenshot_task(self, task_info: dict):
         """截图任务的完整生命周期，包括 torrent 句柄管理。"""

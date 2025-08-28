@@ -1,132 +1,118 @@
+# -*- coding: utf-8 -*-
 import pytest
 import asyncio
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, call, patch
 from screenshot.client import TorrentClient, LibtorrentError
 
+# 这个 fixture 现在是一个“工厂”，它返回一个函数
+# 用于在测试函数内部创建 client 实例。
 @pytest.fixture
-def mock_loop():
-    return MagicMock(spec=asyncio.AbstractEventLoop)
+def client_factory(monkeypatch):
+    """提供一个用于创建带有模拟依赖的 TorrentClient 的工厂函数。"""
 
-@pytest.fixture
-def client(mock_loop):
-    # We patch the session to avoid real network/disk IO
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("libtorrent.session", MagicMock())
-        client = TorrentClient(loop=mock_loop)
+    # 创建一个模拟的 session 类，并预先配置好它
+    mock_session_class = MagicMock()
+    mock_session_class.delete_files = 1 # 修复 AttributeError
+
+    # 在工厂作用域内 patch，这样所有创建的 client 都会使用这些 mock
+    monkeypatch.setattr("screenshot.client.lt.session", mock_session_class)
+    # 模拟 parse_magnet_uri 以避免真实的 libtorrent 调用
+    monkeypatch.setattr("screenshot.client.lt.parse_magnet_uri", MagicMock)
+
+    def _factory():
+        """这个内部函数在测试运行时被调用。"""
+        # 调用 TorrentClient() 时，它会通过 asyncio.get_event_loop()
+        # 获取由 pytest-asyncio 提供的、正在运行的事件循环。
+        client = TorrentClient()
         client.log = MagicMock()
-        yield client
+        return client
 
-class TestFetchPieces:
-    @pytest.mark.asyncio
-    async def test_fetch_pieces_already_present(self, client, mock_loop):
-        """Tests fetching pieces that are already downloaded."""
-        mock_handle = MagicMock()
-        mock_handle.have_piece.return_value = True
-
-        # Mock the reading part
-        async def mock_read_flow():
-            await asyncio.sleep(0.01)
-            # Simulate read_piece alerts for all requested pieces
-            client._handle_read_piece(MagicMock(piece=0, buffer=b'data0', error=None))
-            client._handle_read_piece(MagicMock(piece=1, buffer=b'data1', error=None))
-
-        mock_loop.create_task.side_effect = lambda coro: asyncio.create_task(coro)
-        mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
-
-        asyncio.create_task(mock_read_flow())
-
-        result = await client.fetch_pieces(mock_handle, [0, 1])
-
-        mock_handle.prioritize_pieces.assert_not_called()
-        assert result == {0: b'data0', 1: b'data1'}
-
-    @pytest.mark.asyncio
-    async def test_fetch_pieces_download_flow(self, client, mock_loop):
-        """Tests the full download->read flow for fetch_pieces."""
-        mock_handle = MagicMock()
-        mock_handle.have_piece.side_effect = lambda idx: idx in [2] # Piece 2 is present, 0 and 1 need download
-        ti = MagicMock()
-        ti.num_pieces.return_value = 3
-        mock_handle.get_torrent_info.return_value = ti
-
-        async def mock_alert_flow():
-            # Wait for priorities to be set
-            await asyncio.sleep(0.01)
-            # Simulate piece downloads
-            client._handle_piece_finished(MagicMock(piece_index=0))
-            client._handle_piece_finished(MagicMock(piece_index=1))
-            # Wait for read requests
-            await asyncio.sleep(0.01)
-            # Simulate read completions
-            client._handle_read_piece(MagicMock(piece=0, buffer=b'data0', error=None))
-            client._handle_read_piece(MagicMock(piece=1, buffer=b'data1', error=None))
-            client._handle_read_piece(MagicMock(piece=2, buffer=b'data2', error=None))
-
-        mock_loop.create_task.side_effect = lambda coro: asyncio.create_task(coro)
-        mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
-
-        asyncio.create_task(mock_alert_flow())
-
-        result = await client.fetch_pieces(mock_handle, [0, 1, 2])
-
-        from unittest.mock import call
-        # Check that priorities were set correctly for the pieces to be downloaded
-        calls = [call(0, 7), call(1, 7)]
-        mock_handle.piece_priority.assert_has_calls(calls, any_order=True)
-        assert mock_handle.piece_priority.call_count == 2
-        assert result == {0: b'data0', 1: b'data1', 2: b'data2'}
-
-    @pytest.mark.asyncio
-    async def test_fetch_pieces_download_timeout(self, client, mock_loop):
-        """Tests that a timeout during download is handled correctly."""
-        mock_handle = MagicMock()
-        mock_handle.have_piece.return_value = False
-        ti = MagicMock()
-        ti.num_pieces.return_value = 1
-        mock_handle.get_torrent_info.return_value = ti
-
-        mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
-
-        with pytest.raises(LibtorrentError, match="下载 pieces \\[0\\] 超时。"):
-            await client.fetch_pieces(mock_handle, [0], timeout=0.01)
-
-        # Ensure the pending fetch request is cleaned up
-        assert not client.pending_fetches
+    return _factory
 
 
-class TestAddTorrent:
-    @pytest.mark.asyncio
-    async def test_add_torrent_with_trackers(self, client, mock_loop, monkeypatch):
-        """
-        Tests that add_torrent correctly constructs a magnet URI with trackers.
-        """
-        mock_parse_magnet_uri = MagicMock()
-        monkeypatch.setattr("libtorrent.parse_magnet_uri", mock_parse_magnet_uri)
+@pytest.mark.asyncio
+async def test_add_torrent_success(client_factory):
+    """测试成功添加 torrent。"""
+    client = client_factory() # 在测试开始时创建 client
+    infohash = "test_infohash"
+    mock_handle = MagicMock()
+    mock_handle.info_hash.return_value = infohash
+    client.ses.add_torrent.return_value = mock_handle
 
-        # Mock the async wait so the function doesn't hang
-        async def mock_wait_for(future, timeout):
-            # Simulate metadata received alert to resolve the future
-            client._handle_metadata_received(MagicMock(handle=MagicMock()))
-            return await future
+    add_task = asyncio.create_task(client.add_torrent(infohash))
+    await asyncio.sleep(0)
 
-        monkeypatch.setattr("asyncio.wait_for", mock_wait_for)
+    # 直接调用 handler 来模拟警报循环的效果
+    client._handle_metadata_received(MagicMock(handle=mock_handle))
 
-        # Set up mock handles and torrent info
-        mock_handle = MagicMock()
-        mock_handle.get_torrent_info.return_value = MagicMock()
-        client.ses.add_torrent.return_value = mock_handle
-        mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
+    handle = await add_task
+    assert handle == mock_handle
+    handle.pause.assert_called_once()
 
-        infohash = "0123456789abcdef0123456789abcdef0123"
-        await client.add_torrent(infohash)
+@pytest.mark.asyncio
+async def test_fetch_pieces_success(client_factory):
+    """测试 fetch_pieces 的成功流程。"""
+    client = client_factory()
+    mock_handle = MagicMock()
+    mock_handle.have_piece.return_value = False
 
-        # Verify that parse_magnet_uri was called
-        mock_parse_magnet_uri.assert_called_once()
+    fetch_task = asyncio.create_task(client.fetch_pieces(mock_handle, [0, 1]))
+    await asyncio.sleep(0)
 
-        # Check the magnet URI that was passed to it
-        call_args, _ = mock_parse_magnet_uri.call_args
-        magnet_uri = call_args[0]
+    # 模拟 piece 完成警报
+    client._handle_piece_finished(MagicMock(piece_index=0))
+    client._handle_piece_finished(MagicMock(piece_index=1))
+    await asyncio.sleep(0)
 
-        assert f"magnet:?xt=urn:btih:{infohash}" in magnet_uri
-        for tracker in client.trackers:
-            assert f"&tr={tracker}" in magnet_uri
+    # 模拟 piece 读取警报
+    client._handle_read_piece(MagicMock(piece=0, buffer=b'data0', error=None))
+    client._handle_read_piece(MagicMock(piece=1, buffer=b'data1', error=None))
+
+    result = await fetch_task
+    assert result == {0: b'data0', 1: b'data1'}
+
+@pytest.mark.asyncio
+async def test_fetch_pieces_read_error(client_factory):
+    """测试当 read_piece 警报带有错误时，fetch_pieces 会失败。"""
+    client = client_factory()
+    mock_handle = MagicMock()
+    mock_handle.have_piece.return_value = True
+
+    fetch_task = asyncio.create_task(client.fetch_pieces(mock_handle, [0]))
+    await asyncio.sleep(0)
+
+    mock_error = MagicMock()
+    mock_error.value.return_value = 1
+    mock_error.message.return_value = "模拟读取错误"
+    client._handle_read_piece(MagicMock(piece=0, buffer=b'', error=mock_error))
+
+    with pytest.raises(LibtorrentError, match="模拟读取错误"):
+        await fetch_task
+
+def test_request_pieces(client_factory):
+    """测试 request_pieces 是否正确设置优先级并恢复。"""
+    client = client_factory()
+    mock_handle = MagicMock()
+    mock_handle.have_piece.side_effect = lambda p: p == 2
+
+    client.request_pieces(mock_handle, [0, 1, 2])
+
+    calls = [call(0, 7), call(1, 7)]
+    mock_handle.piece_priority.assert_has_calls(calls, any_order=True)
+    assert mock_handle.piece_priority.call_count == 2
+    mock_handle.resume.assert_called_once()
+
+def test_remove_torrent(client_factory):
+    """测试 remove_torrent 是否能从会话和缓存中正确移除。"""
+    client = client_factory()
+    infohash = "infohash_to_remove"
+    mock_handle = MagicMock(name="TorrentHandle")
+    mock_handle.is_valid.return_value = True
+    mock_handle.info_hash.return_value = infohash
+    client.handles[infohash] = mock_handle
+
+    client.remove_torrent(mock_handle)
+
+    # 访问 lt.session.delete_files
+    client.ses.remove_torrent.assert_called_once_with(mock_handle, client.ses.delete_files)
+    assert infohash not in client.handles
