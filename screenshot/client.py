@@ -136,33 +136,36 @@ class TorrentClient:
         4.  **等待元数据**: 异步等待，直到 `_alert_loop` 收到 `metadata_received_alert` 并通过 Future 发出信号。
         5.  **初始化设置**: 收到元数据后，暂停 torrent 并将所有 piece 的优先级设为0，以便我们只下载明确请求的数据。
         """
-        if infohash in self.handles and self.handles[infohash].is_valid():
-            self.log.info(f"从缓存返回 {infohash} 的现有句柄。")
-            self.handles.move_to_end(infohash)
-            return self.handles[infohash]
+        # --- 线程安全修复: 缓存检查 ---
+        if infohash in self.handles:
+            handle = self.handles[infohash]
+            is_valid = await self.loop.run_in_executor(None, lambda h: h.is_valid(), handle)
+            if is_valid:
+                self.log.info(f"从缓存返回 {infohash} 的现有句柄。")
+                self.handles.move_to_end(infohash)
+                return handle
 
         self.log.info(f"为 infohash 添加新 torrent: {infohash}")
 
-        # --- LRU 缓存管理与死锁修复 ---
+        # --- LRU 缓存管理 ---
         if len(self.handles) >= self.max_cache_size:
             old_infohash, old_handle = self.handles.popitem(last=False)
             self.log.info(f"缓存已满。正在移除最久未使用的句柄: {old_infohash}")
-            # **死锁修复**: `remove_torrent` 是一个同步、可能阻塞的方法，因为它内部有锁和 I/O 操作。
-            # 直接在 `add_torrent` (一个 async 函数) 中调用它会导致死锁风险：
-            # 一个协程可能持有 `fetch_lock` 并等待 I/O，而此处的 `add_torrent` 调用 `remove_torrent`
-            # 并试图获取同一个 `fetch_lock`。
-            # 解决方案是使用 `run_in_executor` 将 `remove_torrent` 的执行推迟到一个独立的线程中，
-            # 从而断开调用链，避免死锁。
             self.loop.run_in_executor(None, self.remove_torrent, old_handle)
 
-        save_dir = os.path.join(self.save_path, infohash)
+        # --- 线程安全修复: 在执行器中添加 torrent ---
         meta_future = self.loop.create_future()
         self.pending_metadata[infohash] = meta_future
-        tracker_urls = "".join([f"&tr={t}" for t in self.trackers])
-        magnet_uri = f"magnet:?xt=urn:btih:{infohash}{tracker_urls}"
-        params = lt.parse_magnet_uri(magnet_uri)
-        params.save_path = save_dir
-        handle = self.ses.add_torrent(params)
+
+        def _add_torrent_sync():
+            save_dir = os.path.join(self.save_path, infohash)
+            tracker_urls = "".join([f"&tr={t}" for t in self.trackers])
+            magnet_uri = f"magnet:?xt=urn:btih:{infohash}{tracker_urls}"
+            params = lt.parse_magnet_uri(magnet_uri)
+            params.save_path = save_dir
+            return self.ses.add_torrent(params)
+
+        handle = await self.loop.run_in_executor(None, _add_torrent_sync)
         self.handles[infohash] = handle
 
         self.log.debug(f"正在等待 {infohash} 的元数据...")
@@ -170,17 +173,29 @@ class TorrentClient:
             await asyncio.wait_for(meta_future, timeout=timeout)
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
+            # 立即从状态中移除，防止重入问题
             self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
+            try:
+                # 死锁修复: 我们等待底层的 libtorrent 调用完成，而不是我们自己
+                # 复杂的、带锁的 remove_torrent 方法，以避免死锁。
+                await self.loop.run_in_executor(None, self.ses.remove_torrent, handle, lt.session.delete_files)
+            except Exception as e:
+                self.log.exception(f"清理 torrent 会话 {infohash} 时发生错误。")
             raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
 
         self.log.info(f"成功获取 {infohash} 的元数据。暂停 torrent。")
-        handle.pause()
-        ti = handle.get_torrent_info()
-        if ti:
-            self.log.info(f"为 {infohash} 设置所有 piece 优先级为 0。")
-            for i in range(ti.num_pieces()):
-                handle.piece_priority(i, 0)
+
+        # --- 线程安全修复: 在执行器中暂停并设置优先级 ---
+        def _pause_and_set_priorities_sync(h):
+            h.pause()
+            ti = h.get_torrent_info()
+            if ti:
+                self.log.info(f"为 {infohash} 设置所有 piece 优先级为 0。")
+                for i in range(ti.num_pieces()):
+                    h.piece_priority(i, 0)
+
+        await self.loop.run_in_executor(None, _pause_and_set_priorities_sync, handle)
         return handle
 
     def remove_torrent(self, handle):
@@ -217,38 +232,48 @@ class TorrentClient:
         self.ses.remove_torrent(handle, lt.session.delete_files)
         self.log.info(f"已移除 torrent: {infohash}")
 
-    def request_pieces(self, handle, piece_indices: list[int]):
+    async def request_pieces(self, handle, piece_indices: list[int]):
         """按需请求一组特定的 piece，但不等待它们完成。"""
-        if not handle.is_valid():
-            self.log.warning("请求 pieces 时使用了无效的句柄。")
-            return
-        if not piece_indices:
-            return
+        def _request_sync():
+            if not handle.is_valid():
+                self.log.warning("请求 pieces 时使用了无效的句柄。")
+                return
+            if not piece_indices:
+                return
 
-        unique_indices = sorted(list(set(piece_indices)))
-        pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
+            unique_indices = sorted(list(set(piece_indices)))
+            pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
 
-        if pieces_to_request:
-            for p in pieces_to_request:
-                handle.piece_priority(p, 7)
-            handle.resume()
+            if pieces_to_request:
+                for p in pieces_to_request:
+                    handle.piece_priority(p, 7)
+                handle.resume()
+
+        await self.loop.run_in_executor(None, _request_sync)
 
     async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         """按需下载、读取并返回一组特定的 piece。"""
-        if not handle.is_valid():
+        is_valid = await self.loop.run_in_executor(None, lambda: handle.is_valid())
+        if not is_valid:
             raise LibtorrentError("获取 pieces 时使用了无效的句柄。")
         if not piece_indices:
             return {}
 
         unique_indices = sorted(list(set(piece_indices)))
-        pieces_to_download = [p for p in unique_indices if not handle.have_piece(p)]
+
+        def _prepare_download_sync():
+            # 在执行器线程中安全地检查 piece 状态并设置优先级
+            pieces_to_download = [p for p in unique_indices if not handle.have_piece(p)]
+            if pieces_to_download:
+                self.log.info(f"需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
+                for p in pieces_to_download:
+                    handle.piece_priority(p, 7)
+                handle.resume()
+            return pieces_to_download
+
+        pieces_to_download = await self.loop.run_in_executor(None, _prepare_download_sync)
 
         if pieces_to_download:
-            self.log.info(f"需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
-            for p in pieces_to_download:
-                handle.piece_priority(p, 7)
-            handle.resume()
-
             request_future = self.loop.create_future()
             with self.fetch_lock:
                 fetch_id = self.next_fetch_id
@@ -256,9 +281,8 @@ class TorrentClient:
                 self.pending_fetches[fetch_id] = {
                     'future': request_future,
                     'remaining': set(pieces_to_download),
-                    'handle': handle  # 存储句柄引用以便在清理时进行匹配
+                    'handle': handle
                 }
-
             try:
                 await asyncio.wait_for(request_future, timeout=timeout)
             except asyncio.TimeoutError:
@@ -270,7 +294,8 @@ class TorrentClient:
             read_future = self.loop.create_future()
             with self.pending_reads_lock:
                 self.pending_reads[piece_index].append(read_future)
-            handle.read_piece(piece_index)
+            # 在执行器线程中安全地读取 piece 数据
+            await self.loop.run_in_executor(None, handle.read_piece, piece_index)
             return await read_future
 
         try:
@@ -363,7 +388,7 @@ class TorrentClient:
 
                 now = time.time()
                 if now - self.last_dht_log_time > 10:
-                    status = self.ses.status()
+                    status = await self.loop.run_in_executor(None, self.ses.status)
                     self.log.info(f"DHT 状态: {status.dht_nodes} 个节点。")
                     self.last_dht_log_time = now
             except asyncio.CancelledError:

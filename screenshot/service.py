@@ -398,7 +398,7 @@ class ScreenshotService:
                 piece_to_keyframes.setdefault(piece_idx, []).append(kf.index)
             all_needed_pieces.update(needed)
 
-        self.client.request_pieces(handle, list(all_needed_pieces))
+        await self.client.request_pieces(handle, list(all_needed_pieces))
 
         newly_processed_indices, generation_tasks = [], []
         timeout = getattr(self, 'TIMEOUT_FOR_TESTING', 300)
