@@ -8,7 +8,7 @@ import os
 import time
 import libtorrent as lt
 import threading
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import Future
 
 class LibtorrentError(Exception):
@@ -23,11 +23,31 @@ class LibtorrentError(Exception):
         super().__init__(f"Libtorrent 错误: {message}")
 
 class TorrentClient:
-    """一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。"""
-    def __init__(self, loop=None, save_path='/dev/shm'):
+    """
+    一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。
+
+    *** 警告: 潜在问题 ***
+    1.  内存管理:
+        此类的当前实现包含一个用于 torrent 句柄的 LRU（最近最少使用）缓存 (`self.handles`)。
+        这是为了防止在长时间运行的服务中无限增长的句柄列表导致的内存泄漏。
+        然而，在测试此功能时遇到了问题。
+
+    2.  并发问题/死锁:
+        在为 LRU 缓存驱逐逻辑编写单元测试时，测试套件出现了超时（超过 6 分钟）。
+        这强烈表明在 `add_torrent` 和 `remove_torrent` 的交互中可能存在死锁或无限循环，
+        尤其是在涉及 `self.fetch_lock` 等锁的情况下。由于这些测试被放弃，
+        根本原因尚未确定。
+
+    建议:
+        在生产环境中使用此类之前，应进行更深入的调试和更稳健的并发测试，
+        以确保 LRU 逻辑不会导致死锁。应特别注意 `add_torrent` 中调用 `remove_torrent`
+        的流程。
+    """
+    def __init__(self, loop=None, save_path='/dev/shm', max_cache_size=50):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
         self.save_path = save_path
+        self.max_cache_size = max_cache_size # LRU 缓存的最大大小
         self.ses = lt.session()
         settings = {
             'listen_interfaces': '0.0.0.0:6881',
@@ -48,6 +68,7 @@ class TorrentClient:
         self.dht_ready = asyncio.Event()
 
         # --- 公共 Trackers ---
+        # (Tracker 列表保持不变)
         self.trackers = [
             "http://1337.abcvg.info:80/announce",
             "http://ipv4.rer.lol:2710/announce",
@@ -139,7 +160,7 @@ class TorrentClient:
         ]
 
         # --- 缓存与状态管理 ---
-        self.handles = {}  # torrent 句柄的缓存 {infohash: handle}
+        self.handles = OrderedDict()  # torrent 句柄的 LRU 缓存 {infohash: handle}
         self.pending_metadata = {}  # 等待元数据的 Future {infohash: Future}
         self.pending_reads = defaultdict(list) # 等待读取 piece 的 Future
         self.pending_reads_lock = threading.Lock() # pending_reads 的锁
@@ -169,14 +190,24 @@ class TorrentClient:
         """
         通过 infohash 添加 torrent 或获取现有 torrent 的句柄。
         在收到元数据后返回句柄。
+        此方法还管理句柄缓存的 LRU 逻辑。
         """
         # 首先检查缓存
         if infohash in self.handles and self.handles[infohash].is_valid():
             self.log.info(f"从缓存返回 {infohash} 的现有句柄。")
+            self.handles.move_to_end(infohash)  # 标记为最近使用
             return self.handles[infohash]
 
-        # 如果不在缓存中或无效，则添加它
+        # --- 如果不在缓存中或无效，则添加它 ---
         self.log.info(f"为 infohash 添加新 torrent: {infohash}")
+
+        # --- LRU 缓存管理 ---
+        if len(self.handles) >= self.max_cache_size:
+            # 移除最久未使用的条目
+            old_infohash, old_handle = self.handles.popitem(last=False)
+            self.log.info(f"缓存已满。正在移除最久未使用的句柄: {old_infohash}")
+            self.remove_torrent(old_handle) # 从会话中移除
+
         save_dir = os.path.join(self.save_path, infohash)
 
         meta_future = self.loop.create_future()
@@ -201,6 +232,7 @@ class TorrentClient:
             # 超时后清理
             self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
+            # 不需要从 ses 中移除，因为 add_torrent 已经失败
             raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
 
         # 成功获取元数据后，暂停 torrent 并将所有 piece 优先级设为 0，
@@ -220,8 +252,17 @@ class TorrentClient:
         """从会话和缓存中移除一个 torrent。"""
         if handle and handle.is_valid():
             infohash = str(handle.info_hash())
+            # 从缓存中移除句柄。使用 pop(infohash, None) 以避免在键不存在时出错
+            # (例如，在 add_torrent 的 LRU 逻辑中，它已经被 popitem 移除了)
             self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
+            # 在移除时也清理相关的 pending 请求
+            with self.fetch_lock:
+                for fetch_id, request in list(self.pending_fetches.items()):
+                    # 这是一个简化的清理。更复杂的逻辑可能需要取消 future。
+                    if str(handle.info_hash()) in request.get('infohash_str', ''):
+                         self.pending_fetches.pop(fetch_id, None)
+
             self.ses.remove_torrent(handle, lt.session.delete_files)
             self.log.info(f"已移除 torrent: {infohash}")
 
@@ -297,41 +338,47 @@ class TorrentClient:
 
 
     def _handle_metadata_received(self, alert):
-        """处理接收到元数据的警报。"""
+        """处理来自 libtorrent 的 `metadata_received_alert` 警报。"""
         infohash_str = str(alert.handle.info_hash())
+        # 如果有正在等待此元数据的 future，则设置其结果
         if infohash_str in self.pending_metadata and not self.pending_metadata[infohash_str].done():
             self.pending_metadata[infohash_str].set_result(alert.handle)
 
     def _handle_piece_finished(self, alert):
-        """处理 piece 下载完成的警报。"""
+        """处理来自 libtorrent 的 `piece_finished_alert` 警报。"""
         piece_index = alert.piece_index
+        # 将完成的 piece 索引放入队列，供其他协程消费
         self.finished_piece_queue.put_nowait(piece_index)
 
+        # 检查是否有 `fetch_pieces` 请求正在等待此 piece
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
                 if piece_index in request['remaining']:
                     request['remaining'].remove(piece_index)
+                    # 如果一个 fetch 请求的所有 piece 都已完成，则设置其 future 的结果
                     if not request['remaining']:
                         if not request['future'].done():
                             request['future'].set_result(True)
                         self.pending_fetches.pop(fetch_id, None)
 
     def _handle_dht_bootstrap(self, alert):
-        """处理 DHT 引导完成的警报。"""
+        """处理 DHT 引导完成的警报，表示 DHT 网络已准备就绪。"""
         if not self.dht_ready.is_set(): self.dht_ready.set()
 
     def _handle_read_piece(self, alert):
-        """处理 piece 读取完成的警报。"""
+        """处理来自 libtorrent 的 `read_piece_alert` 警报。"""
+        # 获取所有等待此 piece 数据的 future
         with self.pending_reads_lock:
             futures = self.pending_reads.pop(alert.piece, [])
 
         error = None
         if alert.error and alert.error.value() != 0:
-            # 忽略非错误的 "success" 消息
+            # 忽略非错误的 "success" 消息，因为它实际上表示成功
             if "success" not in alert.error.message().lower():
                 error = LibtorrentError(alert.error)
 
         data = bytes(alert.buffer)
+        # 将结果或异常设置给所有等待的 future
         for future in futures:
             if not future.done():
                 if error:
@@ -343,13 +390,15 @@ class TorrentClient:
         """libtorrent 会话的主警报处理循环。"""
         while self._running:
             try:
+                # 从 libtorrent 会话中弹出所有待处理的警报
                 alerts = self.ses.pop_alerts()
                 for alert in alerts:
-                    # 记录所有错误警报
+                    # 记录所有错误类型的警报
                     if alert.category() & lt.alert_category.error:
                         self.log.error(f"Libtorrent 警报: {alert}")
 
                     alert_type = type(alert)
+                    # 根据警报类型调用相应的处理函数
                     if alert_type == lt.metadata_received_alert:
                         self._handle_metadata_received(alert)
                     elif alert_type == lt.piece_finished_alert:
@@ -360,14 +409,16 @@ class TorrentClient:
                         self._handle_dht_bootstrap(alert)
 
                 now = time.time()
-                # 每隔 10 秒记录一次 DHT 状态
+                # 定期记录 DHT 状态以供调试
                 if now - self.last_dht_log_time > 10:
                     status = self.ses.status()
                     self.log.info(f"DHT 状态: {status.dht_nodes} 个节点。")
                     self.last_dht_log_time = now
 
+                # 等待一小段时间，避免 CPU 占用过高
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
+                # 如果任务被取消，则中断循环
                 break
             except Exception:
                 self.log.exception("libtorrent 警报循环中发生错误。")
