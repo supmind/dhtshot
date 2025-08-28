@@ -3,9 +3,10 @@ import asyncio
 import logging
 import io
 import struct
+import base64
 from dataclasses import dataclass, field
 from typing import Generator, Tuple, Optional, Dict, Any, Callable
-from .client import TorrentClient
+from .client import TorrentClient, LibtorrentError
 from .extractor import H264KeyframeExtractor, Keyframe
 from .generator import ScreenshotGenerator
 
@@ -196,32 +197,30 @@ class ScreenshotService:
         head_size = min(initial_probe_size, video_file_size)
         head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
 
-        try:
-            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=120)
-            head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
+        moov_timeout = getattr(self, 'MOOV_TIMEOUT_FOR_TESTING', 120)
+        head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=moov_timeout)
+        head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
 
-            stream = io.BytesIO(head_data)
-            for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
-                self.log.info(f"Found box '{box_type}' at offset {box_offset} with size {box_size} in head.")
-                if box_type == 'moov':
-                    self.log.info("Found 'moov' atom in head probe.")
-                    if len(partial_box_data) < box_size:
-                        self.log.info(f"Initial probe got {len(partial_box_data)}/{box_size} bytes of moov. Fetching remainder.")
-                        full_moov_offset_in_torrent = video_file_offset + box_offset
-                        needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
+        stream = io.BytesIO(head_data)
+        for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
+            self.log.info(f"Found box '{box_type}' at offset {box_offset} with size {box_size} in head.")
+            if box_type == 'moov':
+                self.log.info("Found 'moov' atom in head probe.")
+                if len(partial_box_data) < box_size:
+                    self.log.info(f"Initial probe got {len(partial_box_data)}/{box_size} bytes of moov. Fetching remainder.")
+                    full_moov_offset_in_torrent = video_file_offset + box_offset
+                    needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
 
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=120)
-                        return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
-                    else:
-                        return partial_box_data
+                    moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=moov_timeout)
+                    return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
+                else:
+                    return partial_box_data
 
-                if box_type == 'mdat':
-                    if box_size > video_file_size * 0.8:
-                         self.log.info("Found large 'mdat' box in head. Assuming 'moov' is at the tail.")
-                         mdat_size_from_head = box_size
-                         break
-        except Exception as e:
-            self.log.error(f"Error during head probe for moov atom: {e}", exc_info=True)
+            if box_type == 'mdat':
+                if box_size > video_file_size * 0.8:
+                        self.log.info("Found large 'mdat' box in head. Assuming 'moov' is at the tail.")
+                        mdat_size_from_head = box_size
+                        break
 
         # --- Tail Probe (Fallback) ---
         self.log.info("Phase 2: Moov not in head, probing file tail.")
@@ -238,32 +237,30 @@ class ScreenshotService:
         tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
         tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
 
-        try:
-            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=180)
-            tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
+        moov_timeout = getattr(self, 'MOOV_TIMEOUT_FOR_TESTING', 180)
+        tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=moov_timeout)
+        tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
 
-            search_pos = len(tail_data)
-            while search_pos > 4:
-                found_pos = tail_data.rfind(b'moov', 0, search_pos)
-                if found_pos == -1:
-                    break
-                potential_start_pos = found_pos - 4
-                if potential_start_pos < 0:
-                    search_pos = found_pos
-                    continue
-                try:
-                    stream = io.BytesIO(tail_data)
-                    stream.seek(potential_start_pos)
-                    box_type, full_box_data, _, _ = next(self._parse_mp4_boxes(stream), (None, None, None, None))
-
-                    if box_type == 'moov':
-                        self.log.info(f"Successfully parsed 'moov' atom from tail with size {len(full_box_data)}.")
-                        return full_box_data
-                except Exception:
-                    pass
+        search_pos = len(tail_data)
+        while search_pos > 4:
+            found_pos = tail_data.rfind(b'moov', 0, search_pos)
+            if found_pos == -1:
+                break
+            potential_start_pos = found_pos - 4
+            if potential_start_pos < 0:
                 search_pos = found_pos
-        except Exception as e:
-            self.log.error(f"Error during tail probe for moov atom: {e}", exc_info=True)
+                continue
+            try:
+                stream = io.BytesIO(tail_data)
+                stream.seek(potential_start_pos)
+                box_type, full_box_data, _, _ = next(self._parse_mp4_boxes(stream), (None, None, None, None))
+
+                if box_type == 'moov':
+                    self.log.info(f"Successfully parsed 'moov' atom from tail with size {len(full_box_data)}.")
+                    return full_box_data
+            except Exception:
+                pass
+            search_pos = found_pos
 
         return None
 
@@ -280,7 +277,7 @@ class ScreenshotService:
 
             if len(packet_data_bytes) != sample.size:
                 self.log.warning(f"Incomplete data for keyframe {keyframe.index}, skipping.")
-                return
+                return False
 
             if extractor.mode == 'avc1':
                 annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
@@ -305,8 +302,10 @@ class ScreenshotService:
                 infohash_hex=infohash_hex,
                 timestamp_str=timestamp_str
             )
+            return True
         except Exception as e:
             self.log.error(f"Failed to process keyframe {keyframe.index}: {e}", exc_info=True)
+            return False
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data: Optional[Dict[str, Any]] = None):
         """
@@ -316,129 +315,145 @@ class ScreenshotService:
         ti = handle.get_torrent_info()
         piece_length = ti.piece_length()
 
-        # --- Phase 1: Find video file and metadata ---
+        # --- Phase 1: Resume or Start Fresh ---
+        is_resume = resume_data and resume_data.get('moov_data_b64')
 
-        # Find the largest video file
-        video_file_index, video_file_size, video_file_offset = -1, -1, -1
-        fs = ti.files()
-        for i in range(fs.num_files()):
-            if fs.file_path(i).lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
-                video_file_size = fs.file_size(i)
-                video_file_index = i
-                video_file_offset = fs.file_offset(i)
+        if is_resume:
+            self.log.info(f"Resuming task for {infohash_hex} with rich resume_data.")
+            try:
+                moov_data = base64.b64decode(resume_data['moov_data_b64'])
+                video_file_offset = resume_data['video_file_offset']
+                all_kf_indices = resume_data['all_kf_indices']
+                already_processed_indices = set(resume_data.get('processed_kf_indices', []))
 
-        if video_file_index == -1:
-            self.log.warning(f"No .mp4 video file found in torrent {infohash_hex}.")
-            return FatalErrorResult(infohash=infohash_hex, reason="No .mp4 video file found in torrent")
+                extractor = H264KeyframeExtractor(moov_data)
+                all_keyframes = extractor.keyframes
 
-        video_file_path = fs.file_path(video_file_index)
-        self.log.info(f"Found video file: '{video_file_path}' ({video_file_size} bytes).")
+                # Filter to get the keyframes that still need processing
+                keyframes_to_process = [kf for kf in all_keyframes if kf.index in all_kf_indices and kf.index not in already_processed_indices]
 
-        # Get the moov atom (contains metadata)
-        try:
-            moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
-            if not moov_data:
-                self.log.error(f"Could not find or parse moov atom for {infohash_hex}.")
-                return FatalErrorResult(infohash=infohash_hex, reason="Could not find or parse moov atom")
-        except asyncio.TimeoutError:
-             return PartialSuccessResult(infohash=infohash_hex, screenshots_count=0, reason="Timeout fetching moov atom", resume_data={})
-        except Exception as e:
-            self.log.error(f"Error getting moov atom for {infohash_hex}: {e}", exc_info=True)
-            return FatalErrorResult(infohash=infohash_hex, reason=f"Error getting moov atom: {e}")
-
-
-        # --- Phase 2: Extract and select keyframes ---
-
-        try:
-            extractor = H264KeyframeExtractor(moov_data)
-            all_keyframes = extractor.keyframes
-        except Exception as e:
-            self.log.error(f"Failed to initialize H264KeyframeExtractor for {infohash_hex}: {e}", exc_info=True)
-            return FatalErrorResult(infohash=infohash_hex, reason=f"Failed to parse video metadata: {e}")
-
-        if not all_keyframes:
-            self.log.error(f"Could not extract any keyframes from {infohash_hex}.")
-            return FatalErrorResult(infohash=infohash_hex, reason="Could not extract any keyframes from video file")
-
-        # If resuming, filter to only unprocessed keyframes. Otherwise, select a fresh set.
-        unprocessed_kf_indices = resume_data.get('unprocessed_kf_indices') if resume_data else None
-        if unprocessed_kf_indices is not None:
-            self.log.info(f"Resuming task, filtering for {len(unprocessed_kf_indices)} remaining keyframes.")
-            selected_keyframes = [kf for kf in all_keyframes if kf.index in unprocessed_kf_indices]
+            except Exception as e:
+                self.log.error(f"Failed to parse rich resume_data for {infohash_hex}: {e}", exc_info=True)
+                return FatalErrorResult(infohash=infohash_hex, reason=f"Failed to parse resume_data: {e}")
         else:
-            MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
-            duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
-            num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
-            if len(all_keyframes) <= num_screenshots:
-                selected_keyframes = all_keyframes
-            else:
-                indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
-                selected_keyframes = [all_keyframes[i] for i in sorted(list(set(indices)))]
+            self.log.info(f"Starting new task for {infohash_hex}.")
+            already_processed_indices = set()
 
-        if not selected_keyframes:
+            # --- Phase 1a: Find video file ---
+            video_file_index, video_file_size, video_file_offset = -1, -1, -1
+            fs = ti.files()
+            for i in range(fs.num_files()):
+                if fs.file_path(i).lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+                    video_file_size = fs.file_size(i)
+                    video_file_index = i
+                    video_file_offset = fs.file_offset(i)
+
+            if video_file_index == -1:
+                self.log.warning(f"No .mp4 video file found in torrent {infohash_hex}.")
+                return FatalErrorResult(infohash=infohash_hex, reason="No .mp4 video file found in torrent")
+
+            # --- Phase 1b: Get moov atom ---
+            try:
+                moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length)
+                if not moov_data:
+                    return FatalErrorResult(infohash=infohash_hex, reason="Could not find or parse moov atom")
+            except (asyncio.TimeoutError, LibtorrentError):
+                self.log.warning(f"Timeout/LibtorrentError fetching moov atom for {infohash_hex}. Task is recoverable from scratch.")
+                return PartialSuccessResult(infohash=infohash_hex, screenshots_count=0, reason="Timeout or error fetching moov atom", resume_data={})
+            except Exception as e:
+                self.log.error(f"Fatal error getting moov atom for {infohash_hex}: {e}", exc_info=True)
+                return FatalErrorResult(infohash=infohash_hex, reason=f"Error getting moov atom: {e}")
+
+            # --- Phase 1c: Extract and select keyframes ---
+            try:
+                extractor = H264KeyframeExtractor(moov_data)
+                all_keyframes = extractor.keyframes
+                if not all_keyframes:
+                    return FatalErrorResult(infohash=infohash_hex, reason="Could not extract any keyframes")
+
+                MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
+                duration_sec = extractor.samples[-1].pts / extractor.timescale if extractor.timescale > 0 else 0
+                num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
+                if len(all_keyframes) <= num_screenshots:
+                    keyframes_to_process = all_keyframes
+                else:
+                    indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
+                    keyframes_to_process = [all_keyframes[i] for i in sorted(list(set(indices)))]
+
+                all_kf_indices = [kf.index for kf in keyframes_to_process]
+
+            except Exception as e:
+                return FatalErrorResult(infohash=infohash_hex, reason=f"Failed to parse video metadata: {e}")
+
+        if not keyframes_to_process:
             self.log.info(f"No keyframes remaining to process for {infohash_hex}.")
             return AllSuccessResult(infohash=infohash_hex, screenshots_count=0)
 
-        self.log.info(f"Selected {len(selected_keyframes)} keyframes to process for {infohash_hex}.")
+        self.log.info(f"Preparing to process {len(keyframes_to_process)} keyframes for {infohash_hex}.")
 
-        # --- Phase 3: Download and process keyframes ---
-
+        # --- Phase 2: Download and process keyframes ---
         keyframe_info = {}
         piece_to_keyframes = {}
-        all_needed_pieces = set()
-        for kf in selected_keyframes:
+        for kf in keyframes_to_process:
             sample = extractor.samples[kf.sample_index - 1]
             keyframe_torrent_offset = video_file_offset + sample.offset
             needed = self._get_pieces_for_range(keyframe_torrent_offset, sample.size, piece_length)
             keyframe_info[kf.index] = {'keyframe': kf, 'needed_pieces': set(needed)}
             for piece_idx in needed:
                 piece_to_keyframes.setdefault(piece_idx, []).append(kf.index)
-            all_needed_pieces.update(needed)
 
-        self.client.request_pieces(handle, list(all_needed_pieces))
+        self.client.request_pieces(handle, list(piece_to_keyframes.keys()))
 
-        processed_keyframes_count = 0
+        newly_processed_indices = []
         generation_tasks = []
-        timeout = getattr(self, 'TIMEOUT_FOR_TESTING', 300)  # Allow overriding for tests
+        timeout = getattr(self, 'TIMEOUT_FOR_TESTING', 300)
         try:
-            while processed_keyframes_count < len(selected_keyframes):
+            while len(newly_processed_indices) < len(keyframes_to_process):
                 finished_piece = await asyncio.wait_for(self.client.finished_piece_queue.get(), timeout=timeout)
                 if finished_piece not in piece_to_keyframes: continue
 
-                affected_kf_indices = piece_to_keyframes.pop(finished_piece)
-                for kf_index in affected_kf_indices:
+                for kf_index in piece_to_keyframes.pop(finished_piece):
                     info = keyframe_info.get(kf_index)
-                    if not info or not info['needed_pieces']: continue
-
+                    if not info or not info.get('needed_pieces'): continue
                     info['needed_pieces'].remove(finished_piece)
                     if not info['needed_pieces']:
-                        self.log.info(f"All pieces for keyframe {kf_index} ready. Spawning generation task.")
-                        task = asyncio.create_task(self._process_and_generate_screenshot(
-                            info['keyframe'], extractor, handle, video_file_offset, piece_length, infohash_hex
-                        ))
-                        generation_tasks.append(task)
-                        processed_keyframes_count += 1
-                        # Mark as processed by clearing the needed_pieces set
-                        info['needed_pieces'].clear()
+                        # --- Test-only hook to simulate a timeout after N keyframes ---
+                        fail_after = getattr(self, 'FAIL_AFTER_N_KEYFRAMES', None)
+                        if fail_after is not None and len(newly_processed_indices) >= fail_after:
+                            self.log.warning(f"Simulating timeout after {fail_after} keyframes for testing.")
+                            raise asyncio.TimeoutError("Simulated failure for testing")
+                        # --- End of test-only hook ---
 
+                        task = asyncio.create_task(self._process_and_generate_screenshot(info['keyframe'], extractor, handle, video_file_offset, piece_length, infohash_hex))
+                        generation_tasks.append(task)
+                        newly_processed_indices.append(kf_index)
                 self.client.finished_piece_queue.task_done()
         except asyncio.TimeoutError:
-            self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Generated {processed_keyframes_count}/{len(selected_keyframes)} keyframes.")
-            unprocessed_indices = [idx for idx, info in keyframe_info.items() if info.get('needed_pieces')]
-            resume_payload = {'unprocessed_kf_indices': unprocessed_indices}
+            self.log.error(f"Timeout waiting for pieces for {infohash_hex}. Processed {len(newly_processed_indices)} new keyframes in this run.")
+
+            # Create the rich resume data for next time
+            final_processed_indices = sorted(list(already_processed_indices.union(newly_processed_indices)))
+            rich_resume_data = {
+                "moov_data_b64": base64.b64encode(moov_data).decode('ascii'),
+                "video_file_offset": video_file_offset,
+                "piece_length": piece_length,
+                "all_kf_indices": all_kf_indices,
+                "processed_kf_indices": final_processed_indices,
+            }
             return PartialSuccessResult(
                 infohash=infohash_hex,
-                screenshots_count=processed_keyframes_count,
-                reason=f"Timeout waiting for pieces. Processed {processed_keyframes_count} of {len(selected_keyframes)} keyframes.",
-                resume_data=resume_payload
+                screenshots_count=len(newly_processed_indices),
+                reason=f"Timeout waiting for pieces. Processed {len(newly_processed_indices)} of {len(keyframes_to_process)} frames in this run.",
+                resume_data=rich_resume_data
             )
 
+        screenshots_generated_in_this_run = 0
         if generation_tasks:
-            self.log.info(f"Waiting for {len(generation_tasks)} screenshot generation tasks to complete.")
-            await asyncio.gather(*generation_tasks)
+            results = await asyncio.gather(*generation_tasks)
+            screenshots_generated_in_this_run = sum(1 for r in results if r is True)
 
-        self.log.info(f"Screenshot task for {infohash_hex} completed successfully.")
-        return AllSuccessResult(infohash=infohash_hex, screenshots_count=processed_keyframes_count)
+        self.log.info(f"Screenshot task for {infohash_hex} completed. Generated {screenshots_generated_in_this_run} screenshots in this run.")
+        return AllSuccessResult(infohash=infohash_hex, screenshots_count=screenshots_generated_in_this_run)
 
     async def _handle_screenshot_task(self, task_info: dict):
         """Full lifecycle of a screenshot task, including torrent handle management."""
@@ -455,16 +470,17 @@ class ScreenshotService:
                 self.log.error(f"Could not get a valid torrent handle for {infohash}.")
                 result = FatalErrorResult(infohash=infohash, reason="Failed to get valid torrent handle")
             else:
-                # This will be modified in the next step to return a result object.
-                # For now, it returns None, so the callback will get None.
+                # The next step will implement the logic for returning a result object.
                 result = await self._generate_screenshots_from_torrent(handle, infohash, resume_data)
 
         except Exception as e:
             self.log.exception(f"An unexpected error occurred while processing {infohash}.")
             result = FatalErrorResult(infohash=infohash, reason=f"Unexpected worker error: {str(e)}")
         finally:
-            if handle:
-                self.client.remove_torrent(handle)
+            # The torrent handle is now cached in the client and should not be
+            # removed after each task, as it may be needed for subsequent resumes.
+            # if handle:
+            #     self.client.remove_torrent(handle)
 
             if on_complete:
                 try:

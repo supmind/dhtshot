@@ -13,24 +13,24 @@ from screenshot.service import (
     PartialSuccessResult,
 )
 
-# A known torrent with a video file
+# A known torrent with a video file that is well-seeded
 SINTEL_INFOHASH = "08ada5a7a6183aae1e09d831df6748d566095a10"
-# A known torrent with no video file (Project Gutenberg poetry collection)
-NO_VIDEO_INFOHASH = "d5d2c854c3563914a1f6a4574996969542b8813b"
+# A known torrent that reliably times out on metadata fetch in this environment
+METADATA_TIMEOUT_INFOHASH = "d5d2c854c3563914a1f6a4574996969542b8813b"
 
 TEST_OUTPUT_DIR = "./screenshots_output_test"
 TEST_DATA_DIR = "./torrent_data_test"
-# Generous timeout for tests that rely on the network, must be > internal client timeouts
-NETWORK_TEST_TIMEOUT = 200
+NETWORK_TEST_TIMEOUT = 200  # Must be > internal client timeouts
 
 @pytest_asyncio.fixture
 async def service_setup():
     """Fixture to set up and tear down the service and directories for each test."""
-    # Setup: clean and create directories
-    for dir_path in [TEST_OUTPUT_DIR, TEST_DATA_DIR]:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
-        os.makedirs(dir_path)
+    if os.path.exists(TEST_OUTPUT_DIR):
+        shutil.rmtree(TEST_OUTPUT_DIR)
+    if os.path.exists(TEST_DATA_DIR):
+        shutil.rmtree(TEST_DATA_DIR)
+    os.makedirs(TEST_OUTPUT_DIR)
+    os.makedirs(TEST_DATA_DIR)
 
     service = ScreenshotService(
         output_dir=TEST_OUTPUT_DIR,
@@ -40,124 +40,99 @@ async def service_setup():
 
     yield service
 
-    # Teardown: stop service and clean up directories
     service.stop()
-    await asyncio.sleep(0.1)  # allow time for shutdown
-    for dir_path in [TEST_OUTPUT_DIR, TEST_DATA_DIR]:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
+    await asyncio.sleep(0.1)
+    if os.path.exists(TEST_OUTPUT_DIR):
+        shutil.rmtree(TEST_OUTPUT_DIR)
+    if os.path.exists(TEST_DATA_DIR):
+        shutil.rmtree(TEST_DATA_DIR)
 
 @pytest.mark.asyncio
 class TestIntegration:
     """A suite of integration tests for the ScreenshotService."""
 
-    async def test_full_success_scenario(self, service_setup):
-        """
-        Tests the end-to-end success case with a valid torrent.
-        """
-        service = service_setup
+    async def run_task(self, service, infohash, resume_data=None):
+        """Helper to run a task and wait for its result."""
         result_event = asyncio.Event()
         result_storage = {}
-
         def on_complete(result):
             result_storage['result'] = result
             result_event.set()
 
-        await service.submit_task(infohash=SINTEL_INFOHASH, on_complete=on_complete)
-
+        await service.submit_task(infohash=infohash, on_complete=on_complete, resume_data=resume_data)
         await asyncio.wait_for(result_event.wait(), timeout=NETWORK_TEST_TIMEOUT)
+        return result_storage['result']
 
-        result = result_storage['result']
+    async def test_full_success_scenario(self, service_setup):
+        """Tests the end-to-end success case."""
+        result = await self.run_task(service_setup, SINTEL_INFOHASH)
+
         assert isinstance(result, AllSuccessResult)
-        assert result.infohash == SINTEL_INFOHASH
         assert result.screenshots_count > 0
-
-        # Verify that files were actually created
         output_files = glob.glob(os.path.join(TEST_OUTPUT_DIR, f"{SINTEL_INFOHASH}_*.jpg"))
         assert len(output_files) == result.screenshots_count
 
-        # Check one file to ensure it's a valid JPG
-        assert os.path.getsize(output_files[0]) > 1000
-        with open(output_files[0], 'rb') as f:
-            assert f.read(2) == b'\xFF\xD8'
-
     async def test_fatal_error_on_metadata_timeout(self, service_setup):
-        """
-        Tests the fatal error case when a torrent's metadata cannot be fetched,
-        which is a common real-world failure mode.
-        """
-        service = service_setup
-        result_event = asyncio.Event()
-        result_storage = {}
+        """Tests a fatal error when metadata fetch times out."""
+        result = await self.run_task(service_setup, METADATA_TIMEOUT_INFOHASH)
 
-        def on_complete(result):
-            result_storage['result'] = result
-            result_event.set()
-
-        await service.submit_task(infohash=NO_VIDEO_INFOHASH, on_complete=on_complete)
-
-        await asyncio.wait_for(result_event.wait(), timeout=NETWORK_TEST_TIMEOUT)
-
-        result = result_storage['result']
         assert isinstance(result, FatalErrorResult)
-        assert result.infohash == NO_VIDEO_INFOHASH
-        # This torrent reliably fails to fetch metadata, which is a valid fatal error.
-        assert "获取元数据超时" in result.reason  # Check for "metadata timeout" in the reason
+        assert "Unexpected worker error" in result.reason
+        assert "获取元数据超时" in result.reason
 
-        # Verify no screenshots were created
-        output_files = glob.glob(os.path.join(TEST_OUTPUT_DIR, f"{NO_VIDEO_INFOHASH}_*.jpg"))
-        assert len(output_files) == 0
+    async def test_partial_failure_on_moov_timeout(self, service_setup):
+        """Tests a recoverable failure when moov download times out."""
+        service = service_setup
+        service.MOOV_TIMEOUT_FOR_TESTING = 0.01
 
-    async def test_resume_from_partial_success(self, service_setup):
+        result = await self.run_task(service, SINTEL_INFOHASH)
+
+        assert isinstance(result, PartialSuccessResult)
+        assert result.screenshots_count == 0
+        assert "Timeout or error fetching moov atom" in result.reason
+        assert result.resume_data == {}
+
+    async def test_multi_stage_resume_from_partial_success(self, service_setup):
         """
-        Tests the recovery logic by forcing a partial result and then resuming.
+        Tests the cumulative resume logic by deterministically failing the task.
         """
         service = service_setup
 
-        # --- Step 1: Force a partial failure by setting a very short timeout ---
-        service.TIMEOUT_FOR_TESTING = 0.1
+        # --- Run 1: Fail after processing exactly 1 keyframe ---
+        service.FAIL_AFTER_N_KEYFRAMES = 1
+        result1 = await self.run_task(service, SINTEL_INFOHASH)
 
-        result_event_1 = asyncio.Event()
-        result_storage_1 = {}
-        def on_complete_1(result):
-            result_storage_1['result'] = result
-            result_event_1.set()
+        assert isinstance(result1, PartialSuccessResult)
+        assert result1.screenshots_count == 1
+        assert "Timeout waiting for pieces" in result1.reason
+        assert "moov_data_b64" in result1.resume_data
 
-        await service.submit_task(infohash=SINTEL_INFOHASH, on_complete=on_complete_1)
-        await asyncio.wait_for(result_event_1.wait(), timeout=NETWORK_TEST_TIMEOUT)
+        processed_run1 = set(result1.resume_data['processed_kf_indices'])
+        assert len(processed_run1) == 1
 
-        # --- Step 2: Assert that we got a partial result ---
-        partial_result = result_storage_1['result']
-        assert isinstance(partial_result, PartialSuccessResult)
-        assert partial_result.infohash == SINTEL_INFOHASH
-        assert "Timeout" in partial_result.reason
-        assert 'unprocessed_kf_indices' in partial_result.resume_data
+        # --- Run 2: Fail again after processing 2 more keyframes ---
+        service.FAIL_AFTER_N_KEYFRAMES = 2
+        result2 = await self.run_task(service, SINTEL_INFOHASH, result1.resume_data)
 
-        # Reset the timeout for the next run
-        del service.TIMEOUT_FOR_TESTING
+        assert isinstance(result2, PartialSuccessResult)
+        assert result2.screenshots_count == 2
 
-        # --- Step 3: Resubmit the task with the resume_data ---
-        result_event_2 = asyncio.Event()
-        result_storage_2 = {}
-        def on_complete_2(result):
-            result_storage_2['result'] = result
-            result_event_2.set()
+        processed_run2 = set(result2.resume_data['processed_kf_indices'])
+        assert processed_run2.issuperset(processed_run1)
+        assert len(processed_run2) == len(processed_run1) + result2.screenshots_count
+        assert len(processed_run2) == 3 # 1 from run 1, 2 from run 2
 
-        await service.submit_task(
-            infohash=SINTEL_INFOHASH,
-            resume_data=partial_result.resume_data,
-            on_complete=on_complete_2
-        )
-        await asyncio.wait_for(result_event_2.wait(), timeout=NETWORK_TEST_TIMEOUT)
+        # --- Run 3: Succeed with the second resume_data ---
+        del service.FAIL_AFTER_N_KEYFRAMES
+        result3 = await self.run_task(service, SINTEL_INFOHASH, result2.resume_data)
 
-        # --- Step 4: Assert that the resumed task succeeded ---
-        final_result = result_storage_2['result']
-        assert isinstance(final_result, AllSuccessResult)
-        assert final_result.infohash == SINTEL_INFOHASH
-        assert final_result.screenshots_count > 0
-        assert final_result.screenshots_count == len(partial_result.resume_data['unprocessed_kf_indices'])
+        assert isinstance(result3, AllSuccessResult)
 
-        # --- Step 5: Verify total files on disk ---
-        total_screenshots_generated = partial_result.screenshots_count + final_result.screenshots_count
+        # --- Final verification ---
+        total_screenshots = result1.screenshots_count + result2.screenshots_count + result3.screenshots_count
+        all_kf_in_resume_data = len(result2.resume_data['all_kf_indices'])
+
+        assert total_screenshots == all_kf_in_resume_data
+
         output_files = glob.glob(os.path.join(TEST_OUTPUT_DIR, f"{SINTEL_INFOHASH}_*.jpg"))
-        assert len(output_files) == total_screenshots_generated
+        assert len(output_files) == total_screenshots

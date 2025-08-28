@@ -15,11 +15,9 @@ class LibtorrentError(Exception):
     """自定义异常，用于清晰地传递来自 libtorrent 核心的特定错误。"""
     def __init__(self, error_code_or_message):
         if hasattr(error_code_or_message, 'message'):
-            # It's a libtorrent error code object
             self.error_code = error_code_or_message
             message = self.error_code.message()
         else:
-            # It's a simple string message
             self.error_code = None
             message = str(error_code_or_message)
         super().__init__(f"Libtorrent 错误: {message}")
@@ -35,11 +33,11 @@ class TorrentClient:
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
             'alert_mask': (
-        lt.alert_category.error |
-        lt.alert_category.status |
-        lt.alert_category.storage |
-        lt.alert_category.piece_progress
-),
+                lt.alert_category.error |
+                lt.alert_category.status |
+                lt.alert_category.storage |
+                lt.alert_category.piece_progress
+            ),
             'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
             'user_agent': 'qBittorrent/4.5.2',
             'peer_fingerprint': 'qB4520',
@@ -48,12 +46,16 @@ class TorrentClient:
         self.alert_task = None
         self._running = False
         self.dht_ready = asyncio.Event()
-        self.pending_metadata = {}
+
+        # --- Caching and State Management ---
+        self.handles = {} # Cache for torrent handles {infohash: handle}
+        self.pending_metadata = {} # {infohash: Future}
         self.pending_reads = defaultdict(list)
         self.pending_reads_lock = threading.Lock()
         self.pending_fetches = {}
         self.fetch_lock = threading.Lock()
         self.next_fetch_id = 0
+
         self.last_dht_log_time = 0
         self.finished_piece_queue = asyncio.Queue()
 
@@ -73,37 +75,37 @@ class TorrentClient:
         self.log.info("TorrentClient 已停止。")
 
     async def add_torrent(self, infohash: str):
-        """通过 infohash 添加 torrent，并在收到元数据后返回句柄。"""
-        self.log.info(f"正在为 infohash 添加 torrent: {infohash}")
+        """
+        通过 infohash 添加 torrent 或获取现有 torrent 的句柄。
+        在收到元数据后返回句柄。
+        """
+        # Check cache first
+        if infohash in self.handles and self.handles[infohash].is_valid():
+            self.log.info(f"从缓存返回 {infohash} 的现有句柄。")
+            return self.handles[infohash]
+
+        # If not in cache or invalid, add it
+        self.log.info(f"为 infohash 添加新 torrent: {infohash}")
         save_dir = os.path.join(self.save_path, infohash)
 
         meta_future = self.loop.create_future()
         self.pending_metadata[infohash] = meta_future
-        trackers = [
-            "udp://tracker.opentrackr.org:1337/announce",
-            "udp://open.demonii.com:1337/announce",
-            "udp://open.stealth.si:80/announce",
-            "udp://exodus.desync.com:6969/announce",
-            "udp://tracker.bittor.pw:1337/announce",
-            "http://sukebei.tracker.wf:8888/announce",
-            "udp://tracker.torrent.eu.org:451/announce",
-        ]
-        magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
-        params = lt.parse_magnet_uri(magnet_uri)
+
+        params = lt.parse_magnet_uri(f"magnet:?xt=urn:btih:{infohash}")
         params.save_path = save_dir
-        # Add the torrent in a paused state so we can set piece priorities before downloading.
         params.flags |= lt.torrent_flags.paused
         handle = self.ses.add_torrent(params)
+        self.handles[infohash] = handle # Add to cache immediately
 
         self.log.debug(f"正在等待 {infohash} 的元数据...")
         try:
-            handle = await asyncio.wait_for(meta_future, timeout=180)
+            await asyncio.wait_for(meta_future, timeout=180)
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
+            self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
             raise LibtorrentError(f"为 {infohash} 获取元数据超时。")
 
-        # After getting metadata, set all pieces to priority 0
         ti = handle.get_torrent_info()
         if ti:
             self.log.info(f"为 {infohash} 设置所有 piece 优先级为 0。")
@@ -113,15 +115,19 @@ class TorrentClient:
         return handle
 
     def remove_torrent(self, handle):
-        """从会话中移除一个 torrent。"""
+        """从会话和缓存中移除一个 torrent。"""
         if handle and handle.is_valid():
             infohash = str(handle.info_hash())
+            self.handles.pop(infohash, None)
             self.pending_metadata.pop(infohash, None)
             self.ses.remove_torrent(handle, lt.session.delete_files)
             self.log.info(f"已移除 torrent: {infohash}")
 
     def request_pieces(self, handle, piece_indices: list[int]):
         """按需请求一组特定的 piece，但不等待它们完成。"""
+        if not handle.is_valid():
+            self.log.warning("请求 pieces 时使用了无效的句柄。")
+            return
         if not piece_indices:
             return
 
@@ -129,13 +135,14 @@ class TorrentClient:
         pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
 
         if pieces_to_request:
-            self.log.info(f"为 pieces {pieces_to_request} 设置高优先级。")
             for p in pieces_to_request:
-                handle.piece_priority(p, 7)  # 7 is the highest priority
+                handle.piece_priority(p, 7)
             handle.resume()
 
     async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         """按需下载、读取并返回一组特定的 piece。"""
+        if not handle.is_valid():
+            raise LibtorrentError("获取 pieces 时使用了无效的句柄。")
         if not piece_indices:
             return {}
 
@@ -144,13 +151,10 @@ class TorrentClient:
 
         if pieces_to_download:
             self.log.info(f"需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
-            # Set priorities for the pieces we want to download.
-            self.log.info(f"为 pieces {pieces_to_download} 设置高优先级。")
             for p in pieces_to_download:
-                handle.piece_priority(p, 7)  # 7 is the highest priority
+                handle.piece_priority(p, 7)
             handle.resume()
 
-            # Create a future to wait for all pieces in this batch to download
             request_future = self.loop.create_future()
             with self.fetch_lock:
                 fetch_id = self.next_fetch_id
@@ -161,15 +165,11 @@ class TorrentClient:
                 }
 
             try:
-                self.log.info(f"开始等待 pieces 下载: {pieces_to_download}")
                 await asyncio.wait_for(request_future, timeout=timeout)
-                self.log.info(f"成功等到 pieces: {pieces_to_download}")
             except asyncio.TimeoutError:
                 self.log.error(f"等待 pieces {pieces_to_download} 超时。")
                 with self.fetch_lock: self.pending_fetches.pop(fetch_id, None)
                 raise LibtorrentError(f"下载 pieces {pieces_to_download} 超时。")
-
-        self.log.info(f"所有需要的 pieces ({unique_indices}) 均已就绪，开始读取。")
 
         async def _read_piece(piece_index):
             read_future = self.loop.create_future()
@@ -184,6 +184,10 @@ class TorrentClient:
             return dict(zip(unique_indices, results))
         except asyncio.TimeoutError:
             raise LibtorrentError(f"读取 pieces {unique_indices} 超时。")
+        except Exception as e:
+            if "invalid torrent handle" in str(e):
+                 raise LibtorrentError(f"读取 pieces 时句柄失效: {unique_indices}")
+            raise
 
 
     def _handle_metadata_received(self, alert):
@@ -194,19 +198,16 @@ class TorrentClient:
 
     def _handle_piece_finished(self, alert):
         """处理 piece 下载完成的警报。"""
-        self.log.info(f"收到 piece 下载完成通知: piece #{alert.piece_index}")
         piece_index = alert.piece_index
-
-        # Notify listeners that a piece is finished
         self.finished_piece_queue.put_nowait(piece_index)
 
         with self.fetch_lock:
-            # Using list() to avoid issues with modifying dict during iteration
             for fetch_id, request in list(self.pending_fetches.items()):
                 if piece_index in request['remaining']:
                     request['remaining'].remove(piece_index)
                     if not request['remaining']:
-                        request['future'].set_result(True)
+                        if not request['future'].done():
+                            request['future'].set_result(True)
                         self.pending_fetches.pop(fetch_id, None)
 
     def _handle_dht_bootstrap(self, alert):
@@ -239,8 +240,6 @@ class TorrentClient:
                 for alert in alerts:
                     if alert.category() & lt.alert_category.error:
                         self.log.error(f"Libtorrent 警报: {alert}")
-                    else:
-                        self.log.debug(f"Libtorrent 警报: {alert}")
 
                     alert_type = type(alert)
                     if alert_type == lt.metadata_received_alert:
@@ -251,14 +250,6 @@ class TorrentClient:
                         self._handle_read_piece(alert)
                     elif alert_type == lt.dht_bootstrap_alert:
                         self._handle_dht_bootstrap(alert)
-                    elif alert_type == lt.state_update_alert:
-                        for s in alert.status:
-                            if s.state != lt.torrent_status.states.seeding:
-                                self.log.info(
-                                    f"  状态更新 - {s.name}: {s.state_str} {s.progress * 100:.2f}% "
-                                    f"| 下载速度: {s.download_rate / 1000:.1f} kB/s "
-                                    f"| 节点: {s.num_peers} ({s.num_seeds} 种子)"
-                                )
 
                 now = time.time()
                 if now - self.last_dht_log_time > 10:
