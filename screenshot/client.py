@@ -154,13 +154,14 @@ class TorrentClient:
     async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         """按需下载、读取并返回一组特定的 piece。"""
         if not piece_indices: return {}
+        infohash_hex = str(handle.info_hash())
 
         unique_indices = sorted(list(set(piece_indices)))
 
         pieces_to_download = await self._execute_sync(lambda: [p for p in unique_indices if not handle.have_piece(p)])
 
         if pieces_to_download:
-            self.log.info(f"需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
+            self.log.info(f"[{infohash_hex}] 需要下载 {len(pieces_to_download)} 个 pieces: {pieces_to_download}")
 
             def _set_priorities_sync():
                 priorities = [(p, 7) for p in pieces_to_download]
@@ -172,12 +173,19 @@ class TorrentClient:
             with self.fetch_lock:
                 fetch_id = self.next_fetch_id
                 self.next_fetch_id += 1
-                self.pending_fetches[fetch_id] = {'future': request_future, 'remaining': set(pieces_to_download)}
+                self.pending_fetches[fetch_id] = {
+                    'future': request_future,
+                    'remaining': set(pieces_to_download),
+                    'infohash': infohash_hex  # Add infohash for better logging
+                }
+                self.log.debug(f"[{infohash_hex}] 创建 fetch 请求 fetch_id={fetch_id}，等待 pieces: {pieces_to_download}")
 
             try:
+                self.log.debug(f"[{infohash_hex}] fetch_id={fetch_id} 开始等待 future...")
                 await asyncio.wait_for(request_future, timeout=timeout)
-                self.log.info(f"成功等到 pieces: {pieces_to_download}")
+                self.log.info(f"[{infohash_hex}] fetch_id={fetch_id} 成功等到 pieces: {pieces_to_download}")
             except asyncio.TimeoutError:
+                self.log.error(f"[{infohash_hex}] fetch_id={fetch_id} 等待 pieces 超时。")
                 with self.fetch_lock: self.pending_fetches.pop(fetch_id, None)
                 raise TorrentClientError(f"下载 pieces {pieces_to_download} 超时。")
 
@@ -225,20 +233,36 @@ class TorrentClient:
 
     def _handle_piece_finished(self, alert):
         piece_index = alert.piece_index
-        self.log.info(f"收到 piece 下载完成通知: piece #{piece_index}")
+        infohash_hex = str(alert.handle.info_hash())
+        self.log.info(f"[{infohash_hex}] 收到 piece 下载完成通知: piece #{piece_index}")
         self.loop.call_soon_threadsafe(self.finished_piece_queue.put_nowait, piece_index)
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
-                if piece_index in request['remaining']:
+                if request['infohash'] == infohash_hex and piece_index in request['remaining']:
+                    self.log.debug(f"[{infohash_hex}] fetch_id={fetch_id} 匹配到 piece #{piece_index}。剩余: {request['remaining']}")
                     request['remaining'].remove(piece_index)
+                    self.log.debug(f"[{infohash_hex}] fetch_id={fetch_id} piece #{piece_index} 已移除。剩余: {request['remaining']}")
                     if not request['remaining']:
                         future = request['future']
+                        self.log.info(f"[{infohash_hex}] fetch_id={fetch_id} 所有 pieces 都已收到。正在解锁 future。")
                         self.loop.call_soon_threadsafe(future.set_result, True)
                         self.pending_fetches.pop(fetch_id, None)
 
     def _handle_dht_bootstrap(self, alert):
         if not self.dht_ready.is_set():
             self.loop.call_soon_threadsafe(self.dht_ready.set)
+
+    def _handle_torrent_finished(self, alert):
+        infohash_hex = str(alert.handle.info_hash())
+        self.log.info(f"[{infohash_hex}] Torrent 完成。正在检查待处理的 fetch 请求...")
+        with self.fetch_lock:
+            for fetch_id, request in list(self.pending_fetches.items()):
+                if request['infohash'] == infohash_hex:
+                    self.log.info(f"[{infohash_hex}] fetch_id={fetch_id} 因 torrent 完成而被标记为完成。")
+                    future = request['future']
+                    if not future.done():
+                        self.loop.call_soon_threadsafe(future.set_result, True)
+                    self.pending_fetches.pop(fetch_id, None)
 
     def _handle_read_piece(self, alert):
         with self.pending_reads_lock:
@@ -281,6 +305,7 @@ class TorrentClient:
                     lt.piece_finished_alert: self._handle_piece_finished,
                     lt.read_piece_alert: self._handle_read_piece,
                     lt.dht_bootstrap_alert: self._handle_dht_bootstrap,
+                    lt.torrent_finished_alert: self._handle_torrent_finished,
                 }
                 handler = alert_map.get(type(alert))
                 if handler:
