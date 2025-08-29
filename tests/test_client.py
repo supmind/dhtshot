@@ -1,7 +1,8 @@
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
-from screenshot.client import TorrentClient, LibtorrentError
+from screenshot.client import TorrentClient
+from screenshot.errors import TorrentClientError
 
 @pytest.fixture
 def mock_loop():
@@ -87,7 +88,7 @@ class TestFetchPieces:
 
         mock_loop.create_future.side_effect = lambda: asyncio.get_running_loop().create_future()
 
-        with pytest.raises(LibtorrentError, match="下载 pieces \\[0\\] 超时。"):
+        with pytest.raises(TorrentClientError, match="下载 pieces \\[0\\] 超时。"):
             await client.fetch_pieces(mock_handle, [0], timeout=0.01)
 
         # Ensure the pending fetch request is cleaned up

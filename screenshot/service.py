@@ -492,11 +492,11 @@ class ScreenshotService:
 
         except TaskError as e:
             # Catch our specific, structured errors and log them clearly.
-            # If the error contains resume data, we log that too.
+            # Using .exception() will automatically add exception info to the log.
             if getattr(e, 'resume_data', None):
-                self.log.error(f"Task failed for {infohash_hex} with a resumable error: {e}. Resume data is available.")
+                self.log.exception(f"Task failed for {infohash_hex} with a resumable error: {e}. Resume data is available.")
             else:
-                self.log.error(f"Task failed for {infohash_hex} with a known, non-resumable error: {e}")
+                self.log.exception(f"Task failed for {infohash_hex} with a known, non-resumable error: {e}")
         except TorrentClientError as e:
             # Catch errors from the torrent client layer
             self.log.error(f"Task failed for {infohash_hex} due to a torrent client error: {e}")
