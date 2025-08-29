@@ -45,13 +45,23 @@ async def main():
     # --- 示例任务 ---
     # 向服务提交一些截图任务。
     # 用户应将这些替换为真实的 infohash。
-    # Sintel - 一个开源电影 torrent
-    infohash_to_submit = "ea8988740fa7a125e1593ce26ee5f24c29478f13"
+    infohashes_to_submit = [
+        # Sintel - 一部开源电影
+        "ea8988740fa7a125e1593ce26ee5f24c29478f13",
+        # Big Buck Bunny - 另一部开源电影
+        "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+        # Cosmos Laundromat - 开源电影
+        "c9e15763f722f23e98a29decdfae341b98d53056",
+        # Tears of Steel - 开源电影
+        "209c8226b299b308beaf2b9cd3fb49212dbd13ec",
+    ]
 
-    await service.submit_task(infohash_to_submit)
+    for infohash in infohashes_to_submit:
+        await service.submit_task(infohash)
+
 
     print("\n截图服务正在运行。")
-    print("已提交1个示例任务。服务现在将处理它。")
+    print(f"已提交 {len(infohashes_to_submit)} 个示例任务。服务现在将处理它们。")
     print(f"截图将保存在 '{service.output_dir}' 目录中。")
     print("按 Ctrl+C 停止服务。")
 
