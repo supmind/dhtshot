@@ -207,6 +207,15 @@ class TorrentClient:
                     if not f.done():
                         self.pending_reads.pop(indices_to_await[i], None)
             raise TorrentClientError(f"读取 pieces {unique_indices} 超时或失败: {e}") from e
+        except asyncio.CancelledError:
+            # Also handle cancellation to prevent leaking futures in pending_reads
+            with self.pending_reads_lock:
+                for i, f in enumerate(futures_to_await):
+                    # A cancelled future's done() method returns True, so we must
+                    # not check f.done() here. We just cancel and pop.
+                    f.cancel()
+                    self.pending_reads.pop(indices_to_await[i], None)
+            raise  # Re-raise the cancellation
 
     def _handle_metadata_received(self, alert):
         infohash_str = str(alert.handle.info_hash())

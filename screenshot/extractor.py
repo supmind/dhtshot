@@ -193,8 +193,18 @@ class H264KeyframeExtractor:
         if avc1_payload:
             log.info("检测到 'avc1' 采样条目，正在检查 'avcC' Box...")
             # The 'avcC' box is a sub-box of 'avc1'.
-            avc1_payload.seek(78) # Fixed offset to where sub-boxes like avcC start
-            avcc_payload_stream = self._find_box_payload(avc1_payload, ['avcC'])
+            # Instead of seeking a fixed offset then assuming avcC is the next box,
+            # we will seek past the known header size and then properly parse the
+            # following sub-boxes to find 'avcC'. This is more robust.
+            avc1_payload.seek(78)  # Seek past the 78-byte VisualSampleEntry header.
+            avcc_payload_stream = None
+            try:
+                for box_type, payload in self._parse_boxes(avc1_payload):
+                    if box_type == 'avcC':
+                        avcc_payload_stream = payload
+                        break  # Found it
+            except struct.error:
+                log.warning("解析 'avc1' 中的子 box 失败。文件可能不符合标准。")
 
             if avcc_payload_stream and len(avcc_payload_stream.getvalue()) > 5:
                 # Found 'avc1' with a valid 'avcC' -> out-of-band mode
