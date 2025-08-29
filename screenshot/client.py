@@ -176,7 +176,7 @@ class TorrentClient:
                 self.pending_fetches[fetch_id] = {
                     'future': request_future,
                     'remaining': set(pieces_to_download),
-                    'infohash': infohash_hex  # Add infohash for better logging
+                    'infohash': infohash_hex
                 }
                 self.log.debug(f"[{infohash_hex}] 创建 fetch 请求 fetch_id={fetch_id}，等待 pieces: {pieces_to_download}")
 
@@ -196,10 +196,10 @@ class TorrentClient:
         with self.pending_reads_lock:
             for piece_index in unique_indices:
                 if piece_index in self.pending_reads:
-                    future = self.pending_reads[piece_index]
+                    future = self.pending_reads[piece_index]['future']
                 else:
                     future = self.loop.create_future()
-                    self.pending_reads[piece_index] = future
+                    self.pending_reads[piece_index] = {'future': future, 'retries': 0, 'handle': handle}
                     self._execute_sync_nowait(handle.read_piece, piece_index)
                 futures_to_await.append(future)
                 indices_to_await.append(piece_index)
@@ -208,22 +208,17 @@ class TorrentClient:
             gathered_results = await asyncio.gather(*futures_to_await)
             return dict(zip(indices_to_await, gathered_results))
         except (TorrentClientError, asyncio.TimeoutError) as e:
-            # We need to ensure that any futures that didn't complete are removed
-            # from the pending_reads dict to avoid them being stuck there forever.
             with self.pending_reads_lock:
                 for i, f in enumerate(futures_to_await):
                     if not f.done():
                         self.pending_reads.pop(indices_to_await[i], None)
             raise TorrentClientError(f"读取 pieces {unique_indices} 超时或失败: {e}") from e
         except asyncio.CancelledError:
-            # Also handle cancellation to prevent leaking futures in pending_reads
             with self.pending_reads_lock:
                 for i, f in enumerate(futures_to_await):
-                    # A cancelled future's done() method returns True, so we must
-                    # not check f.done() here. We just cancel and pop.
                     f.cancel()
                     self.pending_reads.pop(indices_to_await[i], None)
-            raise  # Re-raise the cancellation
+            raise
 
     def _handle_metadata_received(self, alert):
         infohash_str = str(alert.handle.info_hash())
@@ -264,24 +259,42 @@ class TorrentClient:
                         self.loop.call_soon_threadsafe(future.set_result, True)
                     self.pending_fetches.pop(fetch_id, None)
 
-    def _handle_read_piece(self, alert):
-        with self.pending_reads_lock:
-            future = self.pending_reads.pop(alert.piece, None)
+    async def _retry_read_piece(self, piece_index, handle):
+        """Helper coroutine to wait and then re-trigger a piece read."""
+        await asyncio.sleep(0.2)
+        infohash_hex = str(handle.info_hash())
+        self.log.info(f"[{infohash_hex}] Retrying read for piece #{piece_index}")
+        self._execute_sync_nowait(handle.read_piece, piece_index)
 
-        if not future or future.done():
+    def _handle_read_piece(self, alert):
+        piece_index = alert.piece
+        with self.pending_reads_lock:
+            pending_info = self.pending_reads.get(piece_index)
+
+        if not pending_info or pending_info['future'].done():
             return
 
         error = None
         if alert.error and alert.error.value() != 0:
-            # It seems libtorrent can send spurious 'success' messages in the error.
-            if "success" not in alert.error.message().lower():
-                error = TorrentClientError(alert.error.message())
+            error_message = alert.error.message()
+            if "invalid piece index" in error_message and pending_info['retries'] < 5:
+                pending_info['retries'] += 1
+                infohash_hex = str(alert.handle.info_hash())
+                self.log.warning(f"[{infohash_hex}] read_piece failed for piece #{piece_index} (attempt {pending_info['retries']}). Retrying...")
+                self.loop.create_task(self._retry_read_piece(piece_index, pending_info['handle']))
+                return
+
+            if "success" not in error_message.lower():
+                error = TorrentClientError(error_message)
+
+        with self.pending_reads_lock:
+            self.pending_reads.pop(piece_index, None)
 
         if error:
-            self.loop.call_soon_threadsafe(future.set_exception, error)
+            self.loop.call_soon_threadsafe(pending_info['future'].set_exception, error)
         else:
             data = bytes(alert.buffer)
-            self.loop.call_soon_threadsafe(future.set_result, data)
+            self.loop.call_soon_threadsafe(pending_info['future'].set_result, data)
 
     def _alert_loop(self):
         """libtorrent 会话的主警报处理循环。在专用线程中运行。"""
@@ -289,7 +302,6 @@ class TorrentClient:
             alerts = []
             with self._ses_lock:
                 if not self._running: break
-                # 等待最多 1 秒，直到有警报
                 alert = self._ses.wait_for_alert(1000)
                 if alert:
                     alerts = self._ses.pop_alerts()
