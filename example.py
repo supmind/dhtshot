@@ -53,7 +53,7 @@ async def main():
         # Cosmos Laundromat - 开源电影
         "c9e15763f722f23e98a29decdfae341b98d53056",
         # Tears of Steel - 开源电影
-        "209c8226b299b308beaf2b9cd3fb49212dbd13ec",
+        "08ada5a7a6183aae1e09d831df6748d566095a10",
     ]
 
     for infohash in infohashes_to_submit:
