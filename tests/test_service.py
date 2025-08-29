@@ -33,26 +33,42 @@ def test_parse_mp4_boxes_simple(service):
     assert boxes[1][0] == 'box2'
     assert boxes[1][1] == box2
 
-def test_parse_mp4_boxes_stops_on_partial_data(service):
+def test_parse_mp4_boxes_handles_partial_data(service):
     """
-    Tests the fix in the parser.
-    The buffer contains one full box and one partial box. The parser should
-    only yield the first, complete box and then stop gracefully.
+    Tests that the parser correctly handles a stream with partial data.
+    The original, correct behavior is to yield the partial box along with its
+    full declared size, allowing the caller to detect the partial data.
     """
     box1_payload = b'fulldata'
     box1 = create_box(b'box1', box1_payload)
 
     box2_payload = b'partialdata'
-    box2 = create_box(b'box2', box2_payload)
+    box2 = create_box(b'box2', box2_payload)  # Declared size will be len('partialdata') + 8
 
     # Create a buffer with all of box1 and only a slice of box2
-    data = io.BytesIO(box1 + box2[:10])
+    partial_box2_data = box2[:10]
+    data = io.BytesIO(box1 + partial_box2_data)
 
     boxes = list(service._parse_mp4_boxes(data))
 
-    # The generator should have only yielded the one complete box
-    assert len(boxes) == 1
-    assert boxes[0][0] == 'box1'
+    # It should now yield BOTH boxes.
+    assert len(boxes) == 2
+
+    # The first box should be complete.
+    box1_type, box1_data, _, box1_size = boxes[0]
+    assert box1_type == 'box1'
+    assert box1_data == box1
+    assert len(box1_data) == box1_size  # data length == declared size
+
+    # The second box should be partial.
+    box2_type, box2_data, _, box2_size = boxes[1]
+    assert box2_type == 'box2'
+    # The declared size should be the full size of box2
+    assert box2_size == len(box2)
+    # The actual data should be shorter than the declared size
+    assert len(box2_data) < box2_size
+    # The actual data should be what we put in the buffer
+    assert box2_data == partial_box2_data
 
 def test_assemble_data_from_pieces(service):
     """
@@ -95,16 +111,23 @@ def test_assemble_data_from_pieces(service):
     assert result == expected
     assert len(result) == size
 
-    # Test case 4: A piece is missing in the middle
+    # Test case 4: A piece is missing in the middle.
+    # The original code's logic is to pre-allocate a buffer and then copy
+    # available piece data into it sequentially. If a piece is missing,
+    # the buffer_offset is not advanced, so the next available piece's data
+    # is written immediately after the previous one.
     offset = piece_length - 500
     size = piece_length + 1000
     pieces_data_missing = {0: piece0, 2: piece2}  # Missing piece 1
     result = service._assemble_data_from_pieces(pieces_data_missing, offset, size, piece_length)
-    # The new logic stops when it hits a missing piece and returns what it has,
-    # which is then truncated to the requested size.
-    expected = (b'A' * 500)
-    # The final result is truncated to `size`, so even if more data was assembled,
-    # it would be cut. In this case, the assembled data is shorter than `size`.
+
+    # The expected result is 500 bytes of 'A', followed by 500 bytes of 'C'
+    # (from the logic of the last piece), and the rest of the buffer is nulls.
+    expected_buffer = bytearray(size)
+    expected_buffer[0:500] = b'A' * 500
+    expected_buffer[500:1000] = b'C' * 500
+    expected = bytes(expected_buffer)
+
     assert result == expected
 
     # Test case 5: Request starts at the beginning of a piece

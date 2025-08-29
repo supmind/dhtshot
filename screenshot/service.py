@@ -80,84 +80,107 @@ class ScreenshotService:
         end_piece = (offset_in_torrent + size - 1) // piece_length
         return list(range(start_piece, end_piece + 1))
 
-    def _assemble_data_from_pieces(self, pieces_data: dict[int, bytes], offset_in_torrent: int, size: int, piece_length: int) -> bytes:
-        """从 piece 数据字典中组装一个字节范围。更简单、更健壮。"""
-        if size <= 0:
-            return b''
+    def _assemble_data_from_pieces(self, pieces_data, offset_in_torrent, size, piece_length):
+        """从 piece 数据字典中组装一个字节范围。"""
+        buffer = bytearray(size)
+        buffer_offset = 0
 
         start_piece = offset_in_torrent // piece_length
         end_piece = (offset_in_torrent + size - 1) // piece_length
 
-        chunks = []
-        # The offset of the start of the data we want, relative to the start of the first piece.
-        offset_in_first_piece = offset_in_torrent % piece_length
-
         for piece_index in range(start_piece, end_piece + 1):
-            piece_data = pieces_data.get(piece_index)
-            if not piece_data:
-                # This indicates a problem, as the caller should have fetched all necessary pieces.
-                # We'll return what we have, but log a warning.
-                self.log.warning(f"在数据组装期间缺少 piece #{piece_index}。")
-                break  # Stop processing further pieces
+            if piece_index not in pieces_data: continue
 
+            piece_data = pieces_data[piece_index]
+
+            # 决定使用 piece 的哪个切片
+            copy_from_start = 0
             if piece_index == start_piece:
-                # For the first piece, we skip the part before our desired offset.
-                chunk = piece_data[offset_in_first_piece:]
-            else:
-                # For any middle piece, we take the whole piece.
-                chunk = piece_data
+                copy_from_start = offset_in_torrent % piece_length
 
-            chunks.append(chunk)
+            copy_to_end = piece_length
+            if piece_index == end_piece:
+                copy_to_end = (offset_in_torrent + size - 1) % piece_length + 1
 
-        # Join all the chunks together and then truncate to the exact size requested.
-        # This is simpler than calculating the end slice for the last piece.
-        result = b"".join(chunks)
-        return result[:size]
+            chunk = piece_data[copy_from_start:copy_to_end]
+
+            # 决定将块放在缓冲区的哪个位置
+            bytes_to_copy = len(chunk)
+            if (buffer_offset + bytes_to_copy) > size:
+                bytes_to_copy = size - buffer_offset
+
+            if bytes_to_copy > 0:
+                buffer[buffer_offset : buffer_offset + bytes_to_copy] = chunk[:bytes_to_copy]
+                buffer_offset += bytes_to_copy
+
+        return bytes(buffer)
 
     def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
-        """一个健壮的 MP4 box 解析器，产生 box 类型、其完整数据、偏移量和大小。"""
+        """
+        一个健壮的 MP4 box 解析器，可以从给定的二进制流中解析出 MP4 的 box（或 atom）。
+
+        这个函数是一个生成器，它会逐个地 'yield' 它在流中找到的 box。
+        它被设计为可以处理不完整的数据流：如果一个 box 的大小超出了当前缓冲区的范围，
+        它仍然会 yield 这个 box 的部分数据以及它声明的完整大小。
+        这个特性对于从文件的头部或尾部探测数据至关重要。
+
+        :param stream: 一个包含 MP4 数据的 BytesIO 流。
+        :yields: 一个元组，包含 (box类型, box的完整数据 (可能不完整), 在流中的偏移量, box声明的完整大小)。
+        """
+        # 使用 getbuffer() 来获得整个字节数组的视图，这很高效，避免了不必要的拷贝。
         stream_buffer = stream.getbuffer()
         buffer_size = len(stream_buffer)
 
         current_offset = stream.tell()
-        while current_offset <= buffer_size - 8:  # Need at least 8 bytes for a header
+        while current_offset <= buffer_size - 8: # 至少需要8个字节来读取一个标准的box头部（4字节大小 + 4字节类型）
             stream.seek(current_offset)
 
+            # 解析 box 的头部
             try:
                 header_data = stream.read(8)
-                if len(header_data) < 8: break
+                if not header_data or len(header_data) < 8:
+                    break # 如果数据不足，则停止解析
                 size, box_type_bytes = struct.unpack('>I4s', header_data)
-                box_type = box_type_bytes.decode('ascii', 'ignore')
+                box_type = box_type_bytes.decode('ascii', 'ignore') # 解码box类型
             except struct.error:
                 self.log.warning(f"无法在偏移量 {current_offset} 处解包 box 头部。数据不完整。")
                 break
 
+            original_size = size
             box_header_size = 8
-            if size == 1:  # 64-bit size
+
+            # 处理特殊的 size 值
+            if size == 1:
+                # size 为 1 表示这是一个64位的 box，真实大小在头部之后的一个8字节字段中
                 if current_offset + 16 > buffer_size:
                     self.log.warning(f"Box '{box_type}' 有一个 64 位的大小，但没有足够的数据用于头部。")
-                    break  # Not enough data for the full header
+                    break
                 size_64_data = stream.read(8)
                 size = struct.unpack('>Q', size_64_data)[0]
                 box_header_size = 16
-            elif size == 0:  # Extends to end of file
+            elif size == 0:
+                # size 为 0 表示这个 box 延伸到文件的末尾
                 size = buffer_size - current_offset
 
             if size < box_header_size:
                 self.log.warning(f"Box '{box_type}' 的大小无效 {size}。停止解析。")
                 break
 
-            # Only yield the box if its complete data is within the buffer.
+            # 检查声明的 box 大小是否超出了当前可用缓冲区的范围
             if current_offset + size > buffer_size:
-                self.log.warning(f"大小为 {size} 的 Box '{box_type}' 超出了可用数据范围 ({buffer_size} 字节)。无法解析。")
-                # Do not yield partial data. Just stop parsing.
-                break
+                self.log.warning(f"大小为 {size} 的 Box '{box_type}' 超出了可用数据范围。无法完全解析。")
+                # 这是此函数的关键行为：即使 box 数据不完整，我们仍然 yield 我们拥有的部分数据。
+                # 调用者可以通过比较 yield 的数据长度和声明的 size 来判断数据是否完整，
+                # 然后决定是否需要获取更多的数据。
+                partial_box_data = stream_buffer[current_offset:buffer_size]
+                yield box_type, bytes(partial_box_data), current_offset, size
+                break # 因为数据已经不完整，所以停止继续解析
 
-            # The full box data is available.
-            full_box_data = stream_buffer[current_offset: current_offset + size]
+            # 如果 box 的完整数据都在缓冲区内，则 yield 完整的数据
+            full_box_data = stream_buffer[current_offset:current_offset + size]
             yield box_type, bytes(full_box_data), current_offset, size
 
-            # Move to the next box.
+            # 移动到下一个 box 的起始位置
             current_offset += size
 
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
