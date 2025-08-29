@@ -17,11 +17,27 @@ logging.basicConfig(
 async def main():
     loop = asyncio.get_running_loop()
 
+    # --- Status Callback Definition ---
+    # This is where you can process the results of screenshot tasks.
+    # You could save results to a database, send a notification, or
+    # re-submit a task that had a recoverable failure.
+    async def task_status_callback(status_data: dict):
+        print("\n--- TASK STATUS UPDATE ---")
+        print(f"  Infohash: {status_data.get('infohash')}")
+        print(f"  Status: {status_data.get('status')}")
+        print(f"  Message: {status_data.get('message')}")
+        if status_data.get('status') == 'recoverable_failure':
+            print("  This task can be resumed later with the provided resume_data.")
+            # In a real application, you might save this resume_data to a database
+            # and have a mechanism to retry the task.
+            # For this example, we'll just print a confirmation.
+            print(f"  Resume data available: {'resume_data' in status_data}")
+        print("--------------------------\n")
+
+
     # Create and run the screenshot service
-    # Screenshots will be saved to the default directory: './screenshots_output'
-    # To specify a different directory, use:
-    # service = ScreenshotService(loop=loop, output_dir='/path/to/your/dir')
-    service = ScreenshotService(loop=loop)
+    # We pass our callback function to the service.
+    service = ScreenshotService(loop=loop, status_callback=task_status_callback)
     await service.run()
 
     # --- Example Tasks ---

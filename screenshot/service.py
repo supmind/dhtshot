@@ -12,7 +12,9 @@ from .errors import (
     TaskError,
     NoVideoFileError,
     MoovNotFoundError,
+    MoovFetchError,
     MoovParsingError,
+    MetadataTimeoutError,
     FrameDownloadTimeoutError,
     FrameDecodeError
 )
@@ -24,7 +26,7 @@ class ScreenshotService:
     """
     Orchestrates the screenshot generation process.
     """
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path='/dev/shm', client=None):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path='/dev/shm', client=None, status_callback=None):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
         self.output_dir = output_dir
@@ -34,6 +36,7 @@ class ScreenshotService:
         self._running = False
         self.client = client or TorrentClient(loop=self.loop, save_path=torrent_save_path)
         self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.output_dir)
+        self.status_callback = status_callback
 
     async def run(self):
         """Starts the service, including the torrent client and workers."""
@@ -196,8 +199,7 @@ class ScreenshotService:
                     break
         except TorrentClientError as e:
             self.log.error(f"A torrent client error occurred during head probe: {e}")
-            # This could be a dead torrent, reraise as a clear error.
-            raise MoovNotFoundError("Torrent client error during moov search, torrent may be dead.", infohash_hex) from e
+            raise MoovFetchError(f"Torrent client error during moov head probe: {e}", infohash_hex) from e
 
         # --- Tail Probe (Fallback) ---
         try:
@@ -227,7 +229,7 @@ class ScreenshotService:
                 search_pos = found_pos
         except TorrentClientError as e:
             self.log.error(f"A torrent client error occurred during tail probe: {e}")
-            raise MoovNotFoundError("Torrent client error during moov search, torrent may be dead.", infohash_hex) from e
+            raise MoovFetchError(f"Torrent client error during moov tail probe: {e}", infohash_hex) from e
 
         raise MoovNotFoundError("Could not locate 'moov' atom in the first/last part of the file.", infohash_hex)
 
@@ -469,10 +471,20 @@ class ScreenshotService:
 
         self.log.info(f"[{infohash_hex}] Screenshot task completed successfully.")
 
+    def _send_status_update(self, **kwargs):
+        """Safely sends a status update via the callback if it is provided."""
+        if not self.status_callback:
+            return
+
+        # Ensure the callback is a coroutine, but don't block the service on it.
+        # This prevents a slow consumer from halting the screenshot service.
+        self.loop.create_task(self.status_callback(kwargs))
+
     async def _handle_screenshot_task(self, task_info: dict):
         """Full lifecycle of a screenshot task, including torrent handle management."""
         infohash_hex = task_info['infohash']
         resume_data = task_info.get('resume_data')
+        task_succeeded = False
 
         log_message = f"Processing task: {infohash_hex}"
         if resume_data:
@@ -481,29 +493,52 @@ class ScreenshotService:
 
         handle = None
         try:
-            # Always add the torrent to the session
             handle = await self.client.add_torrent(infohash_hex)
             if not handle or not handle.is_valid():
-                self.log.error(f"Could not get a valid torrent handle for {infohash_hex}.")
-                return
+                # This case is handled by the MetadataTimeoutError in add_torrent,
+                # but as a fallback, we ensure a status is sent.
+                raise TorrentClientError(f"Could not get a valid torrent handle for {infohash_hex}.")
 
-            # Pass both handle and potential resume_data to the main logic
             await self._generate_screenshots_from_torrent(handle, infohash_hex, resume_data)
+            task_succeeded = True
 
+        except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError) as e:
+            self.log.warning(f"Task for {infohash_hex} failed with a resumable error: {e}")
+            self._send_status_update(
+                status='recoverable_failure',
+                infohash=e.infohash,
+                message=str(e),
+                resume_data=getattr(e, 'resume_data', None)
+            )
         except TaskError as e:
-            # Catch our specific, structured errors and log them clearly.
-            # Using .exception() will automatically add exception info to the log.
-            if getattr(e, 'resume_data', None):
-                self.log.exception(f"Task failed for {infohash_hex} with a resumable error: {e}. Resume data is available.")
-            else:
-                self.log.exception(f"Task failed for {infohash_hex} with a known, non-resumable error: {e}")
+            self.log.error(f"Task for {infohash_hex} failed with a permanent error: {e}")
+            self._send_status_update(
+                status='permanent_failure',
+                infohash=e.infohash,
+                message=str(e)
+            )
         except TorrentClientError as e:
-            # Catch errors from the torrent client layer
-            self.log.error(f"Task failed for {infohash_hex} due to a torrent client error: {e}")
-        except Exception:
-            # Catch any other unexpected errors.
+            self.log.error(f"Task for {infohash_hex} failed due to a torrent client error: {e}")
+            self._send_status_update(
+                status='permanent_failure',
+                infohash=infohash_hex, # The error might not have the infohash
+                message=str(e)
+            )
+        except Exception as e:
             self.log.exception(f"An unexpected and severe error occurred while processing {infohash_hex}.")
+            self._send_status_update(
+                status='permanent_failure',
+                infohash=infohash_hex,
+                message=f"An unexpected error occurred: {e}"
+            )
         finally:
+            if task_succeeded:
+                self.log.info(f"Task {infohash_hex} completed successfully.")
+                self._send_status_update(
+                    status='success',
+                    infohash=infohash_hex,
+                    message='Task completed successfully.'
+                )
             if handle and handle.is_valid():
                 await self.client.remove_torrent(handle)
 

@@ -36,6 +36,11 @@ class MoovNotFoundError(TaskError):
     pass
 
 
+class MoovFetchError(TaskError):
+    """Raised when there is a client error while trying to fetch the moov atom data."""
+    pass
+
+
 class MoovParsingError(TaskError):
     """Raised when there is an error parsing the 'moov' atom after it has been located."""
     pass
