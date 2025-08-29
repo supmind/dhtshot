@@ -1,300 +1,217 @@
-# -*- coding: utf-8 -*-
-"""
-ScreenshotService 的单元测试。
-这些测试分为两类：
-1.  针对纯辅助函数（如 piece 计算）的简单、同步的测试。
-2.  针对核心业务逻辑的复杂的、异步的编排测试，其中所有外部依赖项（客户端、提取器、生成器）都被模拟。
-"""
 import pytest
-import asyncio
-import base64
-from unittest.mock import MagicMock, AsyncMock, patch
-import pytest_asyncio
-
-from screenshot.service import (
-    ScreenshotService,
-    AllSuccessResult,
-    FatalErrorResult,
-    PartialSuccessResult,
-)
-from screenshot.extractor import Keyframe, SampleInfo
-
-# --- 辅助函数的单元测试 ---
+from unittest.mock import MagicMock
+from screenshot.service import ScreenshotService
+from screenshot.extractor import H264KeyframeExtractor, Keyframe, SampleInfo
 
 @pytest.fixture
-def service_helpers():
-    """为辅助函数测试提供一个简单的服务实例。"""
-    return ScreenshotService(loop=None)
+def service():
+    # We don't need a running loop or a real client for these unit tests
+    # We can mock them if a specific test needs them.
+    service = ScreenshotService(loop=None)
+    service.client = MagicMock()
+    service.generator = MagicMock()
+    return service
 
 class TestServiceHelpers:
-    """测试 ScreenshotService 中的各种辅助方法。"""
-    def test_get_pieces_for_range(self, service_helpers):
-        """测试 _get_pieces_for_range 方法的 piece 计算逻辑。"""
-        # 假设 piece_length = 1000
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=500, size=100, piece_length=1000) == [0]
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=900, size=200, piece_length=1000) == [0, 1]
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=1500, size=2000, piece_length=1000) == [1, 2, 3]
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=2000, size=500, piece_length=1000) == [2]
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=1500, size=500, piece_length=1000) == [1]
-        assert service_helpers._get_pieces_for_range(offset_in_torrent=1500, size=0, piece_length=1000) == []
+    def test_get_pieces_for_range(self, service):
+        assert service._get_pieces_for_range(offset_in_torrent=500, size=100, piece_length=1000) == [0]
+        assert service._get_pieces_for_range(offset_in_torrent=900, size=200, piece_length=1000) == [0, 1]
+        assert service._get_pieces_for_range(offset_in_torrent=1500, size=2000, piece_length=1000) == [1, 2, 3]
+        assert service._get_pieces_for_range(offset_in_torrent=2000, size=500, piece_length=1000) == [2]
+        assert service._get_pieces_for_range(offset_in_torrent=1500, size=500, piece_length=1000) == [1]
+        assert service._get_pieces_for_range(offset_in_torrent=1500, size=0, piece_length=1000) == []
 
-    def test_assemble_data_from_pieces_single_piece(self, service_helpers):
-        """测试从单个 piece 中组装数据。"""
-        result = service_helpers._assemble_data_from_pieces({10: b'a'*500 + b'B'*100 + b'c'*424}, 10740, 100, 1024)
-        assert result == b'B' * 100
-
-    def test_assemble_data_from_pieces_multiple_pieces(self, service_helpers):
-        """测试从跨越多个 piece 的数据中组装。"""
-        pieces_data = {10: b'a'*1000 + b'B'*24, 11: b'C'*100 + b'd'*924}
-        result = service_helpers._assemble_data_from_pieces(pieces_data, 11240, 124, 1024)
+    def test_assemble_data_from_pieces(self, service):
+        piece_length = 1024
+        pieces_data = { 10: b'a' * 1000 + b'B' * 24, 11: b'C' * 100 + b'd' * 924 }
+        result = service._assemble_data_from_pieces(pieces_data, 11240, 124, piece_length)
         assert result == b'B' * 24 + b'C' * 100
 
-    def test_assemble_data_from_pieces_incomplete_data(self, service_helpers):
-        """测试当 piece 数据不完整时，组装的数据是否用零字节填充。"""
-        pieces_data = {10: b'a'*1000 + b'B'*24}
-        result = service_helpers._assemble_data_from_pieces(pieces_data, 11240, 124, 1024)
+    def test_assemble_data_from_pieces_incomplete(self, service):
+        piece_length = 1024
+        pieces_data = { 10: b'a' * 1000 + b'B' * 24 }
+        result = service._assemble_data_from_pieces(pieces_data, 11240, 124, piece_length)
         assert result == b'B' * 24 + b'\x00' * 100
 
-    def test_assemble_data_from_pieces_offset_and_size(self, service_helpers):
-        """测试一个更复杂的偏移和大小组合。"""
-        pieces_data = {0: b"0123456789ABCDEF", 1: b"GHIJKLMNOPQRSTUV", 2: b"WXYZabcdefghijkl"}
-        result = service_helpers._assemble_data_from_pieces(pieces_data, 10, 20, 16)
-        assert result == b"ABCDEF" + b"GHIJKLMNOPQRST"
-        assert len(result) == 20
+@pytest.fixture
+def sample_task_state():
+    """Provides a sample, valid task state dictionary for testing serialization."""
+    mock_extractor = H264KeyframeExtractor(moov_data=None)
+    mock_extractor.extradata = b'extradata'
+    mock_extractor.mode = 'avc1'
+    mock_extractor.nal_length_size = 4
+    mock_extractor.timescale = 90000
+    mock_extractor.samples = [
+        SampleInfo(offset=100, size=50, is_keyframe=True, index=1, pts=0),
+        SampleInfo(offset=150, size=20, is_keyframe=False, index=2, pts=3000),
+        SampleInfo(offset=170, size=60, is_keyframe=True, index=3, pts=6000),
+    ]
+    all_keyframes = [
+        Keyframe(index=0, sample_index=1, pts=0, timescale=90000),
+        Keyframe(index=1, sample_index=3, pts=6000, timescale=90000),
+    ]
+    mock_extractor.keyframes = all_keyframes
 
-# --- 核心业务逻辑的单元测试 ---
+    return {
+        "infohash": "test_hash",
+        "piece_length": 16384,
+        "video_file_offset": 12345,
+        "video_file_size": 99999,
+        "extractor": mock_extractor,
+        "all_keyframes": all_keyframes,
+        "selected_keyframes": [all_keyframes[1]], # select the second keyframe
+        "completed_pieces": {10, 11},
+        "processed_keyframes": {0}, # processed the first keyframe
+    }
 
-@pytest_asyncio.fixture
-async def mock_service():
-    """
-    提供一个带有模拟（Mocked）依赖的 ScreenshotService 实例。
-    这允许我们在隔离的环境中测试服务的业务逻辑，而无需实际的网络或文件系统操作。
-    """
-    with patch('screenshot.service.TorrentClient') as MockClient, \
-         patch('screenshot.service.H264KeyframeExtractor') as MockExtractor, \
-         patch('screenshot.service.ScreenshotGenerator') as MockGenerator:
+class TestServiceResumability:
+    def test_serialize_task_state(self, service, sample_task_state):
+        """Tests that the service can correctly serialize a state object to a dict."""
+        serialized = service._serialize_task_state(sample_task_state)
 
-        # --- 配置模拟实例 ---
-        mock_client_instance = MockClient.return_value
-        mock_extractor_instance = MockExtractor.return_value
-        mock_generator_instance = MockGenerator.return_value
+        assert serialized['infohash'] == "test_hash"
+        assert serialized['piece_length'] == 16384
+        assert serialized['video_file_offset'] == 12345
+        assert serialized['video_file_size'] == 99999
 
-        # --- 模拟 TorrentClient 的行为 ---
-        mock_handle = MagicMock()
-        mock_ti = MagicMock()
-        mock_fs = MagicMock()
+        # Check extractor info
+        ext_info = serialized['extractor_info']
+        assert ext_info['extradata'] == b'extradata'
+        assert ext_info['timescale'] == 90000
+        assert len(ext_info['samples']) == 3
+        assert ext_info['samples'][0]['offset'] == 100
 
-        # 配置 torrent info (元数据) 和 file storage (文件列表)
-        mock_fs.num_files.return_value = 2
-        mock_fs.file_path.side_effect = lambda i: {0: "video.mp4", 1: "other.txt"}[i]
-        mock_fs.file_size.side_effect = lambda i: {0: 100000, 1: 100}[i]
-        mock_fs.file_offset.return_value = 0
-        mock_ti.files.return_value = mock_fs
-        mock_ti.piece_length.return_value = 16384
-        mock_handle.get_torrent_info.return_value = mock_ti
+        # Check keyframes
+        assert len(serialized['all_keyframes']) == 2
+        assert serialized['all_keyframes'][1]['sample_index'] == 3
+        assert len(serialized['selected_keyframes']) == 1
+        assert serialized['selected_keyframes'][0]['sample_index'] == 3
 
-        mock_client_instance.add_torrent = AsyncMock(return_value=mock_handle)
-        mock_client_instance.fetch_pieces = AsyncMock(return_value={})
-        mock_client_instance.finished_piece_queue = AsyncMock(spec=asyncio.Queue)
-        mock_client_instance.finished_piece_queue.get = AsyncMock()
+        # Check progress
+        assert sorted(serialized['completed_pieces']) == [10, 11]
+        assert sorted(serialized['processed_keyframes']) == [0]
 
-        # --- 模拟 H264KeyframeExtractor 的行为 ---
-        mock_keyframes = [
-            Keyframe(index=0, sample_index=1, pts=0, timescale=90000),
-            Keyframe(index=1, sample_index=10, pts=1000, timescale=90000),
-            Keyframe(index=2, sample_index=20, pts=2000, timescale=90000),
-        ]
-        # 确保样本列表足够大，并且包含有效的 PTS 值
-        mock_samples = [
-            SampleInfo(offset=i*100, size=100, is_keyframe=(i in [0, 9, 19]), index=i+1, pts=i*1000) for i in range(30)
-        ]
-        mock_extractor_instance.keyframes = mock_keyframes
-        mock_extractor_instance.samples = mock_samples
-        mock_extractor_instance.timescale = 90000
-        mock_extractor_instance.extradata = b'mock_extradata'
-        mock_extractor_instance.mode = 'avc1'
-        mock_extractor_instance.nal_length_size = 4
-        MockExtractor.return_value = mock_extractor_instance
+    def test_load_state_from_resume_data(self, service, sample_task_state):
+        """Tests that the service can correctly deserialize a dict into a state object."""
+        # First, serialize the state to get a valid resume_data dict
+        resume_data = service._serialize_task_state(sample_task_state)
 
-        # --- 模拟 ScreenshotGenerator 的行为 ---
-        mock_generator_instance.generate = AsyncMock()
+        # Now, load it back
+        loaded_state = service._load_state_from_resume_data(resume_data)
 
-        # --- 创建并配置服务实例 ---
-        service = ScreenshotService(loop=asyncio.get_running_loop())
-        service.client = mock_client_instance
-        service.generator = mock_generator_instance
+        assert loaded_state['infohash'] == "test_hash"
+        assert loaded_state['piece_length'] == 16384
+        assert loaded_state['video_file_offset'] == 12345
 
-        # 模拟 _get_moov_atom_data 方法，使其直接返回模拟数据，避免实际的 piece 下载逻辑
-        service._get_moov_atom_data = AsyncMock(return_value=b'mock_moov_data')
+        # Check extractor
+        extractor = loaded_state['extractor']
+        assert isinstance(extractor, H264KeyframeExtractor)
+        assert extractor.timescale == 90000
+        assert extractor.extradata == b'extradata'
+        assert len(extractor.samples) == 3
+        assert extractor.samples[1].pts == 3000
+        assert len(extractor.keyframes) == 2 # Ensure full keyframe list is restored
 
-        yield service, mock_client_instance, MockExtractor, mock_generator_instance, mock_handle
+        # Check keyframes
+        assert len(loaded_state['all_keyframes']) == 2
+        assert loaded_state['all_keyframes'][0].pts == 0
+        assert len(loaded_state['selected_keyframes']) == 1
+        assert loaded_state['selected_keyframes'][0].sample_index == 3
 
+        # Check progress
+        assert loaded_state['completed_pieces'] == {10, 11}
+        assert loaded_state['processed_keyframes'] == {0}
 
 @pytest.mark.asyncio
 class TestServiceOrchestration:
-    """测试 ScreenshotService 的核心业务流程和状态管理。"""
-
-    async def test_fatal_error_if_moov_fails(self, mock_service):
+    """
+    Tests the main task handling and orchestration logic of the ScreenshotService,
+    with dependencies mocked out.
+    """
+    async def test_handles_no_video_file_error(self, service, event_loop, caplog):
         """
-        GIVEN: 一个 ScreenshotService 实例
-        WHEN: 调用 _generate_screenshots_from_torrent，但 _get_moov_atom_data 抛出异常
-        THEN: 应返回一个 FatalErrorResult
+        Tests that a torrent with no .mp4 file is handled gracefully,
+        raising a NoVideoFileError.
         """
-        service, _, _, _, mock_handle = mock_service
-        service._get_moov_atom_data.side_effect = Exception("模拟 MOOV 获取失败")
+        service.loop = event_loop
+        infohash = "no_video_file_hash"
 
-        result = await service._generate_screenshots_from_torrent(mock_handle, "infohash")
+        # Mock torrent_info to return a non-mp4 file
+        mock_ti = MagicMock()
+        mock_ti.files.return_value.num_files.return_value = 1
+        mock_ti.files.return_value.file_path.return_value = "archive.zip"
+        mock_ti.files.return_value.file_size.return_value = 1000
 
-        assert isinstance(result, FatalErrorResult)
-        assert "获取 moov atom 时出错" in result.reason
+        mock_handle = MagicMock()
+        mock_handle.is_valid.return_value = True
+        mock_handle.get_torrent_info.return_value = mock_ti
 
-    async def test_fatal_error_if_keyframes_fail(self, mock_service):
+        # Configure client mock
+        service.client.add_torrent = asyncio.coroutine(MagicMock(return_value=mock_handle))
+        service.client.remove_torrent = asyncio.coroutine(MagicMock())
+
+        # Run the task handler
+        await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
+
+        # Assertions
+        service.client.add_torrent.assert_called_once_with(infohash)
+        # Ensure we never even tried to generate a screenshot
+        service.generator.generate.assert_not_called()
+        # Ensure cleanup was still called
+        service.client.remove_torrent.assert_called_once_with(mock_handle)
+
+        # Check that the specific error was logged correctly
+        assert "No .mp4 file found in torrent" in caplog.text
+        assert f"Task failed for {infohash} with a known, non-resumable error" in caplog.text
+
+    async def test_handles_timeout_and_creates_resume_data(self, service, event_loop, caplog):
         """
-        GIVEN: 一个 ScreenshotService 实例
-        WHEN: 成功获取 moov atom，但 H264KeyframeExtractor 未能提取出任何关键帧
-        THEN: 应返回一个 FatalErrorResult
+        Tests that a download timeout correctly raises a FrameDownloadTimeoutError
+        and includes resume_data in the logged exception.
         """
-        service, _, MockExtractor, _, mock_handle = mock_service
-        MockExtractor.return_value.keyframes = []
+        service.loop = event_loop
+        infohash = "timeout_hash"
 
-        result = await service._generate_screenshots_from_torrent(mock_handle, "infohash")
+        # --- Mocks for a seemingly valid torrent ---
+        mock_ti = MagicMock()
+        mock_ti.files.return_value.num_files.return_value = 1
+        mock_ti.files.return_value.file_path.return_value = "video.mp4"
+        mock_ti.files.return_value.file_size.return_value = 50000
+        mock_ti.piece_length.return_value = 16384
 
-        assert isinstance(result, FatalErrorResult)
-        assert "无法提取任何关键帧" in result.reason
+        mock_handle = MagicMock()
+        mock_handle.is_valid.return_value = True
+        mock_handle.get_torrent_info.return_value = mock_ti
 
-    async def test_fatal_error_if_no_mp4_file_found(self, mock_service):
-        """
-        GIVEN: 一个 torrent，但其文件列表中不包含 .mp4 文件
-        WHEN: 调用 _generate_screenshots_from_torrent
-        THEN: 应立即返回一个 FatalErrorResult
-        """
-        service, _, _, _, mock_handle = mock_service
+        service.client.add_torrent = asyncio.coroutine(MagicMock(return_value=mock_handle))
+        service.client.remove_torrent = asyncio.coroutine(MagicMock())
 
-        # 模拟一个不含 mp4 文件的文件列表
-        mock_fs = MagicMock()
-        mock_fs.num_files.return_value = 1
-        mock_fs.file_path.return_value = "archive.zip"
-        mock_fs.file_size.return_value = 100000
-        mock_handle.get_torrent_info.return_value.files.return_value = mock_fs
+        # --- Mock finding MOOV and Extractor data ---
+        service._get_moov_atom_data = asyncio.coroutine(MagicMock(return_value=b"dummy_moov_data"))
 
-        result = await service._generate_screenshots_from_torrent(mock_handle, "infohash")
+        # Mock the H264KeyframeExtractor class itself
+        with pytest.MonkeyPatch.context() as m:
+            mock_extractor_instance = MagicMock()
+            mock_extractor_instance.keyframes = [Keyframe(index=i, sample_index=i+1, pts=i*1000, timescale=1000) for i in range(10)]
+            mock_extractor_instance.samples = [SampleInfo(offset=i*100, size=50, is_keyframe=True, index=i+1, pts=i*1000) for i in range(10)]
+            mock_extractor_instance.timescale = 1000
+            m.setattr("screenshot.service.H264KeyframeExtractor", MagicMock(return_value=mock_extractor_instance))
 
-        assert isinstance(result, FatalErrorResult)
-        assert "在 torrent 中未找到 .mp4 视频文件" in result.reason
+            # --- Mock the piece queue to simulate a timeout ---
+            service.client.finished_piece_queue.get = asyncio.coroutine(MagicMock(side_effect=asyncio.TimeoutError))
 
-    async def test_partial_success_on_piece_timeout(self, mock_service):
-        """
-        GIVEN: 一个 ScreenshotService 实例
-        WHEN: 在等待 piece 下载时发生 asyncio.TimeoutError
-        THEN: 应返回一个包含 resume_data 的 PartialSuccessResult
-        """
-        service, mock_client, _, _, mock_handle = mock_service
-        # 模拟 piece 队列在 get() 时立即超时
-        mock_client.finished_piece_queue.get.side_effect = asyncio.TimeoutError
+            # Run the task handler
+            await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
 
-        result = await service._generate_screenshots_from_torrent(mock_handle, "infohash")
+        # --- Assertions ---
+        # It should have tried to add and then remove the torrent
+        service.client.add_torrent.assert_called_once_with(infohash)
+        service.client.remove_torrent.assert_called_once_with(mock_handle)
 
-        assert isinstance(result, PartialSuccessResult)
-        assert "等待 pieces 超时" in result.reason
-        # 修复测试：在超时后，不应将任何未完成的任务计为成功，因此本次运行截图数为0
-        assert result.screenshots_count == 0
-        assert "moov_data_b64" in result.resume_data
-        assert result.resume_data["processed_kf_indices"] == [] # 没有处理任何关键帧
+        # No frames should have been generated
+        service.generator.generate.assert_not_called()
 
-    async def test_resume_and_timeout_correctly(self, mock_service):
-        """
-        GIVEN: 一个已处理了部分关键帧的恢复任务
-        WHEN: 在处理下一个关键帧后，等待 piece 时发生超时
-        THEN: 应返回一个 PartialSuccessResult，其截图计数为0（因为超时了），并且 resume_data 中包含所有已处理的帧
-        """
-        service, mock_client, MockExtractor, _, mock_handle = mock_service
-
-        piece_length = mock_handle.get_torrent_info().piece_length()
-        # 准备 extractor 的模拟数据，确保 sample 和 keyframe 索引对应
-        mock_samples = [SampleInfo(offset=0, size=0, is_keyframe=False, index=i+1, pts=0) for i in range(20)]
-        mock_samples[0] = SampleInfo(offset=0, size=100, is_keyframe=True, index=1, pts=0) # kf 0 -> piece 0
-        mock_samples[9] = SampleInfo(offset=piece_length, size=100, is_keyframe=True, index=10, pts=1000) # kf 1 -> piece 1
-        mock_samples[19] = SampleInfo(offset=piece_length*2, size=100, is_keyframe=True, index=20, pts=2000) # kf 2 -> piece 2
-        MockExtractor.return_value.samples = mock_samples
-
-        # 准备一个 resume_data，模拟第一个关键帧 (index 0) 已经被处理
-        resume_data = {
-            "moov_data_b64": base64.b64encode(b'mock_moov_data').decode('ascii'),
-            "video_file_offset": 0, "piece_length": piece_length,
-            "all_kf_indices": [0, 1, 2],
-            "processed_kf_indices": [0],
-            "screenshots_generated_so_far": 1, # 已有1张截图
-        }
-
-        with patch.object(service, '_process_and_generate_screenshot', new_callable=AsyncMock) as mock_process:
-            # 模拟截图生成需要一点时间才能完成
-            async def long_running_process(*args, **kwargs):
-                await asyncio.sleep(0.2)
-                return True
-            mock_process.side_effect = long_running_process
-
-            # 模拟客户端完成 piece 1 (用于 kf 1)，然后在等待 piece 2 时超时
-            mock_client.finished_piece_queue.get.side_effect = [1, asyncio.TimeoutError]
-
-            result = await service._generate_screenshots_from_torrent(mock_handle, "infohash", resume_data)
-
-            # 验证 `_process_and_generate_screenshot` 被调用了一次，且是为 kf 1
-            mock_process.assert_called_once()
-            kf_index_call = mock_process.call_args[0][0].index
-            assert kf_index_call == 1
-
-            # 验证结果是部分成功
-            assert isinstance(result, PartialSuccessResult)
-            # 修复测试：由于超时，我们不应假定截图任务已完成。所以本次运行成功数为0。
-            assert result.screenshots_count == 0
-            # resume_data 中应只包含之前成功处理的关键帧
-            assert sorted(result.resume_data['processed_kf_indices']) == [0, 1]
-            # resume_data 中应只包含累积的、已确认的截图总数
-            assert result.resume_data['screenshots_generated_so_far'] == 1
-
-    async def test_cumulative_screenshot_count_on_resume(self, mock_service):
-        """
-        这是一个关键测试，用于验证在恢复任务并最终成功后，
-        AllSuccessResult 返回的截图总数是之前所有运行的总和。
-        """
-        service, mock_client, MockExtractor, _, mock_handle = mock_service
-
-        # --- GIVEN: 准备模拟数据，与上一个测试类似 ---
-        piece_length = mock_handle.get_torrent_info().piece_length()
-        MockExtractor.return_value.keyframes = [
-            Keyframe(index=0, sample_index=1, pts=0, timescale=90000),
-            Keyframe(index=1, sample_index=10, pts=1000, timescale=90000),
-            Keyframe(index=2, sample_index=20, pts=2000, timescale=90000),
-        ]
-        mock_samples = [SampleInfo(offset=0, size=0, is_keyframe=False, index=i+1, pts=0) for i in range(20)]
-        mock_samples[0] = SampleInfo(offset=0, size=100, is_keyframe=True, index=1, pts=0)
-        mock_samples[9] = SampleInfo(offset=piece_length, size=100, is_keyframe=True, index=10, pts=1000)
-        mock_samples[19] = SampleInfo(offset=piece_length*2, size=100, is_keyframe=True, index=20, pts=2000)
-        MockExtractor.return_value.samples = mock_samples
-
-        # --- WHEN: 运行 1, 成功处理一个 kf 后超时 ---
-        with patch.object(service, '_process_and_generate_screenshot', new_callable=AsyncMock) as mock_process_run1:
-            mock_process_run1.return_value = True
-            # 模拟 piece 0 完成，然后 get() 抛出超时异常
-            mock_client.finished_piece_queue.get.side_effect = [0, asyncio.TimeoutError]
-
-            result1 = await service._generate_screenshots_from_torrent(mock_handle, "infohash")
-
-            # THEN: 验证第一次运行的结果
-            assert isinstance(result1, PartialSuccessResult)
-            assert result1.screenshots_count == 1
-            assert sorted(result1.resume_data['processed_kf_indices']) == [0]
-            assert result1.resume_data['screenshots_generated_so_far'] == 1
-
-        # --- AND WHEN: 运行 2, 使用 resume_data 恢复并完成剩余部分 ---
-        with patch.object(service, '_process_and_generate_screenshot', new_callable=AsyncMock) as mock_process_run2:
-            mock_process_run2.return_value = True
-            # 模拟为剩余的 kf 1 和 kf 2 提供 piece，然后停止
-            mock_client.finished_piece_queue.get.side_effect = [1, 2, asyncio.CancelledError]
-
-            result2 = await service._generate_screenshots_from_torrent(mock_handle, "infohash", result1.resume_data)
-
-            # THEN: 验证最终结果
-            assert isinstance(result2, AllSuccessResult), f"期望得到 AllSuccessResult，但收到了 {type(result2).__name__}"
-            # 这是要修复的 bug: 最终的截图总数应该是所有运行的累积总和。
-            assert result2.screenshots_count == 3, "最终的截图总数应该是累积的 (1 from run 1 + 2 from run 2)"
+        # The key assertion: check the log for the resumable error message
+        assert "Timeout waiting for pieces" in caplog.text
+        assert f"Task failed for {infohash} with a resumable error" in caplog.text
+        assert "Resume data is available" in caplog.text
