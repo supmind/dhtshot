@@ -33,7 +33,7 @@ class TorrentClient:
             'user_agent': 'qBittorrent/4.5.2',
             'peer_fingerprint': 'qB4520',
         }
-        # The session and its objects are not thread-safe.
+        # 会话及其对象不是线程安全的。
         self._ses = lt.session(settings)
         self._ses_lock = threading.Lock()
 
@@ -53,16 +53,16 @@ class TorrentClient:
         self.finished_piece_queue = asyncio.Queue()
 
     async def _execute_sync(self, func, *args, **kwargs):
-        """Executes a function that touches libtorrent objects in a thread-safe manner."""
+        """以线程安全的方式执行接触 libtorrent 对象的功能。"""
         return await self.loop.run_in_executor(None, self._sync_wrapper, func, *args, **kwargs)
 
     def _sync_wrapper(self, func, *args, **kwargs):
-        """Internal wrapper to acquire the lock before executing the function."""
+        """在执行函数前获取锁的内部包装器。"""
         with self._ses_lock:
             return func(*args, **kwargs)
 
     def _execute_sync_nowait(self, func, *args, **kwargs):
-        """Executes a function that touches libtorrent objects without waiting for the result."""
+        """执行一个接触 libtorrent 对象的函数，但不等待结果。"""
         self.loop.run_in_executor(None, self._sync_wrapper, func, *args, **kwargs)
 
     async def start(self):
@@ -78,7 +78,7 @@ class TorrentClient:
         self.log.info("正在停止 TorrentClient...")
         self._running = False
         if self._thread and self._thread.is_alive():
-            # This call wakes up self._ses.wait_for_alert()
+            # 这个调用会唤醒 self._ses.wait_for_alert()
             self._execute_sync_nowait(self._ses.post_dht_stats)
             self._thread.join()
         self.log.info("TorrentClient 已停止。")
@@ -113,7 +113,7 @@ class TorrentClient:
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
             self.pending_metadata.pop(infohash, None)
-            # Raise the specific, structured error
+            # 引发特定的、结构化的错误
             raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
 
         ti = await self._execute_sync(handle.get_torrent_info)
@@ -140,12 +140,12 @@ class TorrentClient:
         unique_indices = sorted(list(set(piece_indices)))
 
         def _request_sync():
-            # This is not perfectly safe if have_piece changes between calls, but good enough for this purpose.
+            # 如果 have_piece 在调用之间发生变化，这并非完全安全，但对于此目的已足够好。
             pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
             if pieces_to_request:
                 self.log.info(f"为 pieces {pieces_to_request} 设置高优先级。")
                 priorities = [(p, 7) for p in pieces_to_request]
-                # prioritize_pieces is more efficient than one by one
+                # prioritize_pieces 比逐个设置更高效
                 handle.prioritize_pieces(priorities)
                 handle.resume()
 

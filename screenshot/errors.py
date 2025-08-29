@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-This module defines custom, structured exceptions for the screenshot service.
+该模块为截图服务定义了自定义的、结构化的异常。
 """
 
 class ScreenshotError(Exception):
-    """Base class for all exceptions in this application."""
+    """本应用中所有异常的基类。"""
     pass
 
 
 class TaskError(ScreenshotError):
     """
-    Base class for errors related to a specific screenshot task.
-    It includes the infohash for context.
+    与特定截图任务相关的错误的基类。
+    它包含 infohash 以提供上下文。
     """
     def __init__(self, message: str, infohash: str):
         super().__init__(message)
@@ -22,34 +22,34 @@ class TaskError(ScreenshotError):
 
 
 class MetadataTimeoutError(TaskError):
-    """Raised when fetching torrent metadata (the .torrent file) times out."""
+    """在获取 torrent 元数据（.torrent 文件）超时时引发。"""
     pass
 
 
 class NoVideoFileError(TaskError):
-    """Raised when no suitable video file (e.g., .mp4) is found in the torrent."""
+    """在 torrent 中找不到合适的视频文件（例如 .mp4）时引发。"""
     pass
 
 
 class MoovNotFoundError(TaskError):
-    """Raised when the 'moov' atom cannot be located in the video file."""
+    """在视频文件中无法定位 'moov' atom 时引发。"""
     pass
 
 
 class MoovFetchError(TaskError):
-    """Raised when there is a client error while trying to fetch the moov atom data."""
+    """在尝试获取 moov atom 数据时发生客户端错误时引发。"""
     pass
 
 
 class MoovParsingError(TaskError):
-    """Raised when there is an error parsing the 'moov' atom after it has been located."""
+    """在定位到 'moov' atom 后解析时发生错误时引发。"""
     pass
 
 
 class FrameDownloadTimeoutError(TaskError):
     """
-    Raised when downloading the necessary pieces for keyframes times out.
-    This is potentially a resumable error.
+    在下载关键帧所需的 piece 超时时引发。
+    这可能是一个可恢复的错误。
     """
     def __init__(self, message: str, infohash: str, resume_data=None):
         super().__init__(message, infohash)
@@ -57,13 +57,13 @@ class FrameDownloadTimeoutError(TaskError):
 
 
 class FrameDecodeError(TaskError):
-    """Raised when a video frame cannot be decoded by the underlying library (PyAV)."""
+    """当视频帧无法被底层库（PyAV）解码时引发。"""
     pass
 
 
 class TorrentClientError(ScreenshotError):
     """
-    Raised for internal or unclassified errors within the TorrentClient,
-    wrapping errors from the underlying libtorrent library.
+    为 TorrentClient 内部的或未分类的错误引发，
+    包装来自底层 libtorrent 库的错误。
     """
     pass

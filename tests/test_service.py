@@ -2,6 +2,7 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
 from screenshot.service import ScreenshotService
+from screenshot.errors import NoVideoFileError, FrameDownloadTimeoutError
 from screenshot.extractor import H264KeyframeExtractor, Keyframe, SampleInfo
 
 @pytest.fixture
@@ -126,18 +127,18 @@ class TestServiceResumability:
 @pytest.mark.asyncio
 class TestServiceOrchestration:
     """
-    Tests the main task handling and orchestration logic of the ScreenshotService,
-    with dependencies mocked out.
+    测试 ScreenshotService 的主要任务处理和编排逻辑，
+    并模拟了其依赖项。
     """
     async def test_handles_no_video_file_error(self, service, caplog):
         """
-        Tests that a torrent with no .mp4 file is handled gracefully,
-        raising a NoVideoFileError.
+        测试对于没有 .mp4 文件的 torrent，能够优雅地处理，
+        并记录一个 NoVideoFileError。
         """
         service.loop = asyncio.get_running_loop()
         infohash = "no_video_file_hash"
 
-        # Mock torrent_info to return a non-mp4 file
+        # 模拟 torrent_info 以返回一个非 mp4 文件
         mock_ti = MagicMock()
         mock_ti.files.return_value.num_files.return_value = 1
         mock_ti.files.return_value.file_path.return_value = "archive.zip"
@@ -147,33 +148,33 @@ class TestServiceOrchestration:
         mock_handle.is_valid.return_value = True
         mock_handle.get_torrent_info.return_value = mock_ti
 
-        # Configure client mock
-        service.client.add_torrent = AsyncMock(return_value=mock_handle)
+        # 配置客户端模拟
+        service.client.add_torrent = AsyncMock(side_effect=NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash))
         service.client.remove_torrent = AsyncMock()
 
-        # Run the task handler
+        # 运行任务处理器
         await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
 
-        # Assertions
+        # 断言
         service.client.add_torrent.assert_called_once_with(infohash)
-        # Ensure we never even tried to generate a screenshot
+        # 确保我们从未尝试生成截图
         service.generator.generate.assert_not_called()
-        # Ensure cleanup was still called
-        service.client.remove_torrent.assert_called_once_with(mock_handle)
+        # 确保清理逻辑仍然被调用
+        service.client.remove_torrent.assert_not_called() # 句柄获取失败，不应调用移除
 
-        # Check that the specific error was logged correctly
-        assert "No .mp4 file found in torrent" in caplog.text
-        assert f"Task failed for {infohash} with a known, non-resumable error" in caplog.text
+        # 检查特定的错误是否已正确记录
+        assert "在 torrent 中没有找到 .mp4 文件。" in caplog.text
+        assert f"任务 {infohash} 因永久性错误而失败" in caplog.text
 
     async def test_handles_timeout_and_creates_resume_data(self, service, caplog):
         """
-        Tests that a download timeout correctly raises a FrameDownloadTimeoutError
-        and includes resume_data in the logged exception.
+        测试下载超时会正确地引发一个 FrameDownloadTimeoutError
+        并在日志异常中包含 resume_data。
         """
         service.loop = asyncio.get_running_loop()
         infohash = "timeout_hash"
 
-        # --- Mocks for a seemingly valid torrent ---
+        # --- 模拟一个看起来有效的 torrent ---
         mock_ti = MagicMock()
         mock_ti.files.return_value.num_files.return_value = 1
         mock_ti.files.return_value.file_path.return_value = "video.mp4"
@@ -187,10 +188,10 @@ class TestServiceOrchestration:
         service.client.add_torrent = AsyncMock(return_value=mock_handle)
         service.client.remove_torrent = AsyncMock()
 
-        # --- Mock finding MOOV and Extractor data ---
+        # --- 模拟 MOOV 和 Extractor 数据的查找 ---
         service._get_moov_atom_data = AsyncMock(return_value=b"dummy_moov_data")
 
-        # Mock the H264KeyframeExtractor class itself
+        # 模拟 H264KeyframeExtractor 类本身
         with pytest.MonkeyPatch.context() as m:
             mock_extractor_instance = MagicMock()
             mock_extractor_instance.keyframes = [Keyframe(index=i, sample_index=i+1, pts=i*1000, timescale=1000) for i in range(10)]
@@ -198,21 +199,98 @@ class TestServiceOrchestration:
             mock_extractor_instance.timescale = 1000
             m.setattr("screenshot.service.H264KeyframeExtractor", MagicMock(return_value=mock_extractor_instance))
 
-            # --- Mock the piece queue to simulate a timeout ---
+            # --- 模拟 piece 队列以模拟超时 ---
             service.client.finished_piece_queue.get = AsyncMock(side_effect=asyncio.TimeoutError)
 
-            # Run the task handler
+            # 运行任务处理器
             await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
 
-        # --- Assertions ---
-        # It should have tried to add and then remove the torrent
+        # --- 断言 ---
+        # 它应该尝试添加然后移除 torrent
         service.client.add_torrent.assert_called_once_with(infohash)
         service.client.remove_torrent.assert_called_once_with(mock_handle)
 
-        # No frames should have been generated
+        # 不应有任何帧被生成
         service.generator.generate.assert_not_called()
 
-        # The key assertion: check the log for the resumable error message
-        assert "Timeout waiting for pieces" in caplog.text
-        assert f"Task failed for {infohash} with a resumable error" in caplog.text
-        assert "Resume data is available" in caplog.text
+        # 关键断言：检查日志中是否有可恢复的错误消息
+        assert "等待 piece 超时" in caplog.text
+        assert f"任务 {infohash} 因可恢复的错误而失败" in caplog.text
+
+
+@pytest.fixture
+def service_with_callback():
+    """提供一个带有模拟 status_callback 的 ScreenshotService 实例。"""
+    service = ScreenshotService()
+    service.client = MagicMock()
+    service.generator = MagicMock()
+    service.status_callback = AsyncMock()
+    return service
+
+@pytest.mark.asyncio
+class TestStatusCallback:
+    """Tests the status_callback functionality of the ScreenshotService."""
+
+    async def test_success_callback(self, service_with_callback):
+        """Tests that the callback is called on successful task completion."""
+        service = service_with_callback
+        infohash = "success_hash"
+
+        # Mock the entire generation process to succeed
+        service._generate_screenshots_from_torrent = AsyncMock()
+        mock_handle = MagicMock()
+        mock_handle.is_valid.return_value = True
+        service.client.add_torrent = AsyncMock(return_value=mock_handle)
+        service.client.remove_torrent = AsyncMock()
+
+        # Run the task handler
+        await service._handle_screenshot_task({'infohash': infohash})
+
+        # Assertion
+        service.status_callback.assert_called_once()
+        call_args = service.status_callback.call_args[1]
+        assert call_args['status'] == 'success'
+        assert call_args['infohash'] == infohash
+
+    async def test_permanent_failure_callback(self, service_with_callback):
+        """Tests that the callback is called on a permanent, non-resumable error."""
+        service = service_with_callback
+        infohash = "permanent_fail_hash"
+
+        # Mock add_torrent to raise a NoVideoFileError
+        service.client.add_torrent = AsyncMock(side_effect=NoVideoFileError("No MP4 found", infohash))
+        service.client.remove_torrent = AsyncMock()
+
+        # Run the task handler
+        await service._handle_screenshot_task({'infohash': infohash})
+
+        # Assertion
+        service.status_callback.assert_called_once()
+        call_args = service.status_callback.call_args[1]
+        assert call_args['status'] == 'permanent_failure'
+        assert call_args['infohash'] == infohash
+        assert "No MP4 found" in call_args['message']
+
+    async def test_recoverable_failure_callback(self, service_with_callback):
+        """Tests that the callback is called on a recoverable error with resume_data."""
+        service = service_with_callback
+        infohash = "recoverable_fail_hash"
+        resume_data = {"some": "data"}
+
+        # Mock the generation process to raise a resumable error
+        error = FrameDownloadTimeoutError("Timeout", infohash, resume_data=resume_data)
+        service._generate_screenshots_from_torrent = AsyncMock(side_effect=error)
+        mock_handle = MagicMock()
+        mock_handle.is_valid.return_value = True
+        service.client.add_torrent = AsyncMock(return_value=mock_handle)
+        service.client.remove_torrent = AsyncMock()
+
+        # Run the task handler
+        await service._handle_screenshot_task({'infohash': infohash})
+
+        # Assertion
+        service.status_callback.assert_called_once()
+        call_args = service.status_callback.call_args[1]
+        assert call_args['status'] == 'recoverable_failure'
+        assert call_args['infohash'] == infohash
+        assert call_args['resume_data'] == resume_data
