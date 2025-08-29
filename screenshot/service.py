@@ -16,7 +16,7 @@ from .errors import (
     FrameDownloadTimeoutError,
     FrameDecodeError
 )
-from .extractor import H264KeyframeExtractor, Keyframe
+from .extractor import H264KeyframeExtractor, Keyframe, SampleInfo
 from .generator import ScreenshotGenerator
 
 

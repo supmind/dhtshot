@@ -1,5 +1,6 @@
 import pytest
-from unittest.mock import MagicMock
+import asyncio
+from unittest.mock import MagicMock, AsyncMock
 from screenshot.service import ScreenshotService
 from screenshot.extractor import H264KeyframeExtractor, Keyframe, SampleInfo
 
@@ -128,12 +129,12 @@ class TestServiceOrchestration:
     Tests the main task handling and orchestration logic of the ScreenshotService,
     with dependencies mocked out.
     """
-    async def test_handles_no_video_file_error(self, service, event_loop, caplog):
+    async def test_handles_no_video_file_error(self, service, caplog):
         """
         Tests that a torrent with no .mp4 file is handled gracefully,
         raising a NoVideoFileError.
         """
-        service.loop = event_loop
+        service.loop = asyncio.get_running_loop()
         infohash = "no_video_file_hash"
 
         # Mock torrent_info to return a non-mp4 file
@@ -147,8 +148,8 @@ class TestServiceOrchestration:
         mock_handle.get_torrent_info.return_value = mock_ti
 
         # Configure client mock
-        service.client.add_torrent = asyncio.coroutine(MagicMock(return_value=mock_handle))
-        service.client.remove_torrent = asyncio.coroutine(MagicMock())
+        service.client.add_torrent = AsyncMock(return_value=mock_handle)
+        service.client.remove_torrent = AsyncMock()
 
         # Run the task handler
         await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
@@ -164,12 +165,12 @@ class TestServiceOrchestration:
         assert "No .mp4 file found in torrent" in caplog.text
         assert f"Task failed for {infohash} with a known, non-resumable error" in caplog.text
 
-    async def test_handles_timeout_and_creates_resume_data(self, service, event_loop, caplog):
+    async def test_handles_timeout_and_creates_resume_data(self, service, caplog):
         """
         Tests that a download timeout correctly raises a FrameDownloadTimeoutError
         and includes resume_data in the logged exception.
         """
-        service.loop = event_loop
+        service.loop = asyncio.get_running_loop()
         infohash = "timeout_hash"
 
         # --- Mocks for a seemingly valid torrent ---
@@ -183,11 +184,11 @@ class TestServiceOrchestration:
         mock_handle.is_valid.return_value = True
         mock_handle.get_torrent_info.return_value = mock_ti
 
-        service.client.add_torrent = asyncio.coroutine(MagicMock(return_value=mock_handle))
-        service.client.remove_torrent = asyncio.coroutine(MagicMock())
+        service.client.add_torrent = AsyncMock(return_value=mock_handle)
+        service.client.remove_torrent = AsyncMock()
 
         # --- Mock finding MOOV and Extractor data ---
-        service._get_moov_atom_data = asyncio.coroutine(MagicMock(return_value=b"dummy_moov_data"))
+        service._get_moov_atom_data = AsyncMock(return_value=b"dummy_moov_data")
 
         # Mock the H264KeyframeExtractor class itself
         with pytest.MonkeyPatch.context() as m:
@@ -198,7 +199,7 @@ class TestServiceOrchestration:
             m.setattr("screenshot.service.H264KeyframeExtractor", MagicMock(return_value=mock_extractor_instance))
 
             # --- Mock the piece queue to simulate a timeout ---
-            service.client.finished_piece_queue.get = asyncio.coroutine(MagicMock(side_effect=asyncio.TimeoutError))
+            service.client.finished_piece_queue.get = AsyncMock(side_effect=asyncio.TimeoutError)
 
             # Run the task handler
             await service._handle_screenshot_task({'infohash': infohash, 'resume_data': None})
