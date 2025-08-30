@@ -13,12 +13,16 @@ from collections import defaultdict
 from .errors import TorrentClientError, MetadataTimeoutError
 
 
+import tempfile
+
+
 class TorrentClient:
     """一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。"""
-    def __init__(self, loop=None, save_path='/dev/shm'):
+    def __init__(self, loop=None, save_path: str = None):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
-        self.save_path = save_path
+        # 兼容性修复：如果未提供 save_path，则使用系统通用的临时目录
+        self.save_path = save_path or os.path.join(tempfile.gettempdir(), 'screenshot_service_torrents')
 
         settings = {
             'listen_interfaces': '0.0.0.0:6881',

@@ -29,7 +29,7 @@ StatusCallback = Callable[..., Awaitable[None]]
 
 class ScreenshotService:
     """协调截图生成过程的核心服务类。"""
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path='/dev/shm', client=None, status_callback: Optional[StatusCallback] = None):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
         self.output_dir = output_dir
@@ -37,6 +37,8 @@ class ScreenshotService:
         self.task_queue = asyncio.Queue()
         self.workers = []
         self._running = False
+        # 兼容性修复：将 torrent_save_path 的决定权交给 TorrentClient，
+        # 如果为 None，Client 将使用系统的临时目录。
         self.client = client or TorrentClient(loop=self.loop, save_path=torrent_save_path)
         self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.output_dir)
         self.status_callback = status_callback
@@ -89,12 +91,21 @@ class ScreenshotService:
 
     def _assemble_data_from_pieces(self, pieces_data, offset_in_torrent, size, piece_length):
         """从 piece 数据字典中组装一个字节范围。"""
-        buffer = bytearray(size)
-        buffer_offset = 0
         start_piece = offset_in_torrent // piece_length
         end_piece = (offset_in_torrent + size - 1) // piece_length
+
+        # Bug 修复：在拼装前，首先检查所有需要的数据块是否都存在。
+        # 如果有任何一个缺失，我们无法构成一个连续的、有效的数据块。
+        # 在这种情况下，返回一个空字节串来向上游发出失败信号。
         for piece_index in range(start_piece, end_piece + 1):
-            if piece_index not in pieces_data: continue
+            if piece_index not in pieces_data:
+                self.log.warning(f"组装数据时缺少 piece #{piece_index}，操作中止。")
+                return b""
+
+        # 确认所有数据块都存在后，再进行拼装。
+        buffer = bytearray(size)
+        buffer_offset = 0
+        for piece_index in range(start_piece, end_piece + 1):
             piece_data = pieces_data[piece_index]
             copy_from_start = 0
             if piece_index == start_piece:
