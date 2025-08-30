@@ -377,6 +377,9 @@ class ScreenshotService:
                         processed_this_run.add(kf_index)
 
             if not generation_tasks and len(remaining_keyframes) > 0:
+                 # 错误修复：在生成恢复数据之前，更新已处理的关键帧列表。
+                 # 这可以防止在恢复任务后，重复处理在超时前已成功完成的关键帧。
+                 task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
                  raise FrameDownloadTimeoutError(f"没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
 
             results = await asyncio.gather(*generation_tasks, return_exceptions=True)
