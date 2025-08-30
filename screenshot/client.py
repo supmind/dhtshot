@@ -200,8 +200,11 @@ class TorrentClient:
                 self.log.info(f"[{infohash_hex}] fetch_id={fetch_id} 成功等到 pieces: {pieces_to_download}")
             except asyncio.TimeoutError:
                 self.log.error(f"[{infohash_hex}] fetch_id={fetch_id} 等待 pieces 超时。")
-                with self.fetch_lock: self.pending_fetches.pop(fetch_id, None)
                 raise TorrentClientError(f"下载 pieces {pieces_to_download} 超时。")
+            finally:
+                # 确保无论成功、失败或取消，都能清理待处理的 fetch 请求，防止资源泄露
+                with self.fetch_lock:
+                    self.pending_fetches.pop(fetch_id, None)
 
         self.log.info(f"所有需要的 pieces ({unique_indices}) 均已就绪，开始读取。")
         futures_to_await = []

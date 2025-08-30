@@ -42,6 +42,8 @@ class ScreenshotService:
         self.status_callback = status_callback
         # 用于跟踪活跃任务，防止重复提交
         self.active_tasks = set()
+        # 用于防止 submit_task 中出现竞态条件的锁
+        self._submit_lock = asyncio.Lock()
 
     async def run(self):
         """启动服务，包括 torrent 客户端和工作进程。"""
@@ -65,11 +67,13 @@ class ScreenshotService:
         """
         提交一个新的截图任务，并防止重复提交。
         """
-        if infohash in self.active_tasks:
-            self.log.warning(f"任务 {infohash} 已在处理中，本次提交被忽略。")
-            return
+        # 使用锁来确保检查和添加操作的原子性，防止竞态条件
+        async with self._submit_lock:
+            if infohash in self.active_tasks:
+                self.log.warning(f"任务 {infohash} 已在处理中，本次提交被忽略。")
+                return
+            self.active_tasks.add(infohash)
 
-        self.active_tasks.add(infohash)
         await self.task_queue.put({'infohash': infohash, 'resume_data': resume_data})
         if resume_data:
             self.log.info(f"为 infohash: {infohash} 重新提交了任务")
