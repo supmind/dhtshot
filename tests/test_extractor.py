@@ -144,3 +144,130 @@ def test_extractor_handles_avcc_after_other_box():
     # The key assertion is that we found the avcC box correctly despite the 'free' box.
     assert extractor.mode == 'avc1'
     assert extractor.extradata == avcc_payload
+
+
+def test_extractor_missing_stbl_box():
+    """
+    Tests that the extractor raises a ValueError if the 'stbl' box is missing,
+    as it's essential for parsing sample information.
+    """
+    # Create a moov structure without the 'stbl' box
+    minf_payload = create_box(b'dinf', b'') # Some other box, but not stbl
+    minf_box = create_box(b'minf', minf_payload)
+    hdlr_box = create_box(b'hdlr', b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00' + b'vide' + b'\x00' * 12)
+    mdhd_box = create_box(b'mdhd', b'\x00'*24)
+    mdia_payload = mdhd_box + hdlr_box + minf_box
+    mdia_box = create_box(b'mdia', mdia_payload)
+    tkhd_box = create_box(b'tkhd', b'\x00' * 84)
+    trak_payload = tkhd_box + mdia_box
+    trak_box = create_box(b'trak', trak_payload)
+    mvhd_box = create_box(b'mvhd', b'\x00' * 100)
+    moov_payload = mvhd_box + trak_box
+    moov_data = create_box(b'moov', moov_payload)
+
+    with pytest.raises(ValueError, match="在视频轨道中未找到 'stbl' Box"):
+        H264KeyframeExtractor(moov_data)
+
+
+def test_extractor_no_keyframes():
+    """
+    Tests the extractor with a valid stream that contains samples but no keyframes.
+    This is simulated by having an 'stss' box with an entry count of 0.
+    """
+    # Use the structure from the main test, but replace the 'stss' box
+    # stss: Sync Sample Box with 0 entries
+    stss_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 0)
+    stss_box = create_box(b'stss', stss_payload)
+
+    # Re-build a minimal moov with this 'stss' box
+    avcc_payload = b'\x01\x64\x00\x1f\xff\xe1\x00\x19\x67\x64\x00\x1f\xac\xd9\x41\xe0\x22\x07\xb0\x8b\x00\x00\x03\x00\x01\x00\x00\x03\x00\x3d\x08\x01\x01\x00\x04\x68\xee\x3c\x80'
+    avcc_box = create_box(b'avcC', avcc_payload)
+    avc1_header = b'\x00' * 78
+    avc1_payload = avc1_header + avcc_box
+    avc1_box = create_box(b'avc1', avc1_payload)
+    stsd_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + avc1_box
+    stsd_box = create_box(b'stsd', stsd_payload)
+    stts_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>II', 2, 1000)
+    stts_box = create_box(b'stts', stts_payload)
+    stsz_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 0) + struct.pack('>I', 2) + struct.pack('>II', 100, 200)
+    stsz_box = create_box(b'stsz', stsz_payload)
+    stsc_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>III', 1, 2, 1)
+    stsc_box = create_box(b'stsc', stsc_payload)
+    stco_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>I', 1024)
+    stco_box = create_box(b'stco', stco_payload)
+
+    stbl_payload = stsd_box + stts_box + stss_box + stsz_box + stsc_box + stco_box
+    stbl_box = create_box(b'stbl', stbl_payload)
+
+    minf_payload = stbl_box
+    minf_box = create_box(b'minf', minf_payload)
+    hdlr_box = create_box(b'hdlr', b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00' + b'vide' + b'\x00' * 12)
+    mdhd_box = create_box(b'mdhd', b'\x00' * 12 + struct.pack('>I', 90000) + b'\x00' * 4)
+    mdia_payload = mdhd_box + hdlr_box + minf_box
+    mdia_box = create_box(b'mdia', mdia_payload)
+    tkhd_box = create_box(b'tkhd', b'\x00' * 84)
+    trak_payload = tkhd_box + mdia_box
+    trak_box = create_box(b'trak', trak_payload)
+    mvhd_box = create_box(b'mvhd', b'\x00' * 100)
+    moov_payload = mvhd_box + trak_box
+    moov_data = create_box(b'moov', moov_payload)
+
+    extractor = H264KeyframeExtractor(moov_data)
+
+    assert len(extractor.samples) == 2
+    assert len(extractor.keyframes) == 0
+
+
+def test_extractor_handles_avc3_in_band():
+    """
+    Tests that the extractor correctly identifies an 'avc3' stream (in-band SPS/PPS)
+    where 'avc1' is not present. It should set the mode to 'avc3' and extradata to None.
+    """
+    # avc3 box is similar to avc1 but without the avcC sub-box.
+    avc3_header = b'\x00' * 78
+    avc3_box = create_box(b'avc3', avc3_header)
+
+    stsd_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + avc3_box
+    stsd_box = create_box(b'stsd', stsd_payload)
+
+    # Build minimal moov around this
+    stbl_payload = stsd_box + create_box(b'stts', b'\x00'*8) + create_box(b'stss', b'\x00'*8) + create_box(b'stsz', b'\x00'*12) + create_box(b'stsc', b'\x00'*8) + create_box(b'stco', b'\x00'*8)
+    stbl_box = create_box(b'stbl', stbl_payload)
+    minf_box = create_box(b'minf', stbl_box)
+    hdlr_box = create_box(b'hdlr', b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00' + b'vide' + b'\x00' * 12)
+    mdhd_box = create_box(b'mdhd', b'\x00'*24)
+    mdia_payload = mdhd_box + hdlr_box + minf_box
+    mdia_box = create_box(b'mdia', mdia_payload)
+    tkhd_box = create_box(b'tkhd', b'\x00' * 84)
+    trak_payload = tkhd_box + mdia_box
+    trak_box = create_box(b'trak', trak_payload)
+    mvhd_box = create_box(b'mvhd', b'\x00' * 100)
+    moov_payload = mvhd_box + trak_box
+    moov_data = create_box(b'moov', moov_payload)
+
+    extractor = H264KeyframeExtractor(moov_data)
+
+    assert extractor.mode == 'avc3'
+    assert extractor.extradata is None
+
+
+def test_extractor_no_video_track():
+    """
+    Tests that the extractor raises ValueError if the moov atom contains no video track.
+    This is simulated by having a track with a 'soun' (sound) handler instead of 'vide'.
+    """
+    # Create a track with a 'soun' handler
+    sound_hdlr_payload = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00' + b'soun' + b'\x00' * 12
+    hdlr_box = create_box(b'hdlr', sound_hdlr_payload)
+    mdia_payload = hdlr_box # minimal mdia
+    mdia_box = create_box(b'mdia', mdia_payload)
+    tkhd_box = create_box(b'tkhd', b'\x00' * 84)
+    trak_payload = tkhd_box + mdia_box
+    trak_box = create_box(b'trak', trak_payload)
+
+    mvhd_box = create_box(b'mvhd', b'\x00' * 100)
+    moov_payload = mvhd_box + trak_box
+    moov_data = create_box(b'moov', moov_payload)
+
+    with pytest.raises(ValueError, match="在 'moov' Box 中未找到有效的视频轨道"):
+        H264KeyframeExtractor(moov_data)

@@ -47,7 +47,7 @@ async def test_fetch_pieces_cancellation_cleans_up_pending_reads(mock_lt_session
     assert 2 in client.pending_reads
 
     # Get a reference to one of the futures to check its state later
-    future_for_piece_0 = client.pending_reads[0]
+    future_for_piece_0 = client.pending_reads[0]['future']
 
     # --- Now, cancel the task ---
     fetch_task.cancel()
