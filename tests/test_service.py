@@ -122,13 +122,8 @@ def test_assemble_data_from_pieces(service):
     result = service._assemble_data_from_pieces(pieces_data_missing, offset, size, piece_length)
 
     # The expected result is 500 bytes of 'A', followed by 500 bytes of 'C'
-    # (from the logic of the last piece), and the rest of the buffer is nulls.
-    expected_buffer = bytearray(size)
-    expected_buffer[0:500] = b'A' * 500
-    expected_buffer[500:1000] = b'C' * 500
-    expected = bytes(expected_buffer)
-
-    assert result == expected
+    # The new, correct behavior is to return empty bytes.
+    assert result == b""
 
     # Test case 5: Request starts at the beginning of a piece
     offset = piece_length
@@ -137,3 +132,42 @@ def test_assemble_data_from_pieces(service):
     expected = b'B' * 500
     assert result == expected
     assert len(result) == size
+
+
+def test_select_keyframes_uses_custom_config():
+    """测试 _select_keyframes 方法能正确使用在服务中配置的自定义参数。"""
+    # 重新配置服务实例以使用非默认值
+    service = ScreenshotService(
+        loop=None,
+        min_screenshots=10,
+        max_screenshots=10,
+    )
+
+    # 模拟一个很长的视频，确保我们的 max_screenshots 会生效
+    # (10000s duration / 180s interval) > 10
+    duration_sec = 10000
+    timescale = 1
+    # 创建足够的关键帧和样本
+    # The actual keyframe content doesn't matter for this test
+    all_keyframes = [f"kf_{i}" for i in range(100)]
+    # We only need the last sample to determine duration
+    samples = [type('Sample', (), {'pts': duration_sec * timescale})()]
+
+    selected = service._select_keyframes(all_keyframes, timescale, samples)
+
+    # 因为 max_screenshots 被设为 10，所以结果应该只有 10 个
+    assert len(selected) == 10
+
+
+def test_select_keyframes_default_for_zero_duration():
+    """测试当视频时长为0时，使用 default_screenshots 参数。"""
+    service = ScreenshotService(loop=None, default_screenshots=15)
+
+    duration_sec = 0
+    timescale = 1
+    all_keyframes = [f"kf_{i}" for i in range(100)]
+    # All samples have the same pts, so duration is 0
+    samples = [type('Sample', (), {'pts': 0})()] * 2
+
+    selected = service._select_keyframes(all_keyframes, timescale, samples)
+    assert len(selected) == 15

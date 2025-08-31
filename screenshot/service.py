@@ -29,7 +29,7 @@ StatusCallback = Callable[..., Awaitable[None]]
 
 class ScreenshotService:
     """协调截图生成过程的核心服务类。"""
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None, min_screenshots: int = 5, max_screenshots: int = 50, target_interval_sec: int = 180, default_screenshots: int = 20):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
         self.output_dir = output_dir
@@ -46,6 +46,12 @@ class ScreenshotService:
         self.active_tasks = set()
         # 用于防止 submit_task 中出现竞态条件的锁
         self._submit_lock = asyncio.Lock()
+
+        # --- 截图选择策略配置 ---
+        self.min_screenshots = min_screenshots
+        self.max_screenshots = max_screenshots
+        self.target_interval_sec = target_interval_sec
+        self.default_screenshots = default_screenshots
 
     async def run(self):
         """启动服务，包括 torrent 客户端和工作进程。"""
@@ -233,9 +239,14 @@ class ScreenshotService:
     def _select_keyframes(self, all_keyframes: list, timescale: int, samples: list) -> list:
         """根据一系列规则，从所有关键帧中选择一个有代表性的子集用于生成截图。"""
         if not all_keyframes: return []
-        MIN_SCREENSHOTS, MAX_SCREENSHOTS, TARGET_INTERVAL_SEC = 5, 50, 180
         duration_sec = samples[-1].pts / timescale if timescale > 0 else 0
-        num_screenshots = max(MIN_SCREENSHOTS, min(int(duration_sec / TARGET_INTERVAL_SEC), MAX_SCREENSHOTS)) if duration_sec > 0 else 20
+
+        # 使用可配置的参数来决定截图数量
+        if duration_sec > 0:
+            num_screenshots = max(self.min_screenshots, min(int(duration_sec / self.target_interval_sec), self.max_screenshots))
+        else:
+            num_screenshots = self.default_screenshots
+
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
         else:
@@ -260,6 +271,107 @@ class ScreenshotService:
         all_keyframes = [Keyframe(**k) for k in data['all_keyframes']]
         extractor.keyframes = all_keyframes
         return {"infohash": data['infohash'],"piece_length": data['piece_length'],"video_file_offset": data['video_file_offset'],"video_file_size": data['video_file_size'],"extractor": extractor,"all_keyframes": all_keyframes,"selected_keyframes": [Keyframe(**k) for k in data['selected_keyframes']],"completed_pieces": set(data['completed_pieces']),"processed_keyframes": set(data['processed_keyframes']),}
+
+    async def _process_keyframe_pieces(
+        self,
+        handle,
+        local_queue: asyncio.Queue,
+        task_state: dict,
+        keyframe_info: dict,
+        piece_to_keyframes: dict,
+        remaining_keyframes: list
+    ) -> Tuple[set, list]:
+        """
+        处理关键帧数据块的下载和截图任务的生成。
+
+        这是一个从 _generate_screenshots_from_torrent 中提取出的辅助方法，
+        负责核心的 while 循环，以提高代码的模块化和可读性。
+
+        :return: 一个元组，包含 (本次运行处理的关键帧集合, 创建的截图生成任务列表)
+        """
+        infohash_hex = task_state['infohash']
+        extractor = task_state['extractor']
+        video_file_offset = task_state['video_file_offset']
+        piece_length = task_state['piece_length']
+
+        processed_this_run = set()
+        generation_tasks = []
+
+        while len(processed_this_run) < len(remaining_keyframes):
+            try:
+                finished_piece = await asyncio.wait_for(local_queue.get(), timeout=300)
+                if finished_piece is None:
+                    self.log.warning(f"[{infohash_hex}] Torrent 完成但仍有 piece 未下载，提前终止。")
+                    break
+            except asyncio.TimeoutError:
+                self.log.warning(f"[{infohash_hex}] 等待 piece 超时。")
+                break
+
+            task_state.setdefault('completed_pieces', set()).add(finished_piece)
+
+            if finished_piece not in piece_to_keyframes:
+                continue
+
+            for kf_index in piece_to_keyframes[finished_piece]:
+                info = keyframe_info.get(kf_index)
+                if not info or kf_index in processed_this_run:
+                    continue
+
+                info['needed_pieces'].remove(finished_piece)
+                if not info['needed_pieces']:
+                    self.log.info(f"[{infohash_hex}] 关键帧 {kf_index} 的所有 piece 都已准备好。正在获取数据并生成截图任务。")
+
+                    keyframe = info['keyframe']
+                    sample = extractor.samples[keyframe.sample_index - 1]
+
+                    try:
+                        keyframe_pieces_data = await self.client.fetch_pieces(
+                            handle, self._get_pieces_for_range(
+                                video_file_offset + sample.offset, sample.size, piece_length
+                            ), timeout=60
+                        )
+                        packet_data_bytes = self._assemble_data_from_pieces(
+                            keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length
+                        )
+                    except TorrentClientError as e:
+                        self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。")
+                        processed_this_run.add(kf_index)
+                        continue
+
+                    if len(packet_data_bytes) != sample.size:
+                        self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data_bytes)}/{sample.size})，跳过。")
+                        processed_this_run.add(kf_index)
+                        continue
+
+                    if extractor.mode == 'avc1':
+                        annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
+                        while cursor < len(packet_data_bytes):
+                            nal_length = int.from_bytes(
+                                packet_data_bytes[cursor: cursor + extractor.nal_length_size], 'big'
+                            )
+                            cursor += extractor.nal_length_size
+                            nal_data = packet_data_bytes[cursor: cursor + nal_length]
+                            annexb_data.extend(start_code + nal_data)
+                            cursor += nal_length
+                        packet_data = bytes(annexb_data)
+                    else:
+                        packet_data = packet_data_bytes
+
+                    ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
+                    m, s = divmod(ts_sec, 60)
+                    h, m = divmod(m, 60)
+                    timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+
+                    task = self.loop.create_task(self.generator.generate(
+                        extradata=extractor.extradata,
+                        packet_data=packet_data,
+                        infohash_hex=infohash_hex,
+                        timestamp_str=timestamp_str
+                    ))
+                    generation_tasks.append(task)
+                    processed_this_run.add(kf_index)
+
+        return processed_this_run, generation_tasks
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data=None):
         """处理为给定 torrent 生成截图的详细逻辑。"""
@@ -292,25 +404,19 @@ class ScreenshotService:
             self.log.info(f"[{infohash_hex}] 从总共 {len(all_keyframes)} 个关键帧中选择了 {len(selected_keyframes)} 个。")
             task_state = {"infohash": infohash_hex, "piece_length": piece_length,"video_file_offset": video_file_offset, "video_file_size": video_file_size,"extractor": extractor, "all_keyframes": all_keyframes,"selected_keyframes": selected_keyframes, "completed_pieces": set(),"processed_keyframes": set()}
 
-        extractor = task_state['extractor']
-        selected_keyframes = task_state['selected_keyframes']
-        video_file_offset = task_state['video_file_offset']
-        piece_length = task_state['piece_length']
-
-        keyframe_info = {}
-        piece_to_keyframes = defaultdict(list)
-        all_needed_pieces = set()
-        remaining_keyframes = [kf for kf in selected_keyframes if kf.index not in task_state.get('processed_keyframes', set())]
-
+        remaining_keyframes = [kf for kf in task_state['selected_keyframes'] if kf.index not in task_state.get('processed_keyframes', set())]
         self.log.info(f"[{infohash_hex}] 需要处理 {len(remaining_keyframes)} 个关键帧。")
         if not remaining_keyframes:
             self.log.info(f"[{infohash_hex}] 所有选定的关键帧都已处理。")
             return
 
+        keyframe_info = {}
+        piece_to_keyframes = defaultdict(list)
+        all_needed_pieces = set()
         for kf in remaining_keyframes:
-            sample = extractor.samples[kf.sample_index - 1]
-            offset = video_file_offset + sample.offset
-            needed = self._get_pieces_for_range(offset, sample.size, piece_length)
+            sample = task_state['extractor'].samples[kf.sample_index - 1]
+            offset = task_state['video_file_offset'] + sample.offset
+            needed = self._get_pieces_for_range(offset, sample.size, task_state['piece_length'])
             keyframe_info[kf.index] = {'keyframe': kf, 'needed_pieces': set(needed)}
             for piece_idx in needed:
                 piece_to_keyframes[piece_idx].append(kf.index)
@@ -324,76 +430,11 @@ class ScreenshotService:
 
         try:
             self.client.request_pieces(handle, pieces_to_request)
-            processed_this_run = set()
-            generation_tasks = []
-
-            while len(processed_this_run) < len(remaining_keyframes):
-                try:
-                    finished_piece = await asyncio.wait_for(local_queue.get(), timeout=300)
-                    if finished_piece is None:
-                        self.log.warning(f"[{infohash_hex}] Torrent 完成但仍有 piece 未下载，提前终止。")
-                        break
-                except asyncio.TimeoutError:
-                    self.log.warning(f"[{infohash_hex}] 等待 piece 超时。")
-                    break
-
-                task_state.setdefault('completed_pieces', set()).add(finished_piece)
-
-                if finished_piece not in piece_to_keyframes: continue
-
-                for kf_index in piece_to_keyframes[finished_piece]:
-                    info = keyframe_info.get(kf_index)
-                    if not info or kf_index in processed_this_run: continue
-
-                    info['needed_pieces'].remove(finished_piece)
-                    if not info['needed_pieces']:
-                        self.log.info(f"[{infohash_hex}] 关键帧 {kf_index} 的所有 piece 都已准备好。正在获取数据并生成截图任务。")
-
-                        keyframe = info['keyframe']
-                        sample = extractor.samples[keyframe.sample_index - 1]
-
-                        try:
-                            keyframe_pieces_data = await self.client.fetch_pieces(handle, self._get_pieces_for_range(video_file_offset + sample.offset, sample.size, piece_length), timeout=60)
-                            packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length)
-                        except TorrentClientError as e:
-                            self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。")
-                            processed_this_run.add(kf_index)
-                            continue
-
-                        if len(packet_data_bytes) != sample.size:
-                            self.log.warning(f"关键帧 {keyframe.index} 的数据不完整，跳过。")
-                            processed_this_run.add(kf_index)
-                            continue
-
-                        if extractor.mode == 'avc1':
-                            annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
-                            while cursor < len(packet_data_bytes):
-                                nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + extractor.nal_length_size], 'big')
-                                cursor += extractor.nal_length_size
-                                nal_data = packet_data_bytes[cursor : cursor + nal_length]
-                                annexb_data.extend(start_code + nal_data)
-                                cursor += nal_length
-                            packet_data = bytes(annexb_data)
-                        else:
-                            packet_data = packet_data_bytes
-
-                        ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
-                        m, s = divmod(ts_sec, 60)
-                        h, m = divmod(m, 60)
-                        timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
-
-                        task = self.loop.create_task(self.generator.generate(
-                            extradata=extractor.extradata,
-                            packet_data=packet_data,
-                            infohash_hex=infohash_hex,
-                            timestamp_str=timestamp_str
-                        ))
-                        generation_tasks.append(task)
-                        processed_this_run.add(kf_index)
+            processed_this_run, generation_tasks = await self._process_keyframe_pieces(
+                handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes
+            )
 
             if not generation_tasks and len(remaining_keyframes) > 0:
-                 # 错误修复：在生成恢复数据之前，更新已处理的关键帧列表。
-                 # 这可以防止在恢复任务后，重复处理在超时前已成功完成的关键帧。
                  task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
                  raise FrameDownloadTimeoutError(f"没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
 
