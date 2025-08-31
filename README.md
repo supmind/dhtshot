@@ -1,79 +1,89 @@
-# 异步 Torrent 截图服务 (Async Torrent Screenshot Service)
+# Torrent-based Video Screenshot Service
 
-这是一个功能强大且健壮的 Python 服务，能够通过 Torrent 协议下载视频文件，并为其自动生成一系列截图。本项目基于 `asyncio` 构建，具有高并发、高可用和可恢复的特性。
+## 1. Overview
 
-## 主要功能
+This project provides a high-performance, asynchronous service for generating screenshots from video files contained within torrents. The key feature of this service is its **minimal download strategy**. Instead of downloading an entire torrent, it only fetches the necessary metadata and the specific data chunks required to extract keyframes, thus saving significant bandwidth and time.
 
-- **基于 Torrent**: 直接使用 `infohash` 或 `magnet` 链接作为输入，无需预先下载视频。
-- **智能关键帧提取**: 自动解析 MP4 文件结构 (`moov` atom)，智能定位 H.264 关键帧，只下载必要的数据块。
-- **异步高并发**: 使用 `asyncio` 和多工作进程（worker）模型，可以同时处理多个截图任务。
-- **健壮的错误处理**: 能够处理网络超时、种子失效等问题，并支持从失败点恢复任务。
-- **灵活配置**: 支持自定义截图策略（如截图数量、间隔等）。
-- **跨平台**: 可在 Linux, macOS, 和 Windows 上运行。
+The service is built with Python using `asyncio` for concurrency and leverages the powerful `libtorrent` library for all BitTorrent-related operations.
 
-## 依赖要求
+## 2. Core Features
 
-本项目依赖于以下 Python 库：
-- `libtorrent`: 用于处理所有 Torrent 相关的功能。
-- `bencode2`: Torrent 元数据编解码。
-- `av`: (PyAV) 用于视频解码，是 `ffmpeg` 的 Python 封装。
-- `Pillow`: 用于图像处理和保存。
-- `bitstring` & `six`: 辅助库。
+- **Minimal Download:** Only downloads the torrent metadata and the specific pieces needed for keyframes.
+- **High-Performance Concurrency:** Utilizes an `asyncio`-based worker pool to process multiple torrents (infohashes) simultaneously.
+- **Robust `moov` Atom Parsing:** Implements a sophisticated two-stage search (header and tail probing) to reliably locate the `moov` atom (video metadata) in various MP4 file structures.
+- **Resilience:** Correctly handles common torrenting issues like timeouts and differentiates between permanent and recoverable errors.
+- **Configurable:** Settings such as worker count, timeouts, and screenshotting strategy are managed via a Pydantic settings class and can be overridden by environment variables.
 
-测试框架使用 `pytest` 和 `pytest-asyncio`。
+## 3. Architecture and Design
 
-## 依赖管理
+The service is composed of several key components that work together in an asynchronous pipeline.
 
-本项目的依赖分为两部分：
-- `requirements.in`: 用于定义直接、高层级的依赖。如需添加或更新依赖，请修改此文件。
-- `requirements.txt`: 这是一个由 `pip-compile` (来自 `pip-tools`) 自动生成的、锁定了所有依赖（包括间接依赖）版本的文件。**请不要手动修改此文件。**
+### 3.1. Components
 
-### 安装
+- **`ScreenshotService` (`service.py`):**
+  - The central orchestrator of the application.
+  - Manages a task queue (`asyncio.Queue`) for incoming infohash jobs.
+  - Spawns and manages a pool of worker coroutines to process tasks concurrently.
+  - Coordinates interactions between the `TorrentClient`, `H264KeyframeExtractor`, and `ScreenshotGenerator`.
 
-1. 克隆本代码库。
-2. 强烈建议在虚拟环境（virtual environment）中进行安装。
-3. 安装所有依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
+- **`TorrentClient` (`client.py`):**
+  - A sophisticated wrapper around the `libtorrent` C++ library.
+  - Manages a single `libtorrent` session to handle all torrents efficiently.
+  - Provides an `asyncio`-friendly interface for torrent operations like adding torrents, fetching metadata, and requesting specific pieces.
+  - Implements a thread-safe alert loop to process notifications from `libtorrent` without blocking the main event loop.
 
-### 更新依赖
+- **`H264KeyframeExtractor` (`extractor.py`):**
+  - A robust parser for MP4 file structures.
+  - Takes the raw bytes of a `moov` atom and parses it to build a complete map of all samples (video frames).
+  - Identifies which samples are keyframes, providing the necessary information (offsets, sizes) to fetch them.
 
-如需更新依赖版本，请执行以下步骤：
-1. （如果尚未安装）`pip install pip-tools`
-2. 修改 `requirements.in` 文件。
-3. 运行 `pip-compile requirements.in` 来重新生成 `requirements.txt`。
-4. 提交 `requirements.in` 和 `requirements.txt` 两个文件的变更。
+- **`ScreenshotGenerator` (`generator.py`):**
+  - Responsible for the final step of generating a JPG screenshot from raw video frame data.
+  - Uses the `PyAV` library (an FFMpeg wrapper) to decode the H.264 frame data and save it as an image.
 
-## 如何使用
+### 3.2. Workflow
 
-项目提供了一个功能完整的示例脚本 `example.py`，用于演示如何使用 `ScreenshotService`。
+The process for generating screenshots from a single infohash follows these steps:
 
-直接运行即可：
+1.  **Task Submission:** An `infohash` is submitted to the `ScreenshotService`, which places it in a queue.
+2.  **Worker Assignment:** An available worker picks up the task.
+3.  **Metadata Fetching:** The worker, via the `TorrentClient`, adds the torrent using a magnet link and waits for the metadata to be downloaded from the DHT network.
+4.  **`moov` Atom Probing:**
+    - **Head Probe:** The service first downloads a small chunk (the first 256KB) from the beginning of the video file to search for the `moov` atom. If found, it proceeds.
+    - **Tail Probe:** If the `moov` atom is not in the header (e.g., if a large `mdat` box is found first), the service downloads a larger chunk from the end of the file (10MB) and searches for the `moov` atom there. This "find and validate" search is robust against malformed data.
+5.  **Keyframe Extraction:** The downloaded `moov` data is passed to the `H264KeyframeExtractor`, which parses it and returns a list of all keyframes in the video.
+6.  **Keyframe Selection:** The service applies a selection strategy (e.g., selecting 5 keyframes evenly distributed throughout the video) to choose a representative set of frames for the screenshots.
+7.  **Targeted Piece Downloading:** The service calculates exactly which torrent pieces are needed to reconstruct the data for the selected keyframes. It then instructs the `TorrentClient` to download only these specific pieces.
+8.  **Screenshot Generation:** As each required piece finishes downloading, the service assembles the keyframe data and passes it to the `ScreenshotGenerator`, which decodes the frame and saves it as a `.jpg` file.
+9.  **Task Completion:** Once all selected keyframes are processed, the task is marked as complete.
+
+## 4. Setup and Usage
+
+### 4.1. Installation
+
+The project uses Python 3.10+. All dependencies are listed in `requirements.txt`.
+
 ```bash
-python example.py
+# Install all required packages
+pip install -r requirements.txt
 ```
 
-该脚本会：
-1. 启动服务。
-2. 提交多个开源电影的 `infohash` 作为截图任务。
-3. 在后台处理这些任务，并将生成的截图保存在 `screenshots_output/` 目录下。
-4. 按下 `Ctrl+C` 可以优雅地停止服务。
+### 4.2. Running the Example
 
-## 工作原理
+The `example.py` script demonstrates how to use the service. It submits a list of pre-defined infohashes and prints status updates as they are processed.
 
-本服务主要由以下几个核心组件构成：
+```bash
+# Run the example script
+python3 example.py
+```
+Screenshots will be saved in the `./screenshots_output` directory by default.
 
-- **`ScreenshotService`**: 核心的服务调度器。负责管理任务队列、工作进程（worker）和任务的生命周期（包括从失败中恢复）。
-- **`TorrentClient`**: `libtorrent` 库的异步封装。负责处理所有底层 P2P 下载、元数据获取和数据块请求。
-- **`H264KeyframeExtractor`**: MP4 文件解析器。它能智能地解析视频的 `moov` box，找到所有关键帧的位置和元数据。
-- **`ScreenshotGenerator`**: 截图生成器。它使用 `PyAV` 库将原始的 H.264 关键帧数据包解码为 `.jpg` 图像。
+## 5. Code Improvement Suggestions
 
-## 近期改进 (全面代码审查)
+The current architecture is solid and performant, but the following areas could be enhanced for a production environment:
 
-本代码库近期经历了一次全面的代码审查和重构，显著提升了其稳定性、健壮性和可维护性。主要改进包括：
-- **修复了 6 个关键 Bug**: 涵盖了任务恢复、并发安全、资源管理、数据完整性和跨平台兼容性等多个方面。
-- **代码重构**: 优化了核心方法的代码结构，使其更清晰、更易于维护。
-- **增强了测试覆盖**: 新增了关键的集成测试和单元测试，确保了核心业务流程（特别是任务恢复）的正确性。
-
-详细的改进内容请参见 `FINAL_REPORT.md`。
+1.  **Enhanced Resume/Recovery Logic:** The service currently has the building blocks for resuming tasks (passing `resume_data`), but there is no application-level logic to persist this data and automatically re-submit tasks that fail with recoverable errors (e.g., timeouts). A persistent queue (like Redis or a database-backed queue) could be implemented to manage retries.
+2.  **Expanded Format Support:** The `H264KeyframeExtractor` is specific to H.264 streams in an MP4 container. This could be abstracted into a more general `Extractor` class with different implementations for other common codecs and containers (e.g., HEVC, VP9, MKV).
+3.  **Improved Test Coverage:** The project has a good testing structure, but coverage should be expanded, particularly for the complex asynchronous interactions in the `TorrentClient` and the various error-handling paths in the `ScreenshotService`.
+4.  **Resource Management Configuration:** The existing Pydantic-based settings could be expanded to include `libtorrent` session-level settings (e.g., `active_torrents_limit`, `max_peerlist_size`, connection limits). This would provide finer-grained control over resource usage in a large-scale deployment.
+5.  **Graceful Shutdown Enhancement:** The current shutdown logic cancels worker tasks. For long-running keyframe processing, it might be beneficial to allow in-progress keyframes to finish processing before shutting down, while preventing new tasks from starting.
