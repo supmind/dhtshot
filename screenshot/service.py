@@ -301,8 +301,10 @@ class ScreenshotService:
             try:
                 finished_piece = await asyncio.wait_for(local_queue.get(), timeout=300)
                 if finished_piece is None:
-                    self.log.warning(f"[{infohash_hex}] Torrent 完成但仍有 piece 未下载，提前终止。")
-                    break
+                    # 这个信号可能因为时序问题而过早到达。
+                    # 我们选择忽略它，并依赖我们自己的循环条件和最终的超时来终止。
+                    self.log.info(f"[{infohash_hex}] 收到 Torrent 完成信号，但将继续等待所有请求的数据块。")
+                    continue
             except asyncio.TimeoutError:
                 self.log.warning(f"[{infohash_hex}] 等待 piece 超时。")
                 break

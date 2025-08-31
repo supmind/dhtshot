@@ -1,0 +1,180 @@
+{
+    "infohash": "08ada5a7a6183aae1e09d831df6748d566095a10",
+    "piece_length": 16384,
+    "video_file_offset": 0,
+    "video_file_size": 163840,
+    "extractor_info": {
+        "extradata": "bW9ja19leHRyYWRhdGE=",
+        "mode": "avc1",
+        "nal_length_size": 4,
+        "timescale": 1000,
+        "samples": [
+            {
+                "offset": 0,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 1,
+                "pts": 0
+            },
+            {
+                "offset": 16384,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 2,
+                "pts": 1000
+            },
+            {
+                "offset": 32768,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 3,
+                "pts": 2000
+            },
+            {
+                "offset": 49152,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 4,
+                "pts": 3000
+            },
+            {
+                "offset": 65536,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 5,
+                "pts": 4000
+            },
+            {
+                "offset": 81920,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 6,
+                "pts": 5000
+            },
+            {
+                "offset": 98304,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 7,
+                "pts": 6000
+            },
+            {
+                "offset": 114688,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 8,
+                "pts": 7000
+            },
+            {
+                "offset": 131072,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 9,
+                "pts": 8000
+            },
+            {
+                "offset": 147456,
+                "size": 16384,
+                "is_keyframe": true,
+                "index": 10,
+                "pts": 9000
+            }
+        ]
+    },
+    "all_keyframes": [
+        {
+            "index": 0,
+            "sample_index": 1,
+            "pts": 0,
+            "timescale": 1000
+        },
+        {
+            "index": 1,
+            "sample_index": 2,
+            "pts": 1000,
+            "timescale": 1000
+        },
+        {
+            "index": 2,
+            "sample_index": 3,
+            "pts": 2000,
+            "timescale": 1000
+        },
+        {
+            "index": 3,
+            "sample_index": 4,
+            "pts": 3000,
+            "timescale": 1000
+        },
+        {
+            "index": 4,
+            "sample_index": 5,
+            "pts": 4000,
+            "timescale": 1000
+        },
+        {
+            "index": 5,
+            "sample_index": 6,
+            "pts": 5000,
+            "timescale": 1000
+        },
+        {
+            "index": 6,
+            "sample_index": 7,
+            "pts": 6000,
+            "timescale": 1000
+        },
+        {
+            "index": 7,
+            "sample_index": 8,
+            "pts": 7000,
+            "timescale": 1000
+        },
+        {
+            "index": 8,
+            "sample_index": 9,
+            "pts": 8000,
+            "timescale": 1000
+        },
+        {
+            "index": 9,
+            "sample_index": 10,
+            "pts": 9000,
+            "timescale": 1000
+        }
+    ],
+    "selected_keyframes": [
+        {
+            "index": 0,
+            "sample_index": 1,
+            "pts": 0,
+            "timescale": 1000
+        },
+        {
+            "index": 2,
+            "sample_index": 3,
+            "pts": 2000,
+            "timescale": 1000
+        },
+        {
+            "index": 4,
+            "sample_index": 5,
+            "pts": 4000,
+            "timescale": 1000
+        },
+        {
+            "index": 6,
+            "sample_index": 7,
+            "pts": 6000,
+            "timescale": 1000
+        },
+        {
+            "index": 8,
+            "sample_index": 9,
+            "pts": 8000,
+            "timescale": 1000
+        }
+    ],
+    "completed_pieces": [],
+    "processed_keyframes": []
+}
