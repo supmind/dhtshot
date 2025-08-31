@@ -166,7 +166,7 @@ class ScreenshotService:
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """智能地查找并获取 moov atom 数据。"""
         self.log.info("正在智能搜索 moov atom...")
-        mdat_found_in_head = False
+        mdat_size_from_head = 0
         try:
             self.log.info("阶段 1: 探测文件头部以查找 moov atom...")
             initial_probe_size = 256 * 1024
@@ -190,14 +190,14 @@ class ScreenshotService:
                             return partial_box_data
                     if box_type == 'mdat':
                         self.log.info("在头部发现 'mdat' box。假设 'moov' 在尾部。")
-                        mdat_found_in_head = True
+                        mdat_size_from_head = box_size
                         break # Stop head probing if mdat is found
         except TorrentClientError as e:
             self.log.error("在头部探测期间发生 torrent 客户端错误: %s", e)
             raise MoovFetchError("在 moov 头部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
         try:
             self.log.info("阶段 2: Moov 不在头部，探测文件尾部。")
-            tail_probe_size = 10 * 1024 * 1024 # Use a fixed, large probe size for the tail
+            tail_probe_size = (video_file_size - mdat_size_from_head) if mdat_size_from_head > 0 else (10 * 1024 * 1024)
             tail_file_offset = max(0, video_file_size - tail_probe_size)
             tail_torrent_offset = video_file_offset + tail_file_offset
             tail_size = min(tail_probe_size, video_file_size - tail_file_offset)

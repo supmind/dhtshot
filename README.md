@@ -50,7 +50,7 @@ The process for generating screenshots from a single infohash follows these step
 3.  **Metadata Fetching:** The worker, via the `TorrentClient`, adds the torrent using a magnet link and waits for the metadata to be downloaded from the DHT network.
 4.  **`moov` Atom Probing:**
     - **Head Probe:** The service first downloads a small chunk (the first 256KB) from the beginning of the video file to search for the `moov` atom. If found, it proceeds.
-    - **Tail Probe:** If the `moov` atom is not in the header (e.g., if a large `mdat` box is found first), the service downloads a larger chunk from the end of the file (10MB) and searches for the `moov` atom there. This "find and validate" search is robust against malformed data.
+    - **Tail Probe:** If the `moov` atom is not found in the header, the service assumes it's at the end. It calculates the size of the tail to probe (either a fixed 10MB, or a dynamic size if a large `mdat` box was found in the header) and downloads that chunk. It then uses a robust "find and validate" search to locate the `moov` atom within this tail data.
 5.  **Keyframe Extraction:** The downloaded `moov` data is passed to the `H264KeyframeExtractor`, which parses it and returns a list of all keyframes in the video.
 6.  **Keyframe Selection:** The service applies a selection strategy (e.g., selecting 5 keyframes evenly distributed throughout the video) to choose a representative set of frames for the screenshots.
 7.  **Targeted Piece Downloading:** The service calculates exactly which torrent pieces are needed to reconstruct the data for the selected keyframes. It then instructs the `TorrentClient` to download only these specific pieces.
