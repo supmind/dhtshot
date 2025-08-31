@@ -20,6 +20,7 @@ import signal
 import logging
 
 from screenshot.service import ScreenshotService
+from screenshot.config import Settings
 
 # --- 1. 配置日志 ---
 # 设置详细的日志记录，以便观察服务的内部工作状态。
@@ -59,8 +60,11 @@ async def main():
         print("="*54 + "\n")
 
     # --- 3. 创建并运行截图服务 ---
-    # 将我们定义的回调函数传递给服务。
-    service = ScreenshotService(loop=loop, status_callback=task_status_callback)
+    # 创建配置实例。Pydantic-Settings 会自动从环境变量或 .env 文件加载配置。
+    settings = Settings()
+
+    # 将配置实例和我们定义的回调函数传递给服务。
+    service = ScreenshotService(settings=settings, loop=loop, status_callback=task_status_callback)
     await service.run()
 
     # --- 4. 提交示例任务 ---
@@ -87,7 +91,7 @@ async def main():
 
     print("\n✅ 截图服务正在运行中。")
     print(f"已提交 {len(infohashes_to_submit)} 个任务。服务将在后台处理它们。")
-    print(f"🖼️  生成的截图将保存在 '{service.output_dir}' 目录中。")
+    print(f"🖼️  生成的截图将保存在 '{service.settings.output_dir}' 目录中。")
     print("🚦 按下 Ctrl+C 来优雅地停止服务。")
 
     # --- 5. 等待关闭信号 ---

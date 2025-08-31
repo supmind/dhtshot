@@ -23,27 +23,26 @@ def mock_basetorrent_info():
 
 @pytest.fixture
 def mock_torrent_client(mock_basetorrent_info):
-    """Provides a mock TorrentClient."""
-    client = MagicMock()
-    # Make all async methods that are actually called by the service awaitable
+    """
+    Provides a mock TorrentClient and its associated mock handle.
+    Returns a dict: {"client": mock_client, "handle": mock_handle}
+    """
+    client = MagicMock(name="TorrentClientMock")
     client.start = AsyncMock()
     client.stop = AsyncMock()
 
-    # _handle_screenshot_task needs add_torrent to return a mock handle
-    mock_handle = MagicMock()
+    mock_handle = MagicMock(name="TorrentHandleMock")
     mock_handle.is_valid.return_value = True
     mock_handle.get_torrent_info.return_value = mock_basetorrent_info
-    client.add_torrent = AsyncMock(return_value=mock_handle)
 
-    # These methods are called inside the screenshot generation logic
-    client.get_metadata = AsyncMock(return_value="metadata_bytes")
+    mock_context_manager = AsyncMock()
+    mock_context_manager.__aenter__.return_value = mock_handle
+
+    # get_handle is a regular method that returns a context manager, so it should be a MagicMock.
+    client.get_handle = MagicMock(return_value=mock_context_manager)
     client.fetch_pieces = AsyncMock(return_value={0: b"piece_data"})
-    client.download_pieces_for_frame = AsyncMock(return_value={0: b"piece_data"})
 
-    # This is called in the finally block for cleanup
-    client.remove_torrent = AsyncMock()
-
-    return client
+    return {"client": client, "handle": mock_handle}
 
 @pytest.fixture
 def mock_keyframe_extractor():
@@ -74,13 +73,17 @@ def mock_screenshot_generator():
 @pytest.fixture
 def mock_service_dependencies(monkeypatch, mock_torrent_client, mock_keyframe_extractor, mock_screenshot_generator):
     """A fixture to patch all dependencies of ScreenshotService."""
+    client_mock = mock_torrent_client["client"]
+    handle_mock = mock_torrent_client["handle"]
+
     # This lambda must accept all arguments that the real constructor takes.
-    monkeypatch.setattr('screenshot.service.TorrentClient', lambda loop, save_path, **kwargs: mock_torrent_client)
+    monkeypatch.setattr('screenshot.service.TorrentClient', lambda loop, save_path, **kwargs: client_mock)
     monkeypatch.setattr('screenshot.service.H264KeyframeExtractor', mock_keyframe_extractor)
     monkeypatch.setattr('screenshot.service.ScreenshotGenerator', lambda loop, output_dir: mock_screenshot_generator)
 
     return {
-        "client": mock_torrent_client,
+        "client": client_mock,
+        "handle": handle_mock,
         "extractor": mock_keyframe_extractor,
         "generator": mock_screenshot_generator
     }

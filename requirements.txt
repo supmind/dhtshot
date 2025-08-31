@@ -4,6 +4,8 @@
 #
 #    pip-compile requirements.in
 #
+annotated-types==0.7.0
+    # via pydantic
 av==15.1.0
     # via -r requirements.in
 bencode2==0.3.26
@@ -26,6 +28,12 @@ pluggy==1.6.0
     # via
     #   pytest
     #   pytest-cov
+pydantic==2.11.7
+    # via pydantic-settings
+pydantic-core==2.33.2
+    # via pydantic
+pydantic-settings==2.10.1
+    # via -r requirements.in
 pygments==2.19.2
     # via pytest
 pytest==8.4.1
@@ -37,7 +45,17 @@ pytest-asyncio==1.1.0
     # via -r requirements.in
 pytest-cov==6.2.1
     # via -r requirements.in
+python-dotenv==1.1.1
+    # via pydantic-settings
 six==1.17.0
     # via -r requirements.in
 typing-extensions==4.15.0
-    # via bencode2
+    # via
+    #   bencode2
+    #   pydantic
+    #   pydantic-core
+    #   typing-inspection
+typing-inspection==0.4.1
+    # via
+    #   pydantic
+    #   pydantic-settings

@@ -3,6 +3,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from screenshot.service import ScreenshotService, Keyframe, SampleInfo
+from screenshot.config import Settings
 
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
@@ -14,7 +15,7 @@ async def test_process_keyframe_pieces_success_path():
     """
     # --- Test Setup ---
     loop = asyncio.get_running_loop()
-    service = ScreenshotService(loop=loop)
+    service = ScreenshotService(settings=Settings(), loop=loop)
     service.client = MagicMock()
     service.generator = MagicMock()
 
@@ -82,7 +83,7 @@ async def test_process_keyframe_pieces_timeout_path():
     """
     # --- Test Setup ---
     loop = asyncio.get_running_loop()
-    service = ScreenshotService(loop=loop)
+    service = ScreenshotService(settings=Settings(), loop=loop)
     service.client = MagicMock()
     service.generator = MagicMock()
 
@@ -155,7 +156,7 @@ async def test_process_keyframe_pieces_data_corruption():
     """
     # --- Test Setup ---
     loop = asyncio.get_running_loop()
-    service = ScreenshotService(loop=loop)
+    service = ScreenshotService(settings=Settings(), loop=loop)
     service.client = MagicMock()
     service.generator = MagicMock()
 

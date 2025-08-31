@@ -46,7 +46,7 @@ class H264KeyframeExtractor:
             try:
                 self._parse_structure()
             except Exception as e:
-                log.error(f"解析 'moov' box 时发生严重错误: {e}", exc_info=True)
+                log.error("解析 'moov' box 时发生严重错误: %s", e, exc_info=True)
                 # Let the error propagate to be handled by the service
                 raise
 
@@ -59,7 +59,7 @@ class H264KeyframeExtractor:
             if not header_data or len(header_data) < 8: break
             size, box_type_bytes = struct.unpack('>I4s', header_data)
             box_type = box_type_bytes.decode('ascii', 'ignore')
-            log.debug(f"在偏移量 {current_offset} 处找到 Box '{box_type}'，大小为 {size}")
+            log.debug("在偏移量 %d 处找到 Box '%s'，大小为 %d", current_offset, box_type, size)
             header_size = 8
             if size == 1:
                 size_64_data = stream.read(8)
@@ -74,12 +74,12 @@ class H264KeyframeExtractor:
 
             payload_size = size - header_size
             if payload_size < 0:
-                log.warning(f"在 Box '{box_type}' 中检测到无效的 payload 大小 ({payload_size})，停止解析。")
+                log.warning("在 Box '%s' 中检测到无效的 payload 大小 (%d)，停止解析。", box_type, payload_size)
                 break
 
             payload_content = stream.read(payload_size)
             if len(payload_content) < payload_size:
-                log.warning(f"无法读取 Box '{box_type}' 的完整 payload，停止解析。")
+                log.warning("无法读取 Box '%s' 的完整 payload，停止解析。", box_type)
                 break
 
             payload = BytesIO(payload_content)
@@ -101,7 +101,7 @@ class H264KeyframeExtractor:
         This logic is adapted from the user-provided robust implementation.
         """
         stream = self.moov_stream
-        log.info(f"开始解析 'moov' box。总大小: {len(stream.getbuffer())} 字节。")
+        log.info("开始解析 'moov' box。总大小: %d 字节。", len(stream.getbuffer()))
 
         # The data passed to the extractor is the complete 'moov' atom (header + payload).
         # Some files might have a nested 'moov' atom. We need to unwrap it to get to the
@@ -153,7 +153,7 @@ class H264KeyframeExtractor:
             moov_payload.seek(0)
             for t, _ in self._parse_boxes(moov_payload):
                 all_children.append(t)
-            log.error(f"在 'moov' 的 payload 中未找到视频轨道。找到的 box: {all_children}")
+            log.error("在 'moov' 的 payload 中未找到视频轨道。找到的 box: %s", all_children)
             raise ValueError("在 'moov' Box 中未找到有效的视频轨道。")
 
         # 2. Get timescale from 'mdhd'
@@ -212,7 +212,7 @@ class H264KeyframeExtractor:
                 avcc_payload = avcc_payload_stream.getvalue()
                 self.extradata = avcc_payload
                 self.nal_length_size = (avcc_payload[4] & 0x03) + 1
-                log.info(f"找到有效的 'avcC' Box，将使用 '带外' 模式 (NALU 长度: {self.nal_length_size} 字节)。")
+                log.info("找到有效的 'avcC' Box，将使用 '带外' 模式 (NALU 长度: %d 字节)。", self.nal_length_size)
             else:
                 # Found 'avc1' but 'avcC' is missing or invalid -> fallback to in-band
                 self.mode = 'avc3'
@@ -302,4 +302,4 @@ class H264KeyframeExtractor:
             for i, s in enumerate(keyframe_samples)
         ]
 
-        log.info(f"完成采样地图构建。共找到 {len(self.samples)} 个样本，其中 {len(self.keyframes)} 个是关键帧。")
+        log.info("完成采样地图构建。共找到 %d 个样本，其中 %d 个是关键帧。", len(self.samples), len(self.keyframes))

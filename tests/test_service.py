@@ -3,6 +3,7 @@ import io
 import struct
 
 from screenshot.service import ScreenshotService
+from screenshot.config import Settings
 
 # Helper to create a box
 def create_box(box_type: bytes, payload: bytes) -> bytes:
@@ -14,7 +15,7 @@ def create_box(box_type: bytes, payload: bytes) -> bytes:
 def service():
     """Provides a ScreenshotService instance for testing its pure methods."""
     # We don't need a running service with a loop, just an instance.
-    return ScreenshotService(loop=None)
+    return ScreenshotService(settings=Settings(), loop=None)
 
 def test_parse_mp4_boxes_simple(service):
     """Tests that the box parser can correctly parse a stream of multiple, valid boxes."""
@@ -136,12 +137,9 @@ def test_assemble_data_from_pieces(service):
 
 def test_select_keyframes_uses_custom_config():
     """测试 _select_keyframes 方法能正确使用在服务中配置的自定义参数。"""
-    # 重新配置服务实例以使用非默认值
-    service = ScreenshotService(
-        loop=None,
-        min_screenshots=10,
-        max_screenshots=10,
-    )
+    # Create a custom settings object for this test
+    settings = Settings(min_screenshots=10, max_screenshots=10)
+    service = ScreenshotService(settings=settings, loop=None)
 
     # 模拟一个很长的视频，确保我们的 max_screenshots 会生效
     # (10000s duration / 180s interval) > 10
@@ -161,7 +159,8 @@ def test_select_keyframes_uses_custom_config():
 
 def test_select_keyframes_default_for_zero_duration():
     """测试当视频时长为0时，使用 default_screenshots 参数。"""
-    service = ScreenshotService(loop=None, default_screenshots=15)
+    settings = Settings(default_screenshots=15)
+    service = ScreenshotService(settings=settings, loop=None)
 
     duration_sec = 0
     timescale = 1

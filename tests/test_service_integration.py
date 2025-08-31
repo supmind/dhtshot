@@ -4,6 +4,7 @@ from unittest.mock import patch, AsyncMock
 
 from screenshot.service import ScreenshotService, Keyframe, SampleInfo
 from screenshot.errors import FrameDownloadTimeoutError
+from screenshot.config import Settings
 
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
@@ -15,14 +16,18 @@ async def test_task_recovery_after_recoverable_failure(status_callback, mock_ser
     """
     # --- Test Setup ---
     loop = asyncio.get_running_loop()
-    service = ScreenshotService(
-        loop=loop,
-        status_callback=status_callback,
+    settings = Settings(
         min_screenshots=10,
         max_screenshots=10,
         default_screenshots=10
     )
+    service = ScreenshotService(
+        settings=settings,
+        loop=loop,
+        status_callback=status_callback
+    )
     client = mock_service_dependencies['client']
+    handle = mock_service_dependencies['handle']
     generator = mock_service_dependencies['generator']
     service.client = client
     service.generator = generator
@@ -35,7 +40,8 @@ async def test_task_recovery_after_recoverable_failure(status_callback, mock_ser
         num_keyframes = 10
 
         # --- Common Mock Configuration ---
-        mock_ti = client.add_torrent.return_value.get_torrent_info.return_value
+        # The handle is now provided by the fixture, so we configure it directly.
+        mock_ti = handle.get_torrent_info.return_value
         mock_ti.files.return_value.file_size.return_value = 16384 * num_keyframes
 
         mock_keyframes = [Keyframe(index=i, sample_index=i+1, pts=i*1000, timescale=1000) for i in range(num_keyframes)]

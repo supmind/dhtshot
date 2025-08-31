@@ -7,6 +7,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from screenshot.service import ScreenshotService
+from screenshot.config import Settings
 
 # 将此文件中的所有测试标记为异步测试
 pytestmark = pytest.mark.asyncio
@@ -21,7 +22,7 @@ async def test_submit_task_is_thread_safe(mock_service_dependencies, status_call
     """
     # --- 1. 测试设置 ---
     loop = asyncio.get_running_loop()
-    service = ScreenshotService(loop=loop, status_callback=status_callback)
+    service = ScreenshotService(settings=Settings(), loop=loop, status_callback=status_callback)
 
     # 我们不需要实际处理任务，所以模拟掉核心处理逻辑
     service._handle_screenshot_task = AsyncMock()

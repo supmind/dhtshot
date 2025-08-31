@@ -27,46 +27,36 @@ from .generator import ScreenshotGenerator
 StatusCallback = Callable[..., Awaitable[None]]
 
 
+from .config import Settings
+
 class ScreenshotService:
     """协调截图生成过程的核心服务类。"""
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None, min_screenshots: int = 5, max_screenshots: int = 50, target_interval_sec: int = 180, default_screenshots: int = 20, metadata_timeout: int = 180, moov_probe_timeout: int = 120, piece_fetch_timeout: int = 60, piece_queue_timeout: int = 300):
+    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None):
         self.loop = loop or asyncio.get_event_loop()
-        self.num_workers = num_workers
-        self.output_dir = output_dir
+        self.settings = settings
         self.log = logging.getLogger("ScreenshotService")
         self.task_queue = asyncio.Queue()
         self.workers = []
         self._running = False
-        # 兼容性修复：将 torrent_save_path 的决定权交给 TorrentClient，
-        # 如果为 None，Client 将使用系统的临时目录。
-        self.client = client or TorrentClient(loop=self.loop, save_path=torrent_save_path, metadata_timeout=metadata_timeout)
-        self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.output_dir)
+
+        self.client = client or TorrentClient(
+            loop=self.loop,
+            save_path=self.settings.torrent_save_path,
+            metadata_timeout=self.settings.metadata_timeout
+        )
+        self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.settings.output_dir)
         self.status_callback = status_callback
-        # 用于跟踪活跃任务，防止重复提交
         self.active_tasks = set()
-        # 用于防止 submit_task 中出现竞态条件的锁
         self._submit_lock = asyncio.Lock()
-
-        # --- 截图选择策略配置 ---
-        self.min_screenshots = min_screenshots
-        self.max_screenshots = max_screenshots
-        self.target_interval_sec = target_interval_sec
-        self.default_screenshots = default_screenshots
-
-        # --- 超时配置 ---
-        self.metadata_timeout = metadata_timeout
-        self.moov_probe_timeout = moov_probe_timeout
-        self.piece_fetch_timeout = piece_fetch_timeout
-        self.piece_queue_timeout = piece_queue_timeout
 
     async def run(self):
         """启动服务，包括 torrent 客户端和工作进程。"""
         self.log.info("正在启动 ScreenshotService...")
         self._running = True
         await self.client.start()
-        for _ in range(self.num_workers):
+        for _ in range(self.settings.num_workers):
             self.workers.append(self.loop.create_task(self._worker()))
-        self.log.info(f"ScreenshotService 已启动，拥有 {self.num_workers} 个工作进程。")
+        self.log.info("ScreenshotService 已启动，拥有 %d 个工作进程。", self.settings.num_workers)
 
     async def stop(self):
         """异步地停止服务，包括 torrent 客户端和工作进程。"""
@@ -85,15 +75,15 @@ class ScreenshotService:
         # 使用锁来确保检查和添加操作的原子性，防止竞态条件
         async with self._submit_lock:
             if infohash in self.active_tasks:
-                self.log.warning(f"任务 {infohash} 已在处理中，本次提交被忽略。")
+                self.log.warning("任务 %s 已在处理中，本次提交被忽略。", infohash)
                 return
             self.active_tasks.add(infohash)
 
         await self.task_queue.put({'infohash': infohash, 'resume_data': resume_data})
         if resume_data:
-            self.log.info(f"为 infohash: {infohash} 重新提交了任务")
+            self.log.info("为 infohash: %s 重新提交了任务", infohash)
         else:
-            self.log.info(f"为 infohash: {infohash} 提交了新任务")
+            self.log.info("为 infohash: %s 提交了新任务", infohash)
 
     def _get_pieces_for_range(self, offset_in_torrent, size, piece_length):
         """为 torrent 中的给定字节范围计算 piece 索引。"""
@@ -112,7 +102,7 @@ class ScreenshotService:
         # 在这种情况下，返回一个空字节串来向上游发出失败信号。
         for piece_index in range(start_piece, end_piece + 1):
             if piece_index not in pieces_data:
-                self.log.warning(f"组装数据时缺少 piece #{piece_index}，操作中止。")
+                self.log.warning("组装数据时缺少 piece #%d，操作中止。", piece_index)
                 return b""
 
         # 确认所有数据块都存在后，再进行拼装。
@@ -148,12 +138,12 @@ class ScreenshotService:
                 size, box_type_bytes = struct.unpack('>I4s', header_data)
                 box_type = box_type_bytes.decode('ascii', 'ignore')
             except struct.error:
-                self.log.warning(f"无法在偏移量 {current_offset} 处解包 box 头部。数据不完整。")
+                self.log.warning("无法在偏移量 %d 处解包 box 头部。数据不完整。", current_offset)
                 break
             box_header_size = 8
             if size == 1:
                 if current_offset + 16 > buffer_size:
-                    self.log.warning(f"Box '{box_type}' 有一个 64 位的大小，但没有足够的数据用于头部。")
+                    self.log.warning("Box '%s' 有一个 64 位的大小，但没有足够的数据用于头部。", box_type)
                     break
                 size_64_data = stream.read(8)
                 size = struct.unpack('>Q', size_64_data)[0]
@@ -161,10 +151,10 @@ class ScreenshotService:
             elif size == 0:
                 size = buffer_size - current_offset
             if size < box_header_size:
-                self.log.warning(f"Box '{box_type}' 的大小无效 {size}。停止解析。")
+                self.log.warning("Box '%s' 的大小无效 %d。停止解析。", box_type, size)
                 break
             if current_offset + size > buffer_size:
-                self.log.warning(f"大小为 {size} 的 Box '{box_type}' 超出了可用数据范围。无法完全解析。")
+                self.log.warning("大小为 %d 的 Box '%s' 超出了可用数据范围。无法完全解析。", size, box_type)
                 full_box_data = stream_buffer[current_offset:buffer_size]
                 yield box_type, bytes(full_box_data), current_offset, size
                 break
@@ -181,18 +171,18 @@ class ScreenshotService:
             initial_probe_size = 256 * 1024
             head_size = min(initial_probe_size, video_file_size)
             head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.moov_probe_timeout)
+            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
             head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
             stream = io.BytesIO(head_data)
             for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
-                self.log.info(f"在头部发现 box '{box_type}'，偏移量 {box_offset}，大小 {box_size}。")
+                self.log.info("在头部发现 box '%s'，偏移量 %d，大小 %d。", box_type, box_offset, box_size)
                 if box_type == 'moov':
                     self.log.info("在头部探测中发现 'moov' atom。")
                     if len(partial_box_data) < box_size:
-                        self.log.info(f"探测获得了部分 moov ({len(partial_box_data)}/{box_size} 字节)。正在获取完整数据。")
+                        self.log.info("探测获得了部分 moov (%d/%d 字节)。正在获取完整数据。", len(partial_box_data), box_size)
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.moov_probe_timeout)
+                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
                     else:
                         return partial_box_data
@@ -201,8 +191,8 @@ class ScreenshotService:
                     mdat_size_from_head = box_size
                     break
         except TorrentClientError as e:
-            self.log.error(f"在头部探测期间发生 torrent 客户端错误: {e}")
-            raise MoovFetchError(f"在 moov 头部探测期间发生 torrent 客户端错误: {e}", infohash_hex) from e
+            self.log.error("在头部探测期间发生 torrent 客户端错误: %s", e)
+            raise MoovFetchError("在 moov 头部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
         try:
             self.log.info("阶段 2: Moov 不在头部，探测文件尾部。")
             tail_probe_size = (video_file_size - mdat_size_from_head) if mdat_size_from_head > 0 else (10 * 1024 * 1024)
@@ -210,7 +200,7 @@ class ScreenshotService:
             tail_torrent_offset = video_file_offset + tail_file_offset
             tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
             tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.moov_probe_timeout)
+            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
             tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
             search_pos = len(tail_data)
             while search_pos > 4:
@@ -224,12 +214,12 @@ class ScreenshotService:
                 stream.seek(potential_start_pos)
                 box_type, full_box_data, _, _ = next(self._parse_mp4_boxes(stream), (None, None, None, None))
                 if box_type == 'moov':
-                    self.log.info(f"成功从尾部解析 'moov' atom，大小为 {len(full_box_data)}。")
+                    self.log.info("成功从尾部解析 'moov' atom，大小为 %d。", len(full_box_data))
                     return full_box_data
                 search_pos = found_pos
         except TorrentClientError as e:
-            self.log.error(f"在尾部探测期间发生 torrent 客户端错误: {e}")
-            raise MoovFetchError(f"在 moov 尾部探测期间发生 torrent 客户端错误: {e}", infohash_hex) from e
+            self.log.error("在尾部探测期间发生 torrent 客户端错误: %s", e)
+            raise MoovFetchError("在 moov 尾部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
         raise MoovNotFoundError("无法在文件的第一部分/最后一部分定位 'moov' atom。", infohash_hex)
 
     def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int]:
@@ -250,9 +240,9 @@ class ScreenshotService:
 
         # 使用可配置的参数来决定截图数量
         if duration_sec > 0:
-            num_screenshots = max(self.min_screenshots, min(int(duration_sec / self.target_interval_sec), self.max_screenshots))
+            num_screenshots = max(self.settings.min_screenshots, min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots))
         else:
-            num_screenshots = self.default_screenshots
+            num_screenshots = self.settings.default_screenshots
 
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
@@ -306,7 +296,7 @@ class ScreenshotService:
 
         while len(processed_this_run) < len(remaining_keyframes):
             try:
-                finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.piece_queue_timeout)
+                finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.settings.piece_queue_timeout)
                 if finished_piece is None:
                     # 这个信号可能因为时序问题而过早到达。
                     # 我们选择忽略它，并依赖我们自己的循环条件和最终的超时来终止。
@@ -337,7 +327,7 @@ class ScreenshotService:
                         keyframe_pieces_data = await self.client.fetch_pieces(
                             handle, self._get_pieces_for_range(
                                 video_file_offset + sample.offset, sample.size, piece_length
-                            ), timeout=self.piece_fetch_timeout
+                            ), timeout=self.settings.piece_fetch_timeout
                         )
                         packet_data_bytes = self._assemble_data_from_pieces(
                             keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length
@@ -386,37 +376,37 @@ class ScreenshotService:
         """处理为给定 torrent 生成截图的详细逻辑。"""
         task_state = {}
         if resume_data:
-            self.log.info(f"[{infohash_hex}] 正在从提供的数据恢复任务。")
+            self.log.info("[%s] 正在从提供的数据恢复任务。", infohash_hex)
             try:
                 task_state = self._load_state_from_resume_data(resume_data)
             except (KeyError, TypeError) as e:
-                self.log.error(f"[{infohash_hex}] 加载恢复数据失败，将重新开始。错误: {e}")
+                self.log.error("[%s] 加载恢复数据失败，将重新开始。错误: %s", infohash_hex, e)
                 resume_data = None
         if not resume_data:
-            self.log.info(f"[{infohash_hex}] 正在开始新的截图任务分析。")
+            self.log.info("[%s] 正在开始新的截图任务分析。", infohash_hex)
             ti = handle.get_torrent_info()
             piece_length = ti.piece_length()
             video_file_index, video_file_size, video_file_offset = self._find_video_file(ti)
             if video_file_index == -1:
                 raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
             video_file_path = ti.files().file_path(video_file_index)
-            self.log.info(f"[{infohash_hex}] 找到视频文件: '{video_file_path}' ({video_file_size} 字节)。")
+            self.log.info("[%s] 找到视频文件: '%s' (%d 字节)。", infohash_hex, video_file_path, video_file_size)
             moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
             try:
                 extractor = H264KeyframeExtractor(moov_data)
                 if not extractor.keyframes:
                     raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
             except Exception as e:
-                raise MoovParsingError(f"解析 moov 数据失败: {e}", infohash_hex) from e
+                raise MoovParsingError("解析 moov 数据失败: %s", e, infohash_hex) from e
             all_keyframes = extractor.keyframes
             selected_keyframes = self._select_keyframes(all_keyframes, extractor.timescale, extractor.samples)
-            self.log.info(f"[{infohash_hex}] 从总共 {len(all_keyframes)} 个关键帧中选择了 {len(selected_keyframes)} 个。")
+            self.log.info("[%s] 从总共 %d 个关键帧中选择了 %d 个。", infohash_hex, len(all_keyframes), len(selected_keyframes))
             task_state = {"infohash": infohash_hex, "piece_length": piece_length,"video_file_offset": video_file_offset, "video_file_size": video_file_size,"extractor": extractor, "all_keyframes": all_keyframes,"selected_keyframes": selected_keyframes, "completed_pieces": set(),"processed_keyframes": set()}
 
         remaining_keyframes = [kf for kf in task_state['selected_keyframes'] if kf.index not in task_state.get('processed_keyframes', set())]
-        self.log.info(f"[{infohash_hex}] 需要处理 {len(remaining_keyframes)} 个关键帧。")
+        self.log.info("[%s] 需要处理 %d 个关键帧。", infohash_hex, len(remaining_keyframes))
         if not remaining_keyframes:
-            self.log.info(f"[{infohash_hex}] 所有选定的关键帧都已处理。")
+            self.log.info("[%s] 所有选定的关键帧都已处理。", infohash_hex)
             return
 
         keyframe_info = {}
@@ -432,7 +422,7 @@ class ScreenshotService:
             all_needed_pieces.update(needed)
 
         pieces_to_request = list(all_needed_pieces - task_state.get('completed_pieces', set()))
-        self.log.info(f"[{infohash_hex}] 正在从 torrent 客户端请求 {len(pieces_to_request)} 个新 piece。")
+        self.log.info("[%s] 正在从 torrent 客户端请求 %d 个新 piece。", infohash_hex, len(pieces_to_request))
 
         local_queue = asyncio.Queue()
         self.client.subscribe_pieces(infohash_hex, local_queue)
@@ -445,7 +435,7 @@ class ScreenshotService:
 
             if not generation_tasks and len(remaining_keyframes) > 0:
                  task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
-                 raise FrameDownloadTimeoutError(f"没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
+                 raise FrameDownloadTimeoutError("没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
 
             results = await asyncio.gather(*generation_tasks, return_exceptions=True)
         finally:
@@ -456,9 +446,9 @@ class ScreenshotService:
                 raise result
 
         if len(processed_this_run) < len(remaining_keyframes):
-            self.log.warning(f"[{infohash_hex}] 未能为所有选定的关键帧生成截图。")
+            self.log.warning("[%s] 未能为所有选定的关键帧生成截图。", infohash_hex)
         else:
-            self.log.info(f"[{infohash_hex}] 截图任务成功完成。")
+            self.log.info("[%s] 截图任务成功完成。", infohash_hex)
 
     async def _send_status_update(self, **kwargs: Any) -> None:
         """Helper to send a status update via the callback, if provided."""
@@ -470,37 +460,36 @@ class ScreenshotService:
     async def _handle_screenshot_task(self, task_info: dict):
         infohash_hex = task_info['infohash']
         resume_data = task_info.get('resume_data')
-        task_succeeded = False
-        log_message = f"正在处理任务: {infohash_hex}"
+
+        log_message = "正在处理任务: %s"
+        log_args = [infohash_hex]
         if resume_data:
             log_message += " (正在恢复)"
-        self.log.info(log_message)
-        handle = None
+        self.log.info(log_message, *log_args)
+
         try:
-            handle = await self.client.add_torrent(infohash_hex)
-            if not handle or not handle.is_valid():
-                raise TorrentClientError(f"无法为 {infohash_hex} 获取有效的 torrent handle。")
-            await self._generate_screenshots_from_torrent(handle, infohash_hex, resume_data)
-            task_succeeded = True
+            async with self.client.get_handle(infohash_hex) as handle:
+                await self._generate_screenshots_from_torrent(handle, infohash_hex, resume_data)
+
+            # 如果没有异常抛出，则任务成功
+            self.log.info("任务 %s 成功完成。", infohash_hex)
+            await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
+
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:
-            self.log.warning(f"任务 {infohash_hex} 因可恢复的错误而失败: {e}")
+            self.log.warning("任务 %s 因可恢复的错误而失败: %s", infohash_hex, e)
             infohash = getattr(e, 'infohash', infohash_hex)
             await self._send_status_update(status='recoverable_failure',infohash=infohash,message=str(e),error=e,resume_data=getattr(e, 'resume_data', None))
         except TaskError as e:
-            self.log.error(f"任务 {infohash_hex} 因永久性错误而失败: {e}")
+            self.log.error("任务 %s 因永久性错误而失败: %s", e.infohash, e)
             await self._send_status_update(status='permanent_failure',infohash=e.infohash,message=str(e),error=e)
         except TorrentClientError as e:
-            self.log.error(f"任务 {infohash_hex} 因 torrent 客户端错误而失败: {e}")
+            self.log.error("任务 %s 因 torrent 客户端错误而失败: %s", infohash_hex, e)
             await self._send_status_update(status='permanent_failure',infohash=infohash_hex,message=str(e),error=e)
         except Exception as e:
-            self.log.exception(f"处理 {infohash_hex} 时发生意外的严重错误。")
+            self.log.exception("处理 %s 时发生意外的严重错误。", infohash_hex)
             await self._send_status_update(status='permanent_failure',infohash=infohash_hex,message=f"发生意外错误: {e}",error=e)
         finally:
-            if task_succeeded:
-                self.log.info(f"任务 {infohash_hex} 成功完成。")
-                await self._send_status_update(status='success',infohash=infohash_hex,message='任务成功完成。')
-            if handle and handle.is_valid():
-                await self.client.remove_torrent(handle)
+            # 无论成功或失败，最后都将任务从活跃集合中移除
             self.active_tasks.discard(infohash_hex)
 
     async def _worker(self):

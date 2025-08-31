@@ -43,9 +43,9 @@ class ScreenshotGenerator:
         try:
             # PyAV 的 to_image() 方法依赖于 Pillow 库来创建图像对象
             frame.to_image().save(output_filename, "JPEG")
-            log.info(f"成功：截图已保存至 {output_filename}")
+            log.info("成功：截图已保存至 %s", output_filename)
         except Exception:
-            log.exception(f"保存帧到文件 {output_filename} 时发生错误。")
+            log.exception("保存帧到文件 %s 时发生错误。", output_filename)
             raise
 
     def _decode_and_save(self, extradata: Optional[bytes], packet_data: bytes, infohash_hex: str, timestamp_str: str):
@@ -66,7 +66,7 @@ class ScreenshotGenerator:
             if extradata:
                 # '带外' (Out-of-band) 模式：解码器配置（如SPS/PPS）在码流之外提供。
                 # 这通常来自 MP4 的 'avcC' box。
-                log.debug(f"正在使用 {len(extradata)} 字节的 extradata (带外) 配置解码器...")
+                log.debug("正在使用 %d 字节的 extradata (带外) 配置解码器...", len(extradata))
                 codec.extradata = extradata
             else:
                 # '带内' (In-band) 模式：配置信息内嵌在 H.264 码流中。
@@ -76,7 +76,7 @@ class ScreenshotGenerator:
             # 3. 将数据包装成 PyAV 的 Packet 对象
             # 这是解码器唯一接受的输入格式。
             packet = av.Packet(packet_data)
-            log.debug(f"将一个大小为 {packet.size} 字节的数据包送入解码器...")
+            log.debug("将一个大小为 %d 字节的数据包送入解码器...", packet.size)
 
             # 4. 解码数据包
             # decode() 方法可能会返回一个帧列表，也可能不返回（如果它需要更多数据来形成一个完整的帧）。
@@ -93,7 +93,7 @@ class ScreenshotGenerator:
                     pass
 
             if not frames:
-                log.error(f"解码失败：解码器未能从时间戳 {timestamp_str} 的数据包中解码出任何帧。")
+                log.error("解码失败：解码器未能从时间戳 %s 的数据包中解码出任何帧。", timestamp_str)
                 return
 
             # 通常一个关键帧数据包只解码出一个图像帧。我们只取第一个。
@@ -101,10 +101,10 @@ class ScreenshotGenerator:
 
         except av.error.InvalidDataError as e:
             # 当码流数据损坏或格式不正确时，PyAV 会抛出此异常。
-            log.error(f"解码器报告无效数据 (时间戳: {timestamp_str}): {e}")
+            log.error("解码器报告无效数据 (时间戳: %s): %s", timestamp_str, e)
         except Exception:
             # 捕获所有其他潜在异常，以便记录详细的错误信息。
-            log.exception(f"为帧 {timestamp_str} 进行同步解码/保存时发生未知错误")
+            log.exception("为帧 %s 进行同步解码/保存时发生未知错误", timestamp_str)
             # 重新抛出异常，以便 run_in_executor 可以捕获它。
             raise
 
@@ -116,7 +116,7 @@ class ScreenshotGenerator:
         CPU 密集型和阻塞的 `_decode_and_save` 方法调度到线程池中执行，
         从而使主 asyncio 事件循环保持非阻塞状态。
         """
-        log.debug(f"正在为时间戳 {timestamp_str} 安排截图生成任务")
+        log.debug("正在为时间戳 %s 安排截图生成任务", timestamp_str)
 
         await self.loop.run_in_executor(
             None,  # 使用默认的线程池执行器
