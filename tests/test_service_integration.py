@@ -34,7 +34,7 @@ async def test_task_recovery_after_recoverable_failure(status_callback, mock_ser
     mock_extractor_class = mock_service_dependencies['extractor']
 
     with patch('screenshot.service.ScreenshotService._get_moov_atom_data', new_callable=AsyncMock, return_value=b'mock_moov_data'), \
-         patch('screenshot.service.H264KeyframeExtractor', mock_extractor_class):
+         patch('screenshot.service.KeyframeExtractor', mock_extractor_class):
 
         infohash = "test_hash_recovery"
         num_keyframes = 10

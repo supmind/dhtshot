@@ -78,7 +78,7 @@ def mock_service_dependencies(monkeypatch, mock_torrent_client, mock_keyframe_ex
 
     # This lambda must accept all arguments that the real constructor takes.
     monkeypatch.setattr('screenshot.service.TorrentClient', lambda loop, save_path, **kwargs: client_mock)
-    monkeypatch.setattr('screenshot.service.H264KeyframeExtractor', mock_keyframe_extractor)
+    monkeypatch.setattr('screenshot.service.KeyframeExtractor', mock_keyframe_extractor)
     monkeypatch.setattr('screenshot.service.ScreenshotGenerator', lambda loop, output_dir: mock_screenshot_generator)
 
     return {

@@ -29,10 +29,12 @@ async def test_fetch_pieces_cancellation_cleans_up_pending_reads(mock_lt_session
     # Mock the torrent handle to be valid
     mock_handle = MagicMock()
     mock_handle.is_valid.return_value = True
-    # We use have_piece=True to skip the download part and go straight to reading
     mock_handle.have_piece.return_value = True
+    # The key for pending_reads is a tuple of (infohash, piece_index)
+    mock_handle.info_hash.return_value = "mockinfohash12345678901234567890"
 
     piece_indices = [0, 1, 2]
+    infohash_hex = str(mock_handle.info_hash())
 
     # --- Create and run a task that we will then cancel ---
     fetch_task = asyncio.create_task(client.fetch_pieces(mock_handle, piece_indices))
@@ -42,12 +44,12 @@ async def test_fetch_pieces_cancellation_cleans_up_pending_reads(mock_lt_session
 
     # At this point, futures for the read operations should be in the dictionary
     assert len(client.pending_reads) == 3
-    assert 0 in client.pending_reads
-    assert 1 in client.pending_reads
-    assert 2 in client.pending_reads
+    assert (infohash_hex, 0) in client.pending_reads
+    assert (infohash_hex, 1) in client.pending_reads
+    assert (infohash_hex, 2) in client.pending_reads
 
     # Get a reference to one of the futures to check its state later
-    future_for_piece_0 = client.pending_reads[0]['future']
+    future_for_piece_0 = client.pending_reads[(infohash_hex, 0)]['future']
 
     # --- Now, cancel the task ---
     fetch_task.cancel()

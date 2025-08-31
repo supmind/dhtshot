@@ -2,7 +2,7 @@ import pytest
 import struct
 from io import BytesIO
 
-from screenshot.extractor import H264KeyframeExtractor
+from screenshot.extractor import KeyframeExtractor
 
 # Helper function to create a box
 def create_box(box_type: bytes, payload: bytes) -> bytes:
@@ -12,7 +12,7 @@ def create_box(box_type: bytes, payload: bytes) -> bytes:
 
 def test_h264_extractor_parses_correctly():
     """
-    Tests the H264KeyframeExtractor with a manually constructed, valid 'moov' atom.
+    Tests the KeyframeExtractor with a manually constructed, valid 'moov' atom.
     This test verifies that all major tables (stsd, stts, stss, stsz, stsc, stco)
     are parsed correctly to build a complete and accurate sample map.
     """
@@ -75,9 +75,10 @@ def test_h264_extractor_parses_correctly():
     moov_data = create_box(b'moov', moov_payload)
 
     # --- Run the extractor ---
-    extractor = H264KeyframeExtractor(moov_data)
+    extractor = KeyframeExtractor(moov_data)
 
     # --- Assertions ---
+    assert extractor.codec_name == 'h264'
     assert extractor.mode == 'avc1'
     assert extractor.nal_length_size == 4  # from avcc payload: (\xff & 3) + 1 = 4
     assert extractor.extradata == avcc_payload
@@ -138,7 +139,7 @@ def test_extractor_handles_avcc_after_other_box():
     moov_data = create_box(b'moov', moov_payload)
 
     # --- Run the extractor ---
-    extractor = H264KeyframeExtractor(moov_data)
+    extractor = KeyframeExtractor(moov_data)
 
     # --- Assertions ---
     # The key assertion is that we found the avcC box correctly despite the 'free' box.
@@ -166,7 +167,7 @@ def test_extractor_missing_stbl_box():
     moov_data = create_box(b'moov', moov_payload)
 
     with pytest.raises(ValueError, match="在视频轨道中未找到 'stbl' Box"):
-        H264KeyframeExtractor(moov_data)
+        KeyframeExtractor(moov_data)
 
 
 def test_extractor_no_keyframes():
@@ -212,7 +213,7 @@ def test_extractor_no_keyframes():
     moov_payload = mvhd_box + trak_box
     moov_data = create_box(b'moov', moov_payload)
 
-    extractor = H264KeyframeExtractor(moov_data)
+    extractor = KeyframeExtractor(moov_data)
 
     assert len(extractor.samples) == 2
     assert len(extractor.keyframes) == 0
@@ -245,7 +246,7 @@ def test_extractor_handles_avc3_in_band():
     moov_payload = mvhd_box + trak_box
     moov_data = create_box(b'moov', moov_payload)
 
-    extractor = H264KeyframeExtractor(moov_data)
+    extractor = KeyframeExtractor(moov_data)
 
     assert extractor.mode == 'avc3'
     assert extractor.extradata is None
@@ -270,4 +271,4 @@ def test_extractor_no_video_track():
     moov_data = create_box(b'moov', moov_payload)
 
     with pytest.raises(ValueError, match="在 'moov' Box 中未找到有效的视频轨道"):
-        H264KeyframeExtractor(moov_data)
+        KeyframeExtractor(moov_data)

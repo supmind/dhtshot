@@ -34,16 +34,17 @@ async def test_generate_calls_decoder_and_saver(monkeypatch):
     monkeypatch.setattr(generator_instance, '_save_frame_to_jpeg', mock_save)
 
     # --- Test Data ---
+    codec_name = 'h264'
     extradata = b'some_extradata'
     packet_data = b'some_packet_data'
     infohash = 'deadbeefcafebabe'
     timestamp = '00-01-02'
 
     # --- Action ---
-    await generator_instance.generate(extradata, packet_data, infohash, timestamp)
+    await generator_instance.generate(codec_name, extradata, packet_data, infohash, timestamp)
 
     # --- Assertions ---
-    mock_av.CodecContext.create.assert_called_once_with('h264', 'r')
+    mock_av.CodecContext.create.assert_called_once_with(codec_name, 'r')
     assert mock_codec.extradata == extradata
     mock_av.Packet.assert_called_once_with(packet_data)
     mock_codec.decode.assert_called()
@@ -74,7 +75,7 @@ async def test_decode_returns_no_frames_initially(monkeypatch, caplog):
     monkeypatch.setattr(generator_instance, '_save_frame_to_jpeg', mock_save)
 
     # --- Action ---
-    await generator_instance.generate(None, b'some_data', 'hash', 'time')
+    await generator_instance.generate('h264', None, b'some_data', 'hash', 'time')
 
     # --- Assertions ---
     assert mock_codec.decode.call_count == 2
@@ -109,7 +110,7 @@ async def test_decode_fails_with_invalid_data_error(monkeypatch, caplog):
 
     # --- Action ---
     # We expect this to complete without raising an exception
-    await generator_instance.generate(None, b'bad_data', 'hash', 'time')
+    await generator_instance.generate('h264', None, b'bad_data', 'hash', 'time')
 
     # --- Assertions ---
     mock_save.assert_not_called()
@@ -141,7 +142,7 @@ async def test_decode_fails_with_generic_exception(monkeypatch):
 
     # --- Action & Assertion ---
     with pytest.raises(RuntimeError, match="Unexpected failure"):
-        await generator_instance.generate(None, b'data', 'hash', 'time')
+        await generator_instance.generate('h264', None, b'data', 'hash', 'time')
 
     mock_save.assert_not_called()
 
@@ -177,7 +178,7 @@ async def test_generate_handles_no_extradata(monkeypatch):
     timestamp = '00-03-04'
 
     # --- Action ---
-    await generator_instance.generate(None, packet_data, infohash, timestamp)
+    await generator_instance.generate('h264', None, packet_data, infohash, timestamp)
 
     # --- Assertions ---
     assert mock_codec.extradata is None
