@@ -463,12 +463,16 @@ class ScreenshotService:
                  task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
                  raise FrameDownloadTimeoutError("没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
 
+            # Important: We are gathering the tasks which are the *values* of the map.
             results = await asyncio.gather(*generation_tasks_map.values(), return_exceptions=True)
         finally:
             self.client.unsubscribe_pieces(infohash_hex, local_queue)
 
         successful_generations = 0
-        for kf_index, result in zip(generation_tasks_map.keys(), results):
+        # Create a list of keyframe indices from the map to iterate over, as the results correspond to this order.
+        kf_indices = list(generation_tasks_map.keys())
+        for i, result in enumerate(results):
+            kf_index = kf_indices[i]
             if isinstance(result, Exception):
                 self.log.error(f"生成截图时发生错误 (关键帧索引: {kf_index}): {result}", exc_info=result)
             else:
