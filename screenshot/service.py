@@ -144,7 +144,7 @@ class ScreenshotService:
             if size == 1:
                 if current_offset + 16 > buffer_size:
                     self.log.warning("Box '%s' 有一个 64 位的大小，但没有足够的数据用于头部。", box_type)
-                    break
+                    return # Stop parsing if we can't read the full header
                 size_64_data = stream.read(8)
                 size = struct.unpack('>Q', size_64_data)[0]
                 box_header_size = 16
@@ -152,12 +152,13 @@ class ScreenshotService:
                 size = buffer_size - current_offset
             if size < box_header_size:
                 self.log.warning("Box '%s' 的大小无效 %d。停止解析。", box_type, size)
-                break
+                return # Stop parsing on invalid size
             if current_offset + size > buffer_size:
                 self.log.warning("大小为 %d 的 Box '%s' 超出了可用数据范围。无法完全解析。", size, box_type)
-                full_box_data = stream_buffer[current_offset:buffer_size]
-                yield box_type, bytes(full_box_data), current_offset, size
-                break
+                # Yield the partial box and stop, as we can't know where the next box begins.
+                partial_box_data = stream_buffer[current_offset:buffer_size]
+                yield box_type, bytes(partial_box_data), current_offset, size
+                return
             full_box_data = stream_buffer[current_offset:current_offset + size]
             yield box_type, bytes(full_box_data), current_offset, size
             current_offset += size
@@ -165,58 +166,81 @@ class ScreenshotService:
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """智能地查找并获取 moov atom 数据。"""
         self.log.info("正在智能搜索 moov atom...")
-        mdat_size_from_head = 0
+        mdat_found_in_head = False
         try:
             self.log.info("阶段 1: 探测文件头部以查找 moov atom...")
             initial_probe_size = 256 * 1024
             head_size = min(initial_probe_size, video_file_size)
-            head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
-            head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
-            stream = io.BytesIO(head_data)
-            for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
-                self.log.info("在头部发现 box '%s'，偏移量 %d，大小 %d。", box_type, box_offset, box_size)
-                if box_type == 'moov':
-                    self.log.info("在头部探测中发现 'moov' atom。")
-                    if len(partial_box_data) < box_size:
-                        self.log.info("探测获得了部分 moov (%d/%d 字节)。正在获取完整数据。", len(partial_box_data), box_size)
-                        full_moov_offset_in_torrent = video_file_offset + box_offset
-                        needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
-                        return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
-                    else:
-                        return partial_box_data
-                if box_type == 'mdat' and box_size > video_file_size * 0.8:
-                    self.log.info("在头部发现大的 'mdat' box。假设 'moov' 在尾部。")
-                    mdat_size_from_head = box_size
-                    break
+            if head_size > 0:
+                head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
+                head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
+                head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
+                stream = io.BytesIO(head_data)
+                for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
+                    self.log.info("在头部发现 box '%s'，偏移量 %d，大小 %d。", box_type, box_offset, box_size)
+                    if box_type == 'moov':
+                        self.log.info("在头部探测中发现 'moov' atom。")
+                        if len(partial_box_data) < box_size:
+                            self.log.info("探测获得了部分 moov (%d/%d 字节)。正在获取完整数据。", len(partial_box_data), box_size)
+                            full_moov_offset_in_torrent = video_file_offset + box_offset
+                            needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
+                            moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                            return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
+                        else:
+                            return partial_box_data
+                    if box_type == 'mdat':
+                        self.log.info("在头部发现 'mdat' box。假设 'moov' 在尾部。")
+                        mdat_found_in_head = True
+                        break # Stop head probing if mdat is found
         except TorrentClientError as e:
             self.log.error("在头部探测期间发生 torrent 客户端错误: %s", e)
             raise MoovFetchError("在 moov 头部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
         try:
             self.log.info("阶段 2: Moov 不在头部，探测文件尾部。")
-            tail_probe_size = (video_file_size - mdat_size_from_head) if mdat_size_from_head > 0 else (10 * 1024 * 1024)
+            tail_probe_size = 10 * 1024 * 1024 # Use a fixed, large probe size for the tail
             tail_file_offset = max(0, video_file_size - tail_probe_size)
             tail_torrent_offset = video_file_offset + tail_file_offset
             tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
-            tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
-            tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
-            search_pos = len(tail_data)
-            while search_pos > 4:
-                found_pos = tail_data.rfind(b'moov', 0, search_pos)
-                if found_pos == -1: break
-                potential_start_pos = found_pos - 4
-                if potential_start_pos < 0:
+            if tail_size > 0:
+                tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
+                tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
+                tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
+
+                # "Find + Validate" strategy
+                search_pos = len(tail_data)
+                while search_pos > 4:
+                    found_pos = tail_data.rfind(b'moov', 0, search_pos)
+                    if found_pos == -1: break
+
+                    potential_start_pos = found_pos - 4
+                    if potential_start_pos < 0:
+                        search_pos = found_pos
+                        continue
+
+                    stream = io.BytesIO(tail_data)
+                    stream.seek(potential_start_pos)
+
+                    # Validate the potential box
+                    try:
+                        box_size, box_type_bytes = struct.unpack('>I4s', stream.read(8))
+                        if box_type_bytes == b'moov' and box_size > 8 and (potential_start_pos + box_size <= len(tail_data)):
+                             # It's a plausible moov box, now fully parse it
+                            stream.seek(potential_start_pos)
+                            parsed_box_type, full_box_data, box_offset, parsed_box_size = next(self._parse_mp4_boxes(stream), (None, None, None, None))
+                            if parsed_box_type == 'moov':
+                                self.log.info("成功从尾部解析 'moov' atom，大小为 %d。", len(full_box_data))
+                                if len(full_box_data) < parsed_box_size:
+                                    moov_offset_in_file = tail_file_offset + box_offset
+                                    full_moov_offset_in_torrent = video_file_offset + moov_offset_in_file
+                                    needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, parsed_box_size, piece_length)
+                                    moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                                    return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, parsed_box_size, piece_length)
+                                else:
+                                    return full_box_data
+                    except struct.error:
+                        pass # Not a valid box, continue searching
+
                     search_pos = found_pos
-                    continue
-                stream = io.BytesIO(tail_data)
-                stream.seek(potential_start_pos)
-                box_type, full_box_data, _, _ = next(self._parse_mp4_boxes(stream), (None, None, None, None))
-                if box_type == 'moov':
-                    self.log.info("成功从尾部解析 'moov' atom，大小为 %d。", len(full_box_data))
-                    return full_box_data
-                search_pos = found_pos
         except TorrentClientError as e:
             self.log.error("在尾部探测期间发生 torrent 客户端错误: %s", e)
             raise MoovFetchError("在 moov 尾部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
@@ -294,14 +318,14 @@ class ScreenshotService:
         processed_this_run = set()
         generation_tasks = []
 
+        torrent_is_complete = False
         while len(processed_this_run) < len(remaining_keyframes):
             try:
                 finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.settings.piece_queue_timeout)
                 if finished_piece is None:
-                    # 这个信号可能因为时序问题而过早到达。
-                    # 我们选择忽略它，并依赖我们自己的循环条件和最终的超时来终止。
-                    self.log.info(f"[{infohash_hex}] 收到 Torrent 完成信号，但将继续等待所有请求的数据块。")
-                    continue
+                    self.log.info(f"[{infohash_hex}] 收到 Torrent 完成信号。")
+                    torrent_is_complete = True
+                    break
             except asyncio.TimeoutError:
                 self.log.warning(f"[{infohash_hex}] 等待 piece 超时。")
                 break
@@ -369,6 +393,66 @@ class ScreenshotService:
                     ))
                     generation_tasks.append(task)
                     processed_this_run.add(kf_index)
+
+        # 如果 torrent 已完成，但仍有未处理的关键帧，则最后尝试一次
+        if torrent_is_complete:
+            final_try_keyframes = [kf for kf in remaining_keyframes if kf.index not in processed_this_run]
+            if final_try_keyframes:
+                self.log.info(f"[{infohash_hex}] Torrent 已完成，正在最后尝试处理 {len(final_try_keyframes)} 个剩余的关键帧。")
+                for kf_index in [kf.index for kf in final_try_keyframes]:
+                    info = keyframe_info.get(kf_index)
+                    if not info: continue
+
+                    keyframe = info['keyframe']
+                    sample = extractor.samples[keyframe.sample_index - 1]
+
+                    # 假定所有 piece 都已就绪，因为 torrent 已完成
+                    try:
+                        keyframe_pieces_data = await self.client.fetch_pieces(
+                            handle, self._get_pieces_for_range(
+                                video_file_offset + sample.offset, sample.size, piece_length
+                            ), timeout=self.settings.piece_fetch_timeout
+                        )
+                        packet_data_bytes = self._assemble_data_from_pieces(
+                            keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length
+                        )
+                    except TorrentClientError as e:
+                        self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。")
+                        processed_this_run.add(kf_index)
+                        continue
+
+                    if len(packet_data_bytes) == sample.size:
+                        # ... (此处代码与主循环中的截图生成逻辑重复)
+                        if extractor.mode == 'avc1':
+                            annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
+                            while cursor < len(packet_data_bytes):
+                                nal_length = int.from_bytes(
+                                    packet_data_bytes[cursor: cursor + extractor.nal_length_size], 'big'
+                                )
+                                cursor += extractor.nal_length_size
+                                nal_data = packet_data_bytes[cursor: cursor + nal_length]
+                                annexb_data.extend(start_code + nal_data)
+                                cursor += nal_length
+                            packet_data = bytes(annexb_data)
+                        else:
+                            packet_data = packet_data_bytes
+
+                        ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
+                        m, s = divmod(ts_sec, 60)
+                        h, m = divmod(m, 60)
+                        timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+
+                        task = self.loop.create_task(self.generator.generate(
+                            extradata=extractor.extradata,
+                            packet_data=packet_data,
+                            infohash_hex=infohash_hex,
+                            timestamp_str=timestamp_str
+                        ))
+                        generation_tasks.append(task)
+                        processed_this_run.add(kf_index)
+                    else:
+                        self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data_bytes)}/{sample.size})，跳过。")
+                        processed_this_run.add(kf_index)
 
         return processed_this_run, generation_tasks
 
