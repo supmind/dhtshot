@@ -24,7 +24,7 @@ async def test_run_task_success_path(mock_service_dependencies, status_callback)
     infohash = "test_hash_success"
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     client = mock_service_dependencies['client']
 
@@ -51,7 +51,7 @@ async def test_run_task_add_torrent_fails(mock_service_dependencies, status_call
 
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     # The generation logic should not be called if adding the torrent fails
     service._generate_screenshots_from_torrent.assert_not_called()
@@ -72,7 +72,7 @@ async def test_run_task_generation_raises_no_video_file(mock_service_dependencie
 
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     status_callback.assert_awaited_once()
     _, kwargs = status_callback.call_args
@@ -89,7 +89,7 @@ async def test_run_task_generation_raises_moov_not_found(mock_service_dependenci
 
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     status_callback.assert_awaited_once()
     _, kwargs = status_callback.call_args
@@ -106,7 +106,7 @@ async def test_run_task_generation_raises_parsing_error(mock_service_dependencie
 
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     status_callback.assert_awaited_once()
     _, kwargs = status_callback.call_args
@@ -123,7 +123,7 @@ async def test_run_task_generation_raises_recoverable_error(mock_service_depende
 
     await service.run()
     await service._handle_screenshot_task({'infohash': infohash})
-    service.stop()
+    await service.stop()
 
     status_callback.assert_awaited_once()
     _, kwargs = status_callback.call_args

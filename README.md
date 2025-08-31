@@ -22,7 +22,13 @@
 
 测试框架使用 `pytest` 和 `pytest-asyncio`。
 
-## 安装
+## 依赖管理
+
+本项目的依赖分为两部分：
+- `requirements.in`: 用于定义直接、高层级的依赖。如需添加或更新依赖，请修改此文件。
+- `requirements.txt`: 这是一个由 `pip-compile` (来自 `pip-tools`) 自动生成的、锁定了所有依赖（包括间接依赖）版本的文件。**请不要手动修改此文件。**
+
+### 安装
 
 1. 克隆本代码库。
 2. 强烈建议在虚拟环境（virtual environment）中进行安装。
@@ -30,6 +36,14 @@
    ```bash
    pip install -r requirements.txt
    ```
+
+### 更新依赖
+
+如需更新依赖版本，请执行以下步骤：
+1. （如果尚未安装）`pip install pip-tools`
+2. 修改 `requirements.in` 文件。
+3. 运行 `pip-compile requirements.in` 来重新生成 `requirements.txt`。
+4. 提交 `requirements.in` 和 `requirements.txt` 两个文件的变更。
 
 ## 如何使用
 

@@ -107,9 +107,9 @@ async def main():
         print(f"\n⌛ 脚本运行达到 {timeout_seconds} 秒超时。")
 
     # --- 6. 清理和关闭 ---
-    print("\n🛑 正在停止服务，请稍候...")
+    print("\n🛑 正在异步停止服务，请稍候...")
     # 调用 `stop()` 会向所有内部组件发送关闭信号，并等待它们完成清理。
-    service.stop()
+    await service.stop()
     print("✅ 服务已成功停止。")
 
 

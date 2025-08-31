@@ -18,11 +18,12 @@ import tempfile
 
 class TorrentClient:
     """一个 libtorrent 会话的包装器，用于处理 torrent 相关操作。"""
-    def __init__(self, loop=None, save_path: str = None):
+    def __init__(self, loop=None, save_path: str = None, metadata_timeout: int = 180):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
         # 兼容性修复：如果未提供 save_path，则使用系统通用的临时目录
         self.save_path = save_path or os.path.join(tempfile.gettempdir(), 'screenshot_service_torrents')
+        self.metadata_timeout = metadata_timeout
 
         settings = {
             'listen_interfaces': '0.0.0.0:6881',
@@ -83,14 +84,15 @@ class TorrentClient:
         self._thread.start()
         self.log.info("TorrentClient 已启动。")
 
-    def stop(self):
-        """停止 torrent 客户端。"""
+    async def stop(self):
+        """异步地停止 torrent 客户端。"""
         self.log.info("正在停止 TorrentClient...")
         self._running = False
         if self._thread and self._thread.is_alive():
             # 发送一个空操作警报以唤醒 wait_for_alert() 调用
             self._execute_sync_nowait(self._ses.post_dht_stats)
-            self._thread.join()
+            # 将阻塞的 join 操作放入执行器中，以避免阻塞事件循环
+            await self.loop.run_in_executor(None, self._thread.join)
         self.log.info("TorrentClient 已停止。")
 
     def subscribe_pieces(self, infohash: str, queue: asyncio.Queue):
@@ -135,9 +137,9 @@ class TorrentClient:
 
         handle = await self._execute_sync(self._ses.add_torrent, params)
 
-        self.log.debug(f"正在等待 {infohash} 的元数据...")
+        self.log.debug(f"正在等待 {infohash} 的元数据... (超时: {self.metadata_timeout}s)")
         try:
-            handle = await asyncio.wait_for(meta_future, timeout=180)
+            handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
         except asyncio.TimeoutError:
             self.log.error(f"为 {infohash} 获取元数据超时。")
             self.pending_metadata.pop(infohash, None)

@@ -29,7 +29,7 @@ StatusCallback = Callable[..., Awaitable[None]]
 
 class ScreenshotService:
     """协调截图生成过程的核心服务类。"""
-    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None, min_screenshots: int = 5, max_screenshots: int = 50, target_interval_sec: int = 180, default_screenshots: int = 20):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output', torrent_save_path: str = None, client=None, status_callback: Optional[StatusCallback] = None, min_screenshots: int = 5, max_screenshots: int = 50, target_interval_sec: int = 180, default_screenshots: int = 20, metadata_timeout: int = 180, moov_probe_timeout: int = 120, piece_fetch_timeout: int = 60, piece_queue_timeout: int = 300):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
         self.output_dir = output_dir
@@ -39,7 +39,7 @@ class ScreenshotService:
         self._running = False
         # 兼容性修复：将 torrent_save_path 的决定权交给 TorrentClient，
         # 如果为 None，Client 将使用系统的临时目录。
-        self.client = client or TorrentClient(loop=self.loop, save_path=torrent_save_path)
+        self.client = client or TorrentClient(loop=self.loop, save_path=torrent_save_path, metadata_timeout=metadata_timeout)
         self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.output_dir)
         self.status_callback = status_callback
         # 用于跟踪活跃任务，防止重复提交
@@ -53,6 +53,12 @@ class ScreenshotService:
         self.target_interval_sec = target_interval_sec
         self.default_screenshots = default_screenshots
 
+        # --- 超时配置 ---
+        self.metadata_timeout = metadata_timeout
+        self.moov_probe_timeout = moov_probe_timeout
+        self.piece_fetch_timeout = piece_fetch_timeout
+        self.piece_queue_timeout = piece_queue_timeout
+
     async def run(self):
         """启动服务，包括 torrent 客户端和工作进程。"""
         self.log.info("正在启动 ScreenshotService...")
@@ -62,11 +68,12 @@ class ScreenshotService:
             self.workers.append(self.loop.create_task(self._worker()))
         self.log.info(f"ScreenshotService 已启动，拥有 {self.num_workers} 个工作进程。")
 
-    def stop(self):
-        """停止服务，包括 torrent 客户端和工作进程。"""
+    async def stop(self):
+        """异步地停止服务，包括 torrent 客户端和工作进程。"""
         self.log.info("正在停止 ScreenshotService...")
         self._running = False
-        self.client.stop()
+        # 等待客户端完全停止
+        await self.client.stop()
         for worker in self.workers:
             worker.cancel()
         self.log.info("ScreenshotService 已停止。")
@@ -174,7 +181,7 @@ class ScreenshotService:
             initial_probe_size = 256 * 1024
             head_size = min(initial_probe_size, video_file_size)
             head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=120)
+            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.moov_probe_timeout)
             head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
             stream = io.BytesIO(head_data)
             for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
@@ -185,7 +192,7 @@ class ScreenshotService:
                         self.log.info(f"探测获得了部分 moov ({len(partial_box_data)}/{box_size} 字节)。正在获取完整数据。")
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=120)
+                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.moov_probe_timeout)
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
                     else:
                         return partial_box_data
@@ -203,7 +210,7 @@ class ScreenshotService:
             tail_torrent_offset = video_file_offset + tail_file_offset
             tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
             tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=180)
+            tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.moov_probe_timeout)
             tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
             search_pos = len(tail_data)
             while search_pos > 4:
@@ -299,7 +306,7 @@ class ScreenshotService:
 
         while len(processed_this_run) < len(remaining_keyframes):
             try:
-                finished_piece = await asyncio.wait_for(local_queue.get(), timeout=300)
+                finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.piece_queue_timeout)
                 if finished_piece is None:
                     # 这个信号可能因为时序问题而过早到达。
                     # 我们选择忽略它，并依赖我们自己的循环条件和最终的超时来终止。
@@ -330,7 +337,7 @@ class ScreenshotService:
                         keyframe_pieces_data = await self.client.fetch_pieces(
                             handle, self._get_pieces_for_range(
                                 video_file_offset + sample.offset, sample.size, piece_length
-                            ), timeout=60
+                            ), timeout=self.piece_fetch_timeout
                         )
                         packet_data_bytes = self._assemble_data_from_pieces(
                             keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length

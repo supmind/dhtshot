@@ -1,0 +1,16 @@
+# For torrenting
+libtorrent
+bencode2
+
+# For video processing
+av
+Pillow
+
+# For parsing
+bitstring
+six
+
+# For testing
+pytest
+pytest-asyncio
+pytest-cov
