@@ -194,7 +194,7 @@ class ScreenshotService:
                         break # Stop head probing if mdat is found
         except TorrentClientError as e:
             self.log.error("在头部探测期间发生 torrent 客户端错误: %s", e)
-            raise MoovFetchError("在 moov 头部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
+            raise MoovFetchError(f"在 moov 头部探测期间发生 torrent 客户端错误: {e}", infohash_hex) from e
         try:
             self.log.info("阶段 2: Moov 不在头部，探测文件尾部。")
             tail_probe_size = (video_file_size - mdat_size_from_head) if mdat_size_from_head > 0 else (10 * 1024 * 1024)
@@ -243,7 +243,7 @@ class ScreenshotService:
                     search_pos = found_pos
         except TorrentClientError as e:
             self.log.error("在尾部探测期间发生 torrent 客户端错误: %s", e)
-            raise MoovFetchError("在 moov 尾部探测期间发生 torrent 客户端错误: %s", e, infohash_hex) from e
+            raise MoovFetchError(f"在 moov 尾部探测期间发生 torrent 客户端错误: {e}", infohash_hex) from e
         raise MoovNotFoundError("无法在文件的第一部分/最后一部分定位 'moov' atom。", infohash_hex)
 
     def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int]:
