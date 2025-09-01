@@ -10,7 +10,7 @@
     包含虚拟文件信息的模拟 "handle"。
 2.  Patch `ScreenshotService._get_moov_atom_data`: 绕过对 torrent 数据的下载，
     立即返回一个虚拟的 'moov' 数据。
-3.  Patch `H264KeyframeExtractor`: 确保提取器能处理我们的虚拟 'moov' 数据，
+3.  Patch `KeyframeExtractor`: 确保提取器能处理我们的虚拟 'moov' 数据，
     并返回一个结构正确的虚拟关键帧列表。
 4.  Patch `ScreenshotService._process_keyframe_pieces`: 这是最后一步。当执行流
     到达这里时，任务状态已经完全建立。我们在此处立即抛出一个可恢复的异常，
@@ -24,6 +24,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 from screenshot.service import ScreenshotService, FrameDownloadTimeoutError, Keyframe, SampleInfo
 from screenshot.client import TorrentClient
+from screenshot.config import Settings
 
 # --- 配置 ---
 logging.basicConfig(
@@ -65,7 +66,7 @@ async def main():
     mock_torrent_info.files.return_value = mock_files
     mock_handle.get_torrent_info.return_value = mock_torrent_info
 
-    # 2. 模拟 H264KeyframeExtractor
+    # 2. 模拟 KeyframeExtractor
     mock_extractor_class = MagicMock()
     extractor_instance = mock_extractor_class.return_value
     extractor_instance.keyframes = [Keyframe(index=i, sample_index=i+1, pts=i*1000, timescale=1000) for i in range(10)]
@@ -74,6 +75,7 @@ async def main():
     extractor_instance.extradata = b'mock_extradata'
     extractor_instance.mode = 'avc1'
     extractor_instance.nal_length_size = 4
+    extractor_instance.codec_name = 'h264'
 
     # 3. 模拟 _get_moov_atom_data
     async def patched_get_moov_atom_data(*args, **kwargs):
@@ -89,12 +91,14 @@ async def main():
             resume_data=self._serialize_task_state(task_state)
         )
 
-    service = ScreenshotService(loop=loop, status_callback=status_callback)
+    settings = Settings()
+    service = ScreenshotService(settings=settings, loop=loop, status_callback=status_callback)
 
-    # 使用多个 patch 作为上下文管理器，完全控制执行流程
+    # 修复：同时 patch remove_torrent 以避免在清理模拟 handle 时出错
     with patch.object(TorrentClient, 'add_torrent', AsyncMock(return_value=mock_handle)), \
+         patch.object(TorrentClient, 'remove_torrent', AsyncMock()), \
          patch.object(ScreenshotService, '_get_moov_atom_data', new=patched_get_moov_atom_data), \
-         patch('screenshot.service.H264KeyframeExtractor', mock_extractor_class), \
+         patch('screenshot.service.KeyframeExtractor', mock_extractor_class), \
          patch.object(ScreenshotService, '_process_keyframe_pieces', new=patched_process_keyframe_pieces):
 
         await service.run()
@@ -107,7 +111,7 @@ async def main():
         except asyncio.TimeoutError:
             logging.error("❌ 10秒内未收到可恢复失败事件，脚本的 patch 逻辑可能存在问题。")
         finally:
-            service.stop()
+            await service.stop()
 
     if captured_resume_data:
         extractor_info = captured_resume_data.get('extractor_info')

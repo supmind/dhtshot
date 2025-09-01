@@ -20,6 +20,7 @@ import base64
 import signal
 
 from screenshot.service import ScreenshotService
+from screenshot.config import Settings # 修复：导入 Settings
 
 # --- 配置 ---
 logging.basicConfig(
@@ -76,7 +77,9 @@ async def main():
             logging.error(f"❌ 任务恢复失败，最终状态: {status}")
             completed_event.set()
 
-    service = ScreenshotService(loop=loop, status_callback=status_callback)
+    # 修复：创建并传递 Settings 对象
+    settings = Settings()
+    service = ScreenshotService(settings=settings, loop=loop, status_callback=status_callback)
     await service.run()
 
     logging.info("正在提交恢复任务...")
@@ -89,7 +92,8 @@ async def main():
         logging.error("❌ 任务在5分钟内未完成。")
     finally:
         logging.info("正在停止服务...")
-        service.stop()
+        # 修复：正确地 await 异步的 stop 方法
+        await service.stop()
         logging.info("服务已停止。")
 
 if __name__ == "__main__":

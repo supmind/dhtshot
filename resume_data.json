@@ -5,6 +5,7 @@
     "video_file_size": 163840,
     "extractor_info": {
         "extradata": "bW9ja19leHRyYWRhdGE=",
+        "codec_name": "h264",
         "mode": "avc1",
         "nal_length_size": 4,
         "timescale": 1000,
