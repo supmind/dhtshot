@@ -14,7 +14,8 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def client():
     """Fixture to provide a TorrentClient with a real libtorrent session."""
-    client = TorrentClient(loop=asyncio.get_running_loop())
+    # Set a longer timeout for real network tests
+    client = TorrentClient(loop=asyncio.get_running_loop(), metadata_timeout=60)
     await client.start()
     yield client
     await client.stop()
@@ -75,16 +76,32 @@ async def test_add_torrent_with_invalid_metadata_raises_error(client):
     with pytest.raises(TorrentClientError, match="无法解析元数据"):
         await client.add_torrent(infohash, metadata=invalid_metadata)
 
-async def test_add_torrent_without_metadata_times_out(client):
+async def test_add_real_torrent_and_fetch_metadata(client):
     """
-    Tests that add_torrent without metadata (and without peers) times out.
-    This confirms we are hitting the magnet link path.
+    Tests that the client can fetch metadata for a real, well-known torrent
+    from the BitTorrent DHT using the infohash for 'Sintel'.
     """
-    # This infohash doesn't exist, so metadata download should time out.
-    infohash = 'f' * 40
+    # This infohash was provided by the user. It corresponds to the open-source movie 'Sintel'.
+    infohash = '08ada5a7a6183aae1e09d831df6748d566095a10'
 
-    # Set a very short timeout for the test
-    client.metadata_timeout = 1
+    handle = None
 
-    with pytest.raises(MetadataTimeoutError):
-        await client.add_torrent(infohash)
+    async def run_test():
+        nonlocal handle
+        handle = await client.add_torrent(infohash)
+        assert handle.is_valid()
+
+        ti = await client._execute_sync(handle.get_torrent_info)
+        assert ti is not None
+        assert ti.is_valid()
+        assert str(ti.info_hash()) == infohash
+        assert ti.name() == "Sintel"
+
+    try:
+        # Manually implement the timeout since the pytest marker is not supported
+        await asyncio.wait_for(run_test(), timeout=90.0)
+    except asyncio.TimeoutError:
+        pytest.fail("The real torrent metadata fetch timed out after 90 seconds.")
+    finally:
+        if handle:
+            await client.remove_torrent(handle)
