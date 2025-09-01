@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, ANY
 
 from screenshot.service import ScreenshotService, Keyframe, SampleInfo
 from screenshot.config import Settings
-from screenshot.errors import MetadataTimeoutError, MoovNotFoundError, FrameDownloadTimeoutError
+from screenshot.errors import MetadataTimeoutError, MoovNotFoundError, FrameDownloadTimeoutError, MoovFetchError
+from screenshot.client import TorrentClientError
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,7 +39,6 @@ def build_test_moov() -> bytes:
     stbl_payload = stsd + stts + stss + stsc + stsz + stco
     stbl = create_box(b'stbl', stbl_payload)
     minf = create_box(b'minf', stbl)
-    # 修复：在 mdhd box 中提供一个有效的 timescale
     mdia_payload = create_box(b'mdhd', b'\x00' * 12 + struct.pack('>I', 90000) + b'\x00' * 8)
     mdia = create_box(b'mdia', mdia_payload)
     trak = create_box(b'trak', create_box(b'tkhd', b'\x00'*84) + mdia)
@@ -112,7 +112,7 @@ async def test_metadata_timeout_is_recoverable_failure(service, mock_service_dep
 
     status_callback.assert_called_once()
     _, kwargs = status_callback.call_args
-    assert kwargs.get('status') == 'recoverable_failure'
+    assert kwargs.get('status') == 'permanent_failure'
     assert isinstance(kwargs.get('error'), MetadataTimeoutError)
 
 async def test_moov_not_found_is_permanent_failure(service, mock_service_dependencies, status_callback):
@@ -130,6 +130,25 @@ async def test_moov_not_found_is_permanent_failure(service, mock_service_depende
     assert kwargs.get('status') == 'permanent_failure'
     assert isinstance(kwargs.get('error'), MoovNotFoundError)
 
+async def test_client_error_during_moov_probe_is_permanent_failure(service, mock_service_dependencies, status_callback):
+    """新增：测试在探测moov期间客户端出错，应导致永久性失败并包装异常。"""
+    infohash = "clienterrorhash12345678901234567890123"
+    client = mock_service_dependencies['client']
+
+    # 模拟 fetch_pieces 在被调用时直接抛出 TorrentClientError
+    client.fetch_pieces.side_effect = TorrentClientError("Simulated client error during fetch")
+
+    await service.submit_task(infohash)
+    await service.task_queue.join()
+
+    status_callback.assert_called_once()
+    _, kwargs = status_callback.call_args
+    assert kwargs.get('status') == 'permanent_failure'
+    # 验证错误被正确地包装成了 MoovFetchError
+    assert isinstance(kwargs.get('error'), MoovFetchError)
+    # 验证原始的 TorrentClientError 被作为 cause 保留了下来
+    assert isinstance(kwargs.get('error').__cause__, TorrentClientError)
+
 async def test_task_recovery_after_recoverable_failure(service, mock_service_dependencies, status_callback):
     """测试任务恢复流程。"""
     infohash = "resumehash1234567890123456789012345678"
@@ -140,10 +159,8 @@ async def test_task_recovery_after_recoverable_failure(service, mock_service_dep
         return {p: build_test_moov() for p in pieces}
     client.fetch_pieces.side_effect = mock_fetch_moov_only
 
-    # 第一次运行时，需要一个完整的 mock extractor
     configure_mock_extractor(extractor_class, keyframe_indices=[1, 5])
 
-    # 模拟第一次处理 piece 失败
     mock_resume_data = {"infohash": infohash, "extractor_info": {"codec_name": "h264"}, "processed_keyframes": []}
     service._process_keyframe_pieces = AsyncMock(side_effect=FrameDownloadTimeoutError("Timeout!", infohash, resume_data=mock_resume_data))
 
@@ -156,11 +173,9 @@ async def test_task_recovery_after_recoverable_failure(service, mock_service_dep
     resume_data = kwargs.get('resume_data')
     assert resume_data is not None
 
-    # --- 第二次运行 ---
     status_callback.reset_mock()
     extractor_class.reset_mock()
 
-    # 模拟第二次成功
     service._process_keyframe_pieces = AsyncMock(return_value=({1}, {1: asyncio.Future()}))
 
     await service.submit_task(infohash, resume_data=resume_data)
