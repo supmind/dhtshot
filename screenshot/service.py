@@ -68,7 +68,7 @@ class ScreenshotService:
             worker.cancel()
         self.log.info("ScreenshotService 已停止。")
 
-    async def submit_task(self, infohash: str, resume_data: dict = None):
+    async def submit_task(self, infohash: str, metadata: bytes = None, resume_data: dict = None):
         """
         提交一个新的截图任务，并防止重复提交。
         """
@@ -79,7 +79,7 @@ class ScreenshotService:
                 return
             self.active_tasks.add(infohash)
 
-        await self.task_queue.put({'infohash': infohash, 'resume_data': resume_data})
+        await self.task_queue.put({'infohash': infohash, 'metadata': metadata, 'resume_data': resume_data})
         if resume_data:
             self.log.info("为 infohash: %s 重新提交了任务", infohash)
         else:
@@ -501,6 +501,7 @@ class ScreenshotService:
     async def _handle_screenshot_task(self, task_info: dict):
         infohash_hex = task_info['infohash']
         resume_data = task_info.get('resume_data')
+        metadata = task_info.get('metadata')
 
         log_message = "正在处理任务: %s"
         log_args = [infohash_hex]
@@ -509,7 +510,7 @@ class ScreenshotService:
         self.log.info(log_message, *log_args)
 
         try:
-            async with self.client.get_handle(infohash_hex) as handle:
+            async with self.client.get_handle(infohash_hex, metadata=metadata) as handle:
                 await self._generate_screenshots_from_torrent(handle, infohash_hex, resume_data)
 
             # 如果没有异常抛出，则任务成功

@@ -115,12 +115,12 @@ class TorrentClient:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
 
     @asynccontextmanager
-    async def get_handle(self, infohash: str):
+    async def get_handle(self, infohash: str, metadata: bytes = None):
         """一个异步上下文管理器，用于安全地获取和释放 torrent handle。"""
         handle = None
         try:
             # 调用现有的 add_torrent 来获取 handle
-            handle = await self.add_torrent(infohash)
+            handle = await self.add_torrent(infohash, metadata=metadata)
             if not handle or not handle.is_valid():
                 # 如果 handle 无效，我们在这里就引发异常，确保 finally 块不会尝试移除无效的 handle
                 raise TorrentClientError("无法为 %s 获取有效的 torrent handle。", infohash)
@@ -132,45 +132,70 @@ class TorrentClient:
             if handle and handle.is_valid():
                 await self.remove_torrent(handle)
 
-    async def add_torrent(self, infohash: str):
-        """通过 infohash 添加 torrent，并等待元数据下载完成。"""
+    async def add_torrent(self, infohash: str, metadata: bytes = None):
+        """通过 infohash 或元数据添加 torrent。如果提供了元数据，则直接使用它。否则，通过磁力链接下载。"""
         self.log.info("正在为 infohash 添加 torrent: %s", infohash)
         save_dir = os.path.join(self.save_path, infohash)
-        meta_future = self.loop.create_future()
-        self.pending_metadata[infohash] = meta_future
 
-        trackers = [
-            "udp://tracker.opentrackr.org:1337/announce",
-            "udp://open.demonii.com:1337/announce",
-            "udp://open.stealth.si:80/announce",
-            "udp://exodus.desync.com:6969/announce",
-            "udp://tracker.bittor.pw:1337/announce",
-            "http://sukebei.tracker.wf:8888/announce",
-            "udp://tracker.torrent.eu.org:451/announce",
-        ]
-        magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
+        if metadata:
+            self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash)
+            try:
+                ti = lt.torrent_info(metadata)
+                if str(ti.info_hash()) != infohash:
+                    self.log.error("提供的元数据 infohash (%s) 与指定的 infohash (%s) 不匹配。", str(ti.info_hash()), infohash)
+                    raise TorrentClientError(f"提供的元数据 infohash ({ti.info_hash()}) 与指定的 infohash ({infohash}) 不匹配。")
+            except RuntimeError as e:
+                self.log.error("解析提供的元数据时出错: %s", e)
+                raise TorrentClientError(f"无法解析元数据: {e}")
 
-        params = lt.parse_magnet_uri(magnet_uri)
-        params.save_path = save_dir
-        params.flags |= lt.torrent_flags.paused # 以暂停状态开始，以便我们可以手动控制 piece 的下载
+            params = lt.add_torrent_params()
+            params.ti = ti
+            params.save_path = save_dir
+            params.flags |= lt.torrent_flags.paused
+            handle = await self._execute_sync(self._ses.add_torrent, params)
 
-        handle = await self._execute_sync(self._ses.add_torrent, params)
-
-        self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
-        try:
-            handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
-        except asyncio.TimeoutError:
-            self.log.error("为 %s 获取元数据超时。", infohash)
-            self.pending_metadata.pop(infohash, None)
-            raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
-
-        ti = await self._execute_sync(handle.get_torrent_info)
-        if ti:
             self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
             priorities = [0] * ti.num_pieces()
             await self._execute_sync(handle.prioritize_pieces, priorities)
+            return handle
 
-        return handle
+        else:
+            self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash)
+            meta_future = self.loop.create_future()
+            self.pending_metadata[infohash] = meta_future
+
+            trackers = [
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.demonii.com:1337/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://exodus.desync.com:6969/announce",
+                "udp://tracker.bittor.pw:1337/announce",
+                "http://sukebei.tracker.wf:8888/announce",
+                "udp://tracker.torrent.eu.org:451/announce",
+            ]
+            magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
+
+            params = lt.parse_magnet_uri(magnet_uri)
+            params.save_path = save_dir
+            params.flags |= lt.torrent_flags.paused # 以暂停状态开始，以便我们可以手动控制 piece 的下载
+
+            handle = await self._execute_sync(self._ses.add_torrent, params)
+
+            self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
+            try:
+                handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
+            except asyncio.TimeoutError:
+                self.log.error("为 %s 获取元数据超时。", infohash)
+                self.pending_metadata.pop(infohash, None)
+                raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
+
+            ti = await self._execute_sync(handle.get_torrent_info)
+            if ti:
+                self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
+                priorities = [0] * ti.num_pieces()
+                await self._execute_sync(handle.prioritize_pieces, priorities)
+
+            return handle
 
     async def remove_torrent(self, handle):
         """从会话中移除一个 torrent 并删除其文件。"""

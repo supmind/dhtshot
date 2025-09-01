@@ -30,7 +30,7 @@ async def test_run_task_success_path(mock_service_dependencies, status_callback)
     client = mock_service_dependencies['client']
 
     # Check that the core sequence of events happened
-    client.get_handle.assert_called_once_with(infohash)
+    client.get_handle.assert_called_once_with(infohash, metadata=None)
     service._generate_screenshots_from_torrent.assert_awaited_once()
 
     # We no longer assert remove_torrent was called, as it's an
