@@ -105,23 +105,38 @@ class ScreenshotService:
         """
         从多个 piece 数据块中，根据偏移量和大小，精确地拼接出所需的数据段。
         在拼接前会检查所有需要的 piece 是否都已存在。
+
+        :param pieces_data: 一个字典，键是 piece 索引，值是该 piece 的 bytes 数据。
+        :param offset_in_torrent: 所需数据段在整个 torrent 文件中的起始偏移量。
+        :param size: 所需数据段的大小。
+        :param piece_length: torrent 的标准 piece 大小。
+        :return: 拼接好的 bytes 数据，如果缺少任何一个必需的 piece，则返回空 bytes。
         """
         start_piece = offset_in_torrent // piece_length
         end_piece = (offset_in_torrent + size - 1) // piece_length
 
+        # 1. 前置检查：确保所有需要的 piece 都已下载。
         for piece_index in range(start_piece, end_piece + 1):
             if piece_index not in pieces_data:
                 self.log.warning("组装数据时缺少 piece #%d，操作中止。", piece_index)
                 return b""
 
+        # 2. 核心逻辑：遍历所有相关的 piece，并从中拷贝出需要的部分。
         buffer = bytearray(size)
         buffer_offset = 0
         for piece_index in range(start_piece, end_piece + 1):
             piece_data = pieces_data[piece_index]
+
+            # 计算在此 piece 内需要拷贝的起始和结束位置
+            # 对于起始 piece，需要从特定偏移量开始拷贝
             copy_from_start = offset_in_torrent % piece_length if piece_index == start_piece else 0
+            # 对于结束 piece，只拷贝到所需数据的末尾
             copy_to_end = (offset_in_torrent + size - 1) % piece_length + 1 if piece_index == end_piece else piece_length
 
+            # 从当前 piece 中提取出相关的部分
             chunk = piece_data[copy_from_start:copy_to_end]
+
+            # 计算实际要拷贝到最终 buffer 的字节数，防止越界
             bytes_to_copy = min(len(chunk), size - buffer_offset)
             if bytes_to_copy > 0:
                 buffer[buffer_offset : buffer_offset + bytes_to_copy] = chunk[:bytes_to_copy]

@@ -120,9 +120,44 @@ def test_get_next_task_no_tasks(client):
     assert response.status_code == 200
     assert response.json() is None
 
-def test_register_and_heartbeat_worker(client):
-    worker_id = "test_worker_007"
+def test_worker_registration_and_reregistration(client):
+    """
+    测试工作节点的完整生命周期：
+    1. 首次注册一个新工作节点。
+    2. 验证首次注册成功。
+    3. 模拟该工作节点重新注册。
+    4. 验证重新注册（即更新）也成功，并且时间戳被更新。
+    """
+    worker_id = "test_worker_001"
+
+    # 1. 首次注册
+    response1 = client.post("/workers/register", json={"worker_id": worker_id, "status": "idle"})
+    assert response1.status_code == 200
+    data1 = response1.json()
+    assert data1["worker_id"] == worker_id
+    assert data1["status"] == "idle"
+
+    # 记录首次注册的时间
+    first_seen_at = data1["last_seen_at"]
+
+    # 2. 模拟工作节点重新注册
+    response2 = client.post("/workers/register", json={"worker_id": worker_id, "status": "idle"})
+    assert response2.status_code == 200
+    data2 = response2.json()
+    assert data2["worker_id"] == worker_id
+
+    # 3. 验证时间戳已更新
+    # 重新注册后，'last_seen_at' 时间应该晚于（或等于，如果执行速度极快）首次注册的时间
+    assert data2["last_seen_at"] >= first_seen_at
+
+def test_worker_heartbeat(client):
+    """测试已注册工作节点的心跳功能。"""
+    worker_id = "test_worker_002"
+
+    # 必须先注册
     client.post("/workers/register", json={"worker_id": worker_id, "status": "idle"})
+
+    # 发送心跳
     response = client.post("/workers/heartbeat", json={"worker_id": worker_id, "status": "busy"})
     assert response.status_code == 200
     assert response.json()["status"] == "busy"

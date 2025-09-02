@@ -23,7 +23,25 @@ Keyframe = namedtuple("Keyframe", ["index", "sample_index", "pts", "timescale"])
 class KeyframeExtractor:
     """
     一个健壮的 MP4 视频关键帧提取器。
-    它通过解析 'moov' box 的二进制数据来工作，无需访问完整的视频文件。
+
+    它的核心功能是仅通过解析 'moov' box 的二进制数据，就能提取出视频流中所有
+    关键帧的位置、大小、时间戳和解码所需配置等元数据。这使得我们可以在不下载
+    整个视频文件的情况下，精确地请求和解码任意一个关键帧。
+
+    主要工作流程：
+    1.  解析 'moov' box，找到视频轨道 ('trak')。
+    2.  从视频轨道中找到 'stbl' (Sample Table) box，这是所有元数据的核心。
+    3.  依次解析 'stbl' 中的多个子表：
+        - 'stsd' (Sample Description): 获取解码器类型 (H.264/HEVC/AV1) 和解码器
+          配置数据 (extradata，如 SPS/PPS)。
+        - 'stsz' (Sample Size): 获取每一帧的大小。
+        - 'stss' (Sync Sample): 获取哪些帧是关键帧。
+        - 'stco'/'co64' (Chunk Offset): 获取数据块在文件中的位置。
+        - 'stsc' (Sample to Chunk): 描述了帧如何被组织成数据块。
+        - 'stts' (Time to Sample): 获取每一帧的显示时间戳 (PTS)。
+    4.  将以上所有信息整合成一个完整的 `samples` 列表，其中每个元素都代表一帧，
+        包含其所有元数据。
+    5.  从 `samples` 列表中筛选出关键帧，生成一个简化的 `keyframes` 列表。
     """
 
     def __init__(self, moov_data: Optional[bytes]):

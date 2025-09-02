@@ -11,10 +11,91 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from screenshot.service import ScreenshotService, StatusCallback
 from config import Settings
 from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
-from screenshot.extractor import Keyframe, SampleInfo
+from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
 from screenshot.client import TorrentClient
 
-# --- Fixtures ---
+
+# --- 新增的测试 ---
+
+class TestAssembleData:
+    """针对 ScreenshotService._assemble_data_from_pieces 的专用测试类。"""
+
+    @pytest.fixture
+    def service(self, settings):
+        """提供一个无 mock 依赖的 ScreenshotService 实例，用于测试独立函数。"""
+        return ScreenshotService(settings=settings)
+
+    def test_assemble_from_single_piece(self, service):
+        """测试所需数据完全包含在单个 piece 中的情况。"""
+        pieces_data = {0: b"0123456789"}
+        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=2, size=5, piece_length=10)
+        assert result == b"23456"
+
+    def test_assemble_spanning_two_pieces(self, service):
+        """测试所需数据跨越两个 piece 的情况。"""
+        pieces_data = {0: b"0123456789", 1: b"abcdefghij"}
+        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=4, piece_length=10)
+        assert result == b"89ab"
+
+    def test_assemble_spanning_multiple_pieces(self, service):
+        """测试所需数据跨越多个 piece 的情况。"""
+        pieces_data = {
+            0: b"0123456789",
+            1: b"abcdefghij",
+            2: b"KLMNOPQRST"
+        }
+        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=15, piece_length=10)
+        assert result == b"89abcdefghijKLM"
+
+    def test_assemble_at_piece_boundary(self, service):
+        """测试所需数据正好在 piece 边界上的情况。"""
+        pieces_data = {0: b"0123456789", 1: b"abcdefghij"}
+        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=10, size=5, piece_length=10)
+        assert result == b"abcde"
+
+    def test_assemble_with_missing_piece(self, service):
+        """测试当缺少所需 piece 时，函数应返回空字节。"""
+        pieces_data = {0: b"0123456789", 2: b"KLMNOPQRST"} # 故意缺少 piece 1
+        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=15, piece_length=10)
+        assert result == b""
+
+
+def test_serialize_task_state(service):
+    """测试 _serialize_task_state 方法是否能正确地将一个复杂的任务状态对象转换为字典。"""
+    # 1. 创建模拟的 extractor 和其他状态数据
+    mock_extractor = MagicMock(spec=KeyframeExtractor)
+    mock_extractor.extradata = b"some_bytes"
+    mock_extractor.codec_name = "h264"
+    mock_extractor.mode = "avc1"
+    mock_extractor.nal_length_size = 4
+    mock_extractor.timescale = 90000
+    mock_extractor.samples = [SampleInfo(1, 100, True, 1, 90000)]
+
+    task_state = {
+        'infohash': 'test_hash',
+        'piece_length': 16384,
+        'video_file_offset': 0,
+        'video_file_size': 1000,
+        'extractor': mock_extractor,
+        'all_keyframes': [Keyframe(0, 1, 90000, 90000)],
+        'selected_keyframes': [Keyframe(0, 1, 90000, 90000)],
+        'completed_pieces': {0, 1, 2},
+        'processed_keyframes': {0}
+    }
+
+    # 2. 调用序列化方法
+    serialized_data = service._serialize_task_state(task_state)
+
+    # 3. 验证结果
+    assert serialized_data is not None
+    assert serialized_data['infohash'] == 'test_hash'
+    assert serialized_data['extractor_info']['extradata'] == b"some_bytes"
+    assert len(serialized_data['all_keyframes']) == 1
+    assert serialized_data['all_keyframes'][0]['sample_index'] == 1
+    assert list(serialized_data['processed_keyframes']) == [0]
+
+
+# --- 原有的测试 Fixtures 和 Cases ---
 
 @pytest.fixture
 def settings():

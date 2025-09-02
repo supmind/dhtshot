@@ -124,8 +124,10 @@ def update_task_status(
 
 def record_screenshot(db: Session, infohash: str, filename: str) -> Optional[models.Task]:
     """
-    将一个成功生成的截图文件名附加到任务的记录中。
-    此操作通过行级锁保证原子性，可以防止竞态条件。
+    将一个成功生成的截图文件名附加到任务的 `successful_screenshots` JSON 数组中。
+    此操作是并发安全的。通过对任务行施加 `SELECT ... FOR UPDATE` 悲观锁，
+    保证了“读取-修改-写入”整个过程的原子性，能有效防止多个工作节点并发上传截图时
+    发生竞态条件导致的数据丢失。
 
     :param db: 数据库会话。
     :param infohash: 截图所属任务的 infohash。

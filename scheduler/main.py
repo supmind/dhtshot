@@ -5,6 +5,7 @@
 """
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Response, Query
 from sqlalchemy.orm import Session
+import datetime
 from typing import Optional
 import os
 import shutil
@@ -128,15 +129,21 @@ def read_task(infohash: str, db: Session = Depends(get_db)):
 
 @app.post("/workers/register", response_model=schemas.Worker, tags=["工作节点管理"])
 def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db)):
-    """注册一个新的工作节点或更新一个已存在节点的状态。"""
+    """
+    注册一个新的工作节点或更新一个已存在节点的状态。
+    如果工作节点已存在（通过 worker_id 判断），则更新其 last_seen_at 时间并将其状态重置为 'idle'。
+    如果工作节点不存在，则创建一个新的记录。
+    """
     db_worker = crud.get_worker_by_id(db, worker_id=worker.worker_id)
     if db_worker:
-        # 如果工作节点已存在，则更新其最后心跳时间和状态
+        # 如果工作节点已存在，这通常意味着一个之前可能断开连接的工作节点重新启动并重新注册。
+        # 在这种情况下，我们更新它的最后在线时间，并将状态设为 'idle'，表示它已准备好接收新任务。
         db_worker.last_seen_at = datetime.datetime.utcnow()
         db_worker.status = 'idle'
         db.commit()
         db.refresh(db_worker)
         return db_worker
+    # 如果是首次注册，则在数据库中创建一个新的工作节点条目。
     return crud.create_worker(db=db, worker=worker)
 
 @app.post("/workers/heartbeat", response_model=schemas.Worker, tags=["工作节点管理"])
