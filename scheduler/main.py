@@ -6,7 +6,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Response, Query
 from sqlalchemy.orm import Session
 from typing import Optional
-import datetime
 import os
 import shutil
 import base64

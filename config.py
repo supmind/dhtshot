@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # 如果存在 .env 文件，则从中加载环境变量
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
+    # --- API 配置 ---
+    scheduler_url: str = "http://127.0.0.1:8000"
+
     # --- 工作进程配置 ---
     num_workers: int = 10
 

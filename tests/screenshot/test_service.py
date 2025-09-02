@@ -9,7 +9,7 @@ import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from screenshot.service import ScreenshotService, StatusCallback
-from screenshot.config import Settings
+from config import Settings
 from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
 from screenshot.extractor import Keyframe, SampleInfo
 from screenshot.client import TorrentClient

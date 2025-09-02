@@ -19,7 +19,7 @@ from .errors import (
 )
 from .extractor import KeyframeExtractor, Keyframe, SampleInfo
 from .generator import ScreenshotGenerator
-from .config import Settings
+from config import Settings
 
 # 为 status_callback 定义一个类型签名，以增强可读性和静态检查能力
 StatusCallback = Callable[..., Awaitable[None]]
