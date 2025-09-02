@@ -49,8 +49,10 @@ class ScreenshotGenerator:
             frame.to_image().save(output_filename, "JPEG")
             log.info("成功：截图已保存至 %s", output_filename)
             if self.on_success:
-                # Schedule the callback on the main event loop from this worker thread
-                self.loop.call_soon_threadsafe(asyncio.create_task, self.on_success(output_filename))
+                # Schedule the callback on the main event loop from this worker thread.
+                # The callback expects infohash and filepath.
+                coro = self.on_success(infohash_hex, output_filename)
+                self.loop.call_soon_threadsafe(asyncio.create_task, coro)
         except Exception:
             log.exception("保存帧到文件 %s 时发生错误。", output_filename)
             raise
