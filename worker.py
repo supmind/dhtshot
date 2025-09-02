@@ -11,7 +11,7 @@ from screenshot.service import ScreenshotService
 from screenshot.config import Settings
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("Worker")
 
 SCHEDULER_URL = "http://127.0.0.1:8000"
