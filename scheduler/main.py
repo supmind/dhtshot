@@ -105,20 +105,26 @@ def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="Worker not found. Please register first.")
     return db_worker
 
-@app.post("/screenshots/{infohash}", tags=["Screenshots"])
-async def upload_screenshot(infohash: str, file: UploadFile = File(...)):
+@app.post("/screenshots/{infohash}", response_model=schemas.Task, tags=["Screenshots"])
+async def upload_screenshot(infohash: str, db: Session = Depends(get_db), file: UploadFile = File(...)):
+    """
+    Uploads a screenshot and records it for the associated task in a single atomic operation.
+    """
     save_dir = f"screenshots_output/{infohash}"
     os.makedirs(save_dir, exist_ok=True)
     file_path = os.path.join(save_dir, file.filename)
+
+    # Save the uploaded file
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    return {"filename": file.filename, "infohash": infohash, "path": file_path}
 
-@app.post("/tasks/{infohash}/screenshots", response_model=schemas.Task, tags=["Tasks"])
-def record_screenshot_for_task(infohash: str, screenshot: schemas.ScreenshotRecord, db: Session = Depends(get_db)):
-    db_task = crud.record_screenshot(db, infohash=infohash, filename=screenshot.filename)
+    # Record the screenshot in the database
+    db_task = crud.record_screenshot(db, infohash=infohash, filename=file.filename)
     if db_task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        # If the task doesn't exist, we should probably remove the orphaned file
+        os.remove(file_path)
+        raise HTTPException(status_code=404, detail="Task not found for this screenshot.")
+
     return db_task
 
 @app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["Tasks"])

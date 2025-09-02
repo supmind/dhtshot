@@ -39,39 +39,25 @@ async def register_worker(session):
 # --- Callback Functions ---
 
 async def on_screenshot_saved(session, infohash, filepath):
-    """Callback to upload a screenshot and record its filename."""
-    log.info(f"[{infohash}] Screenshot saved to {filepath}. Uploading...")
+    """Callback to upload a screenshot and record its filename in a single API call."""
+    log.info(f"[{infohash}] Screenshot saved to {filepath}. Uploading and recording...")
 
     filename = os.path.basename(filepath)
-
-    # 1. Upload the file
     upload_url = f"{SCHEDULER_URL}/screenshots/{infohash}"
+
     try:
         with open(filepath, "rb") as f:
             data = aiohttp.FormData()
             data.add_field('file', f, filename=filename, content_type='image/jpeg')
             async with session.post(upload_url, data=data) as response:
-                if response.status != 200:
-                    log.error(f"[{infohash}] Failed to upload screenshot {filename}. Status: {response.status}")
-                    return
+                if response.status == 200:
+                    log.info(f"[{infohash}] Successfully uploaded and recorded screenshot {filename}.")
+                else:
+                    log.error(f"[{infohash}] Failed to upload/record screenshot {filename}. Status: {response.status}, Response: {await response.text()}")
     except aiohttp.ClientError as e:
         log.error(f"[{infohash}] Error uploading screenshot {filename}: {e}")
-        return
     except FileNotFoundError:
         log.error(f"[{infohash}] File not found for upload: {filepath}")
-        return
-
-    # 2. Record the filename
-    record_url = f"{SCHEDULER_URL}/tasks/{infohash}/screenshots"
-    payload = {"filename": filename}
-    try:
-        async with session.post(record_url, json=payload) as response:
-            if response.status == 200:
-                log.info(f"[{infohash}] Successfully recorded screenshot {filename}.")
-            else:
-                log.error(f"[{infohash}] Failed to record screenshot {filename}. Status: {response.status}, Response: {await response.text()}")
-    except aiohttp.ClientError as e:
-        log.error(f"[{infohash}] Error recording screenshot {filename}: {e}")
 
 async def on_task_finished(session, status, infohash, message, **kwargs):
     """Callback to report the final status of a task."""
