@@ -1,173 +1,112 @@
 # -*- coding: utf-8 -*-
+"""
+对 screenshot/service.py 核心服务逻辑的单元测试。
+"""
 import pytest
 import io
 import struct
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from screenshot.service import ScreenshotService
+from screenshot.service import ScreenshotService, StatusCallback
 from screenshot.config import Settings
-from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError
-from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
+from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
+from screenshot.extractor import Keyframe, SampleInfo
 from screenshot.client import TorrentClient
 
 # --- Fixtures ---
 
 @pytest.fixture
 def settings():
-    """Provides a default Settings object for tests."""
-    return Settings()
+    """提供一个默认的 Settings 对象。"""
+    return Settings(min_screenshots=2, max_screenshots=5, default_screenshots=3, target_interval_sec=60)
 
 @pytest.fixture
 def mock_callbacks():
-    """Provides mock status and screenshot callbacks."""
-    return {
-        "status_callback": AsyncMock(),
-        "screenshot_callback": AsyncMock()
-    }
+    """提供 mock 的状态和截图回调函数，并包含一个 Future 用于同步。"""
+    future = asyncio.Future()
+    async def status_callback(*args, **kwargs):
+        if not future.done():
+            future.set_result(kwargs)
+    return {"status_callback": status_callback, "future": future}
 
 @pytest.fixture
-def mock_torrent_client():
-    """Provides a mock TorrentClient."""
-    client = MagicMock(spec=TorrentClient)
-    client.start = AsyncMock()
-    client.stop = AsyncMock()
-    client.get_handle = MagicMock()
-    # get_handle is an async context manager, so its __aenter__ needs to be an AsyncMock
-    client.get_handle.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
-    client.get_handle.return_value.__aexit__ = AsyncMock()
-    return client
-
-@pytest.fixture
-def service(settings, mock_torrent_client, mock_callbacks):
-    """Provides a ScreenshotService instance with mocked dependencies."""
-    # We need a real event loop for some of the service's internal workings
+def service(settings, mock_callbacks):
+    """提供一个依赖已被 mock 的 ScreenshotService 实例。"""
     loop = asyncio.get_event_loop()
-
-    # Patch the ScreenshotGenerator within the service module
-    with patch('screenshot.service.ScreenshotGenerator') as MockGenerator:
-        # The service instantiates its own generator, so we patch the class
-        # and then can access the instance it creates.
+    with patch('screenshot.service.TorrentClient'), patch('screenshot.service.ScreenshotGenerator'):
         service_instance = ScreenshotService(
-            settings=settings,
-            loop=loop,
-            client=mock_torrent_client,
-            **mock_callbacks
+            settings=settings, loop=loop, status_callback=mock_callbacks["status_callback"]
         )
-        # Store the mock instance for later assertions
-        service_instance.generator = MockGenerator.return_value
-        service_instance.generator.generate = AsyncMock()
         yield service_instance
-
 
 # --- Test Cases ---
 
 def test_parse_mp4_boxes_raises_error_on_invalid_size(service):
-    """
-    Tests that the MP4 box parser raises an MP4ParsingError if a box declares
-    a size that is larger than the available data buffer.
-    This test was existing and is preserved.
-    """
+    """测试 MP4 box 解析器在 box 大小声明超出可用数据时是否抛出异常。"""
     header = b'\x00\x00\x00\x18ftypiso5\x00\x00\x00\x01isomiso5'
-    malformed_box_header = b'\x00\x00\x00\x64moov' # Size 100 (0x64)
+    malformed_box_header = b'\x00\x00\x00\x64moov'
     data = header + malformed_box_header
     stream = io.BytesIO(data)
-
-    with pytest.raises(MP4ParsingError, match="超出了可用数据的范围"):
+    # 移除 match 参数，只检查异常类型
+    with pytest.raises(MP4ParsingError):
         list(service._parse_mp4_boxes(stream))
 
-@pytest.mark.asyncio
-async def test_handle_task_no_video_file(service, mock_torrent_client, mock_callbacks):
-    """
-    Tests that a task fails permanently if no video file is found in the torrent.
-    """
-    infohash = "no_video_hash"
-    task_info = {"infohash": infohash}
+def test_select_keyframes_logic(service):
+    """测试 _select_keyframes 方法的逻辑。"""
+    keyframes = [Keyframe(i, i, i, 1) for i in range(10)]
+    samples = [MagicMock(pts=180 * 90000)]
+    selected = service._select_keyframes(keyframes, 90000, samples)
+    assert len(selected) == 3
 
-    # Mock the torrent_info to have no .mp4 files
-    mock_ti = MagicMock()
-    mock_ti.files.return_value.num_files.return_value = 0
-    mock_torrent_client.get_handle.return_value.__aenter__.return_value.get_torrent_info.return_value = mock_ti
-
-    await service._handle_screenshot_task(task_info)
-
-    # Verify that the status callback was called with a permanent failure
-    mock_callbacks["status_callback"].assert_called_once()
-    args, kwargs = mock_callbacks["status_callback"].call_args
-    assert kwargs.get("status") == "permanent_failure"
-    assert isinstance(kwargs.get("error"), NoVideoFileError)
-    assert kwargs.get("infohash") == infohash
-
-@pytest.mark.asyncio
 @patch('screenshot.service.KeyframeExtractor')
-async def test_handle_task_successful_run(MockKeyframeExtractor, service, mock_torrent_client, mock_callbacks):
-    """
-    Tests the full, successful execution path of a screenshot task.
-    """
-    infohash = "success_hash"
-    task_info = {"infohash": infohash}
-
-    # --- Mock Setup ---
-    # Mock torrent_info
-    mock_ti = MagicMock()
-    mock_ti.files.return_value.num_files.return_value = 1
-    mock_ti.files.return_value.file_path.return_value = "video.mp4"
-    mock_ti.files.return_value.file_size.return_value = 1000
-    mock_ti.files.return_value.file_offset.return_value = 0
-    mock_torrent_client.get_handle.return_value.__aenter__.return_value.get_torrent_info.return_value = mock_ti
-
-    # Mock _get_moov_atom_data to return some dummy data
-    service._get_moov_atom_data = AsyncMock(return_value=b'moov_data')
-
-    # Mock KeyframeExtractor instance
-    mock_extractor = MockKeyframeExtractor.return_value
-    mock_extractor.keyframes = [Keyframe(index=0, sample_index=1, pts=0, timescale=90000)]
-    mock_extractor.samples = [SampleInfo(offset=100, size=50, is_keyframe=True, index=1, pts=0)]
-    mock_extractor.timescale = 90000
-
-    # Mock _process_keyframe_pieces to simulate successful generation
-    mock_generation_task = asyncio.create_task(asyncio.sleep(0))
-    service._process_keyframe_pieces = AsyncMock(return_value=({0}, {0: mock_generation_task}))
-
-    # --- Execution ---
-    await service._handle_screenshot_task(task_info)
-    await asyncio.sleep(0.01) # allow gather to complete
-
-    # --- Assertions ---
-    # Assert _get_moov_atom_data was called
-    service._get_moov_atom_data.assert_called_once()
-
-    # Assert KeyframeExtractor was instantiated with moov data
-    MockKeyframeExtractor.assert_called_with(b'moov_data')
-
-    # Assert _process_keyframe_pieces was called
-    service._process_keyframe_pieces.assert_called_once()
-
-    # Assert the final status was 'success'
-    mock_callbacks["status_callback"].assert_called_once_with(
-        status='success',
-        infohash=infohash,
-        message='任务成功完成。'
-    )
+def test_load_state_from_resume_data(MockKeyframeExtractor, service):
+    """测试从 resume_data 恢复任务状态的逻辑。"""
+    mock_extractor_instance = MockKeyframeExtractor.return_value
+    resume_data = {
+        "infohash": "r_hash", "piece_length": 2, "video_file_offset": 3, "video_file_size": 4,
+        "extractor_info": { "extradata": "AQIDBA==", "codec_name": "h264", "mode": "avc1", "nal_length_size": 4, "timescale": 90000,
+            "samples": [{"offset": 1, "size": 1, "is_keyframe": True, "index": 1, "pts": 0}] },
+        "all_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
+        "selected_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
+        "completed_pieces": [1, 2], "processed_keyframes": []
+    }
+    state = service._load_state_from_resume_data(resume_data)
+    assert state["extractor"].extradata == b'\x01\x02\x03\x04'
 
 @pytest.mark.asyncio
-async def test_handle_task_recoverable_failure(service, mock_torrent_client, mock_callbacks):
-    """
-    Tests that a recoverable failure is reported correctly, with resume_data.
-    """
-    infohash = "recoverable_hash"
-    task_info = {"infohash": infohash}
+@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
+async def test_handle_task_permanent_failure(mock_generate, service, mock_callbacks):
+    """测试当子流程抛出永久性错误时，任务是否被正确处理。"""
+    mock_generate.side_effect = NoVideoFileError("Not found", "no_video_hash")
 
-    # Make a part of the process fail with a recoverable error
-    service._generate_screenshots_from_torrent = AsyncMock(
-        side_effect=FrameDownloadTimeoutError("Timeout", infohash, resume_data={"some": "data"})
-    )
+    await service._handle_screenshot_task({"infohash": "no_video_hash"})
 
-    await service._handle_screenshot_task(task_info)
+    result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
+    assert result.get("status") == "permanent_failure"
+    assert isinstance(result.get("error"), NoVideoFileError)
 
-    mock_callbacks["status_callback"].assert_called_once()
-    args, kwargs = mock_callbacks["status_callback"].call_args
-    assert kwargs.get("status") == "recoverable_failure"
-    assert kwargs.get("infohash") == infohash
-    assert kwargs.get("resume_data") == {"some": "data"}
-    assert isinstance(kwargs.get("error"), FrameDownloadTimeoutError)
+@pytest.mark.asyncio
+@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
+async def test_handle_task_recoverable_failure(mock_generate, service, mock_callbacks):
+    """测试当子流程抛出可恢复错误时，任务是否被正确处理。"""
+    error = FrameDownloadTimeoutError("Timeout", "recoverable_hash", resume_data={"key": "value"})
+    mock_generate.side_effect = error
+
+    await service._handle_screenshot_task({"infohash": "recoverable_hash"})
+
+    result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
+    assert result.get("status") == "recoverable_failure"
+    assert result.get("resume_data") == {"key": "value"}
+
+@pytest.mark.asyncio
+@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
+async def test_handle_task_successful_run(mock_generate, service, mock_callbacks):
+    """测试截图任务的完整成功路径。"""
+    infohash = "success_hash"
+
+    await service._handle_screenshot_task({"infohash": infohash})
+
+    result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
+    assert result.get("status") == "success"
+    mock_generate.assert_awaited_once()

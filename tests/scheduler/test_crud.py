@@ -19,7 +19,7 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 @pytest.fixture(scope="function")
 def db_session():
     """
-    一个 Pytest fixture，为每个测试函数提供一个独立的数据库会话。
+    一个 Pytest fixture，用于为每个测试函数提供一个独立的数据库会话。
     它会在测试开始前创建所有表，并在测试结束后删除所有表。
     """
     Base.metadata.create_all(bind=engine)
@@ -32,6 +32,11 @@ def db_session():
 
 # --- 测试用例 ---
 
+def test_get_non_existent_task(db_session):
+    """测试查询一个不存在的任务时应返回 None。"""
+    task = crud.get_task_by_infohash(db_session, "non_existent_hash")
+    assert task is None
+
 def test_create_and_get_task(db_session):
     """测试任务的创建和根据 infohash 的查询功能。"""
     infohash = "test_infohash_123"
@@ -42,6 +47,11 @@ def test_create_and_get_task(db_session):
     assert retrieved_task is not None
     assert retrieved_task.id == created_task.id
 
+def test_get_non_existent_worker(db_session):
+    """测试查询一个不存在的工作节点时应返回 None。"""
+    worker = crud.get_worker_by_id(db_session, "non_existent_worker")
+    assert worker is None
+
 def test_create_and_get_worker(db_session):
     """测试工作节点的创建和根据 worker_id 的查询功能。"""
     worker_create = schemas.WorkerCreate(worker_id="worker-001", status="idle")
@@ -50,6 +60,11 @@ def test_create_and_get_worker(db_session):
     retrieved_worker = crud.get_worker_by_id(db_session, worker_id="worker-001")
     assert retrieved_worker is not None
     assert retrieved_worker.id == created_worker.id
+
+def test_update_non_existent_worker_status(db_session):
+    """测试更新一个不存在的工作节点状态时应返回 None。"""
+    updated_worker = crud.update_worker_status(db_session, worker_id="non_existent_worker", status="busy")
+    assert updated_worker is None
 
 def test_update_worker_status(db_session):
     """测试更新工作节点状态的功能。"""
@@ -66,34 +81,46 @@ def test_get_and_assign_next_task(db_session):
     next_task = crud.get_and_assign_next_task(db_session, worker_id="worker-004")
     assert next_task is None
 
+def test_update_non_existent_task_status(db_session):
+    """测试更新一个不存在的任务状态时应返回 None。"""
+    updated_task = crud.update_task_status(db_session, infohash="non_existent_hash", status="success")
+    assert updated_task is None
+
 def test_update_task_status(db_session):
-    """测试更新任务最终状态的功能。"""
+    """测试更新任务最终状态的功能，包括 resume_data 和 message。"""
     crud.create_task(db_session, task=schemas.TaskCreate(infohash="task_to_update"))
     crud.get_and_assign_next_task(db_session, worker_id="worker-005")
-    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message="Completed")
+
+    resume_data = {"key": "value"}
+    message = "Completed with data"
+    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message, resume_data=resume_data)
+
     assert updated_task.status == "success"
     assert updated_task.assigned_worker_id is None
+    assert updated_task.result_message == message
+    assert updated_task.resume_data == resume_data
+
+def test_record_screenshot_for_non_existent_task(db_session):
+    """测试为不存在的任务记录截图时应返回 None。"""
+    result = crud.record_screenshot(db_session, "non_existent_hash", "file.jpg")
+    assert result is None
 
 def test_record_screenshot_multiple_times(db_session):
     """
     测试对同一个任务多次调用 record_screenshot，验证所有记录都被正确添加。
-    这是一个简化的、单线程的测试，用于验证追加逻辑的正确性。
     """
     infohash = "multiple_records_task"
     crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash))
 
-    # 多次调用 record_screenshot
     crud.record_screenshot(db_session, infohash, "file1.jpg")
     crud.record_screenshot(db_session, infohash, "file2.jpg")
     crud.record_screenshot(db_session, infohash, "file1.jpg") # 测试重复添加
     crud.record_screenshot(db_session, infohash, "file3.jpg")
 
-    # 检查最终结果
     final_task = crud.get_task_by_infohash(db_session, infohash)
     assert final_task is not None
     final_screenshots = final_task.successful_screenshots
 
     assert isinstance(final_screenshots, list)
-    # 验证最终列表包含所有不重复的文件名
     assert len(final_screenshots) == 3
     assert set(final_screenshots) == {"file1.jpg", "file2.jpg", "file3.jpg"}

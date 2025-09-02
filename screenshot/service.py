@@ -442,12 +442,15 @@ class ScreenshotService:
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:
             self.log.warning("任务 %s 因可恢复的错误而失败: %s", infohash_hex, e)
             await self._send_status_update(status='recoverable_failure', infohash=getattr(e, 'infohash', infohash_hex), message=str(e), error=e, resume_data=getattr(e, 'resume_data', None))
+            return
         except TaskError as e:
             self.log.error("任务 %s 因永久性错误而失败: %s", e.infohash, e, exc_info=True)
             await self._send_status_update(status='permanent_failure', infohash=e.infohash, message=str(e), error=e)
+            return
         except Exception as e:
             self.log.exception("处理 %s 时发生意外的严重错误。", infohash_hex)
             await self._send_status_update(status='permanent_failure', infohash=infohash_hex, message=f"发生意外错误: {e}", error=e)
+            return
         finally:
             self.active_tasks.discard(infohash_hex)
 
