@@ -6,12 +6,14 @@ import time
 import base64
 import json
 import os
+import signal
+from functools import partial
 
 from screenshot.service import ScreenshotService
 from screenshot.config import Settings
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("Worker")
 
 SCHEDULER_URL = "http://127.0.0.1:8000"
@@ -97,110 +99,84 @@ async def on_task_finished(session, status, infohash, message, **kwargs):
     except aiohttp.ClientError as e:
         log.error(f"[{infohash}] Error reporting final status: {e}")
 
-# --- Main Task Processing ---
-
-async def process_task(session, task_data):
-    """
-    Processes a single screenshot task using the screenshot module.
-    """
-    infohash = task_data['infohash']
-    log.info(f"[{infohash}] Starting task processing.")
-
-    # This is a temporary, direct way to use the service logic for a single task.
-    # A proper implementation might involve refactoring ScreenshotService.
-
-    # 1. Prepare callbacks
-    status_callback = lambda **cb_kwargs: on_task_finished(session, **cb_kwargs)
-    screenshot_callback = lambda filepath: on_screenshot_saved(session, infohash, filepath)
-
-    # 2. Prepare service and task data
-    settings = Settings()
-    loop = asyncio.get_running_loop()
-    service = ScreenshotService(
-        settings=settings,
-        loop=loop,
-        status_callback=status_callback,
-        screenshot_callback=screenshot_callback
-    )
-
-    # Decode metadata from Base64 if present
-    if task_data.get('metadata'):
-        task_data['metadata'] = base64.b64decode(task_data['metadata'])
-
-    # 3. Run the task
-    try:
-        # We directly call the internal handler for a single task.
-        await service._handle_screenshot_task(task_data)
-    except Exception as e:
-        log.exception(f"[{infohash}] An unexpected error occurred during _handle_screenshot_task.")
-        # Report a final, fatal error to the scheduler
-        await on_task_finished(session, status='permanent_failure', infohash=infohash, message=f"Worker-level error: {e}")
-    finally:
-        # Ensure the torrent client session inside the service is cleaned up
-        await service.stop()
-        log.info(f"[{infohash}] Task processing finished.")
-
-
-async def send_heartbeat(session):
+async def send_heartbeat(session, service):
     """Sends a heartbeat to the scheduler."""
     url = f"{SCHEDULER_URL}/workers/heartbeat"
-    # In a real worker, this would reflect the actual status
-    payload = {"worker_id": WORKER_ID, "status": "idle"}
     while True:
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        status = "busy" if service.active_tasks else "idle"
+        payload = {"worker_id": WORKER_ID, "status": status}
         try:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    log.info("Heartbeat sent successfully.")
+                    log.info(f"Heartbeat sent (status: {status}).")
                 else:
                     log.warning(f"Failed to send heartbeat. Status: {response.status}")
         except aiohttp.ClientError as e:
             log.warning(f"Error sending heartbeat: {e}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 async def main():
-    """Main function for the worker."""
+    """Main function for the worker, refactored for long-lived services."""
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+
     async with aiohttp.ClientSession() as session:
-        # Register first
         if not await register_worker(session):
             log.error("Could not register with scheduler. Exiting.")
             return
 
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(send_heartbeat(session))
+        settings = Settings()
+        status_cb = partial(on_task_finished, session)
+        screenshot_cb = partial(on_screenshot_saved, session)
+
+        service = ScreenshotService(
+            settings=settings,
+            loop=loop,
+            status_callback=status_cb,
+            screenshot_callback=screenshot_cb
+        )
+        await service.run()
+        log.info("ScreenshotService is running in the background.")
+
+        heartbeat_task = asyncio.create_task(send_heartbeat(session, service))
         log.info("Heartbeat task started.")
 
-        # Main task processing loop
-        log.info("Starting main task loop...")
-        while True:
+        log.info("Starting main task polling loop...")
+        while not stop_event.is_set():
             try:
-                log.info("Polling for next available task...")
-                url = f"{SCHEDULER_URL}/tasks/next?worker_id={WORKER_ID}"
-                async with session.get(url, timeout=45) as response:
-                    if response.status == 200:
-                        task_data = await response.json()
-                        if task_data:
-                            log.info(f"Received task: {task_data['infohash']}")
-                            await process_task(session, task_data)
-                        else:
-                            log.info("No tasks available (empty 200 OK). Waiting...")
-                    elif response.status == 204:
-                        log.info("No tasks available (204 No Content). Waiting...")
-                    else:
-                        log.error(f"Error fetching task. Status: {response.status}, Response: {await response.text()}")
+                # Only poll if the service is not already busy
+                if not service.active_tasks:
+                    log.info("Polling for next available task...")
+                    url = f"{SCHEDULER_URL}/tasks/next?worker_id={WORKER_ID}"
+                    async with session.get(url, timeout=15) as response:
+                        if response.status == 200:
+                            task_data = await response.json()
+                            if task_data:
+                                log.info(f"Received task: {task_data['infohash']}. Submitting to local service.")
+                                if task_data.get('metadata'):
+                                    task_data['metadata'] = base64.b64decode(task_data['metadata'])
+                                await service.submit_task(
+                                    infohash=task_data['infohash'],
+                                    metadata=task_data.get('metadata'),
+                                    resume_data=task_data.get('resume_data')
+                                )
+                        elif response.status == 204:
+                            log.info("No tasks available. Waiting...")
 
-                await asyncio.sleep(10) # Wait 10 seconds before polling again
+                await asyncio.sleep(10)
 
             except aiohttp.ClientError as e:
                 log.error(f"Error connecting to scheduler: {e}")
-                await asyncio.sleep(HEARTBEAT_INTERVAL) # Wait longer if scheduler is down
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
             except asyncio.CancelledError:
-                log.info("Task loop cancelled.")
                 break
 
-        # This part is not reachable in the current loop, but good for cleanup
+        log.info("Shutdown signal received. Stopping services...")
         heartbeat_task.cancel()
-        await heartbeat_task
-
+        await service.stop()
+        log.info("Worker has shut down.")
 
 if __name__ == "__main__":
     try:
