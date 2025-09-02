@@ -1,90 +1,90 @@
-# Distributed Video Screenshot System
+# 分布式视频截图系统
 
-## 1. Overview
+## 1. 概述
 
-This project provides a high-performance, distributed service for generating screenshots from video files contained within torrents. The key feature of this service is its **minimal download strategy**. Instead of downloading an entire torrent, it only fetches the necessary metadata and the specific data chunks required to extract keyframes, thus saving significant bandwidth and time.
+本项目提供一个高性能的、分布式的服务，用于从 torrent 中的视频文件生成截图。本服务的核心特性是其**最小化下载策略**。它不会下载整个 torrent 文件，而仅获取必要的元数据和提取关键帧所需的特定数据块，从而极大地节省了带宽和时间。
 
-The system is built with Python using `asyncio` and is composed of a central scheduler and multiple worker nodes.
+本系统使用 Python 的 `asyncio` 构建，由一个中心调度器和多个工作节点组成。
 
-## 2. Architecture and Design
+## 2. 架构设计
 
-The system is composed of two main applications:
+本系统由两个主要应用组成：
 
-### 2.1. The Central Scheduler (`scheduler/`)
+### 2.1. 中心调度器 (`scheduler/`)
 
--   **Framework:** Built with FastAPI.
--   **Responsibilities:**
-    -   Provides a REST API for submitting new tasks and querying their status.
-    -   Manages a database (SQLite by default) of all tasks and registered workers.
-    -   Assigns pending tasks to available workers.
-    -   Handles `resume_data` for tasks that fail with recoverable errors, allowing them to be resumed.
-    -   Receives and stores the final screenshot images uploaded by workers.
+-   **框架:** 使用 FastAPI 构建。
+-   **职责:**
+    -   提供 REST API 用于提交新任务和查询任务状态。
+    -   管理一个包含所有任务和已注册工作节点的数据库（默认为 SQLite）。
+    -   将待处理的任务分配给可用的工作节点。
+    -   处理因可恢复错误而失败的任务的 `resume_data`，使其能够被续传。
+    -   接收并存储由工作节点上传的最终截图文件。
 
-### 2.2. The Worker (`worker.py`)
+### 2.2. 工作节点 (`worker.py`)
 
--   **Framework:** A standalone `asyncio` application using `aiohttp`.
--   **Responsibilities:**
-    -   On startup, automatically registers itself with the Central Scheduler.
-    -   Periodically sends heartbeats to the scheduler to remain active.
-    -   Polls the scheduler for new tasks.
-    -   When a task is received, it uses the core `screenshot` library to perform the screenshot generation.
-    -   Reports progress back to the scheduler in real-time, including uploading successfully generated screenshots and their filenames as they are created.
-    -   Reports the final task status (`success`, `permanent_failure`, etc.) back to the scheduler.
+-   **框架:** 一个使用 `aiohttp` 的独立 `asyncio` 应用。
+-   **职责:**
+    -   启动时，自动向中心调度器注册。
+    -   周期性地向调度器发送心跳以保持活动状态。
+    -   向调度器轮询新任务。
+    -   当接收到任务时，使用核心的 `screenshot` 库来执行截图生成工作。
+    -   实时向调度器报告进度，包括在成功生成截图时立即上传文件和记录文件名。
+    -   向调度器报告最终的任务状态（`success`, `permanent_failure` 等）。
 
-### 2.3. The Core Library (`screenshot/`)
+### 2.3. 核心库 (`screenshot/`)
 
-This is the underlying engine that performs the actual screenshotting.
--   **`TorrentClient`:** Manages all `libtorrent` interactions.
--   **`KeyframeExtractor`:** Parses MP4 metadata to find keyframe locations.
--   **`ScreenshotGenerator`:** Decodes video frames and saves them as JPGs.
--   **`ScreenshotService`:** Orchestrates the process for a single task.
+这是执行实际截图工作的底层引擎。
+-   **`TorrentClient`:** 管理所有 `libtorrent` 交互。
+-   **`KeyframeExtractor`:** 解析 MP4 元数据以定位关键帧。
+-   **`ScreenshotGenerator`:** 解码视频帧并将其保存为 JPG 图片。
+-   **`ScreenshotService`:** 为单个任务协调整个流程。
 
-## 3. Deployment and Usage
+## 3. 部署与使用
 
-### 3.1. Installation
+### 3.1. 安装
 
-The project uses Python 3.10+. All dependencies are listed in `requirements.txt`.
+本项目使用 Python 3.10+。所有依赖项均在 `requirements.txt` 中列出。
 
 ```bash
-# Install all required packages
+# 安装所有必需的包
 pip install -r requirements.txt
 ```
 
-### 3.2. Running the System
+### 3.2. 运行系统
 
-You need to run the two components in separate terminals.
+您需要在不同的终端中分别运行这两个组件。
 
-**1. Start the Scheduler:**
+**1. 启动调度器:**
 ```bash
-# From the project root directory
+# 在项目根目录
 uvicorn scheduler.main:app --host 0.0.0.0 --port 8000
 ```
-The scheduler API will now be available at `http://localhost:8000`.
+调度器 API 现在位于 `http://localhost:8000`。
 
-**2. Start one or more Workers:**
+**2. 启动一个或多个工作节点:**
 ```bash
-# From the project root directory, in a new terminal
+# 在项目根目录的一个新终端中
 python worker.py
 ```
-You can run `python worker.py` on multiple different machines, as long as they can reach the scheduler's URL (update `SCHEDULER_URL` in `worker.py` if necessary).
+您可以在多台不同的机器上运行 `python worker.py`，只要它们能访问到调度器的 URL（如有必要，请修改 `worker.py` 中的 `SCHEDULER_URL`）。
 
-### 3.3. API Usage
+### 3.3. API 用法
 
-You can interact with the system via the scheduler's REST API.
+您可以通过调度器的 REST API 与系统交互。
 
--   **Create a new task:**
+-   **创建新任务:**
     ```bash
-    curl -X POST -F "infohash=<YOUR_40_CHAR_INFOHASH>" http://localhost:8000/tasks/
+    curl -X POST -F "infohash=<你的40位INFOHASH>" http://localhost:8000/tasks/
     ```
 
--   **Query a task's status:**
+-   **查询任务状态:**
     ```bash
-    curl http://localhost:8000/tasks/<YOUR_40_CHAR_INFOHASH>
+    curl http://localhost:8000/tasks/<你的40位INFOHASH>
     ```
 
-## 4. Design Details
+## 4. 设计细节
 
--   **Database:** Uses SQLite by default (`/tmp/scheduler.db`), but can be easily configured to use PostgreSQL or MySQL in `scheduler/database.py`.
--   **Task Assignment:** Uses a `SELECT ... FOR UPDATE` database lock to ensure a pending task is atomically assigned to only one worker, preventing race conditions.
--   **Fault Tolerance:** The system is resilient to temporary network errors. If a worker fails to fetch data, the task is marked as `recoverable_failure`, and its `resume_data` is saved by the scheduler. The task can then be re-queued and resumed by another worker.
--   **Real-time Callbacks:** The worker uses a per-screenshot success callback to immediately upload generated images and record their filenames, ensuring no data is lost even if the worker fails mid-task.
+-   **数据库:** 默认为 SQLite (`/tmp/scheduler.db`)，但可以在 `scheduler/database.py` 中轻松配置为 PostgreSQL 或 MySQL。
+-   **任务分配:** 使用 `SELECT ... FOR UPDATE` 数据库锁来确保一个待处理任务被原子性地分配给唯一一个工作节点，防止竞态条件。
+-   **容错性:** 系统对临时的网络错误具有弹性。如果一个工作节点获取数据失败，任务将被标记为 `recoverable_failure`，其 `resume_data` 会被调度器保存。任务随后可以被重新排队并由另一个工作节点续传。
+-   **实时回调:** 工作节点使用“每截图成功回调”机制来立即上传生成的图片并记录其文件名，确保即使工作节点在任务中途失败也不会丢失数据。
