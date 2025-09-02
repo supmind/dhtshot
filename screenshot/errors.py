@@ -13,6 +13,15 @@ class ScreenshotError(Exception):
     pass
 
 
+class MP4ParsingError(ScreenshotError):
+    """
+    在解析 MP4 文件结构（如 box 格式）时发生的底层错误。
+    这个错误是上下文无关的，不包含 infohash，因为它在更通用的、
+    可能在没有任务上下文的情况下使用的解析函数中被引发。
+    """
+    pass
+
+
 class TaskError(ScreenshotError):
     """
     与单个截图任务相关的错误的基类。

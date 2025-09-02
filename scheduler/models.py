@@ -12,6 +12,9 @@ class Task(Base):
     # On backends that support it, it uses the native JSON type.
     # On others (like older SQLite), it falls back to TEXT.
     successful_screenshots = Column(JSON, nullable=True)
+    # 用于存储任务失败时可用于恢复的上下文数据。
+    # 它由工作节点生成，并由调度器保存，以便在重试时传递给下一个工作节点。
+    resume_data = Column(JSON, nullable=True)
     result_message = Column(Text, nullable=True)
     assigned_worker_id = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)

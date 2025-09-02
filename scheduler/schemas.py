@@ -14,6 +14,7 @@ class Task(TaskBase):
     status: str
     successful_screenshots: Optional[List[str]] = []
     result_message: Optional[str] = None
+    resume_data: Optional[dict] = None
     assigned_worker_id: Optional[str] = None
     created_at: datetime.datetime
     updated_at: datetime.datetime

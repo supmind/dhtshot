@@ -60,24 +60,32 @@ async def create_or_reactivate_task(
 
 @app.get("/tasks/next", response_model=Optional[schemas.NextTaskResponse], tags=["Tasks"])
 def get_next_task(worker_id: str, db: Session = Depends(get_db)):
+    """
+    为工作节点获取下一个待处理的任务。
+    此端点现在从数据库中直接读取 resume_data，而不是从临时文件中读取。
+    """
     METADATA_DIR = "temp_metadata"
-    RESUME_DIR = "temp_resume_data"
     task = crud.get_and_assign_next_task(db, worker_id=worker_id)
     if not task:
         return None
+
     response_data = {"infohash": task.infohash}
-    resume_path = os.path.join(RESUME_DIR, f"{task.infohash}.resume.json")
-    if os.path.exists(resume_path):
-        with open(resume_path, "r") as f:
-            response_data["resume_data"] = json.load(f)
-        os.remove(resume_path)
+    if task.resume_data:
+        self.log.info("在任务 %s 中发现恢复数据，将其发送给工作节点。", task.infohash)
+        response_data["resume_data"] = task.resume_data
+        # 清除恢复数据，因为它是一次性的
+        task.resume_data = None
+        db.commit()
     else:
+        # 仅在没有恢复数据时才发送元数据
         metadata_path = os.path.join(METADATA_DIR, f"{task.infohash}.torrent")
         if os.path.exists(metadata_path):
             with open(metadata_path, "rb") as f:
                 metadata_bytes = f.read()
                 response_data["metadata"] = base64.b64encode(metadata_bytes).decode('ascii')
+            # 考虑在成功分配后删除元数据文件，以防磁盘空间膨胀
             os.remove(metadata_path)
+
     return schemas.NextTaskResponse(**response_data)
 
 @app.get("/tasks/{infohash}", response_model=schemas.Task, tags=["Tasks"])
@@ -129,13 +137,22 @@ async def upload_screenshot(infohash: str, db: Session = Depends(get_db), file: 
 
 @app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["Tasks"])
 async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db)):
-    if update.resume_data:
-        resume_dir = "temp_resume_data"
-        os.makedirs(resume_dir, exist_ok=True)
-        resume_path = os.path.join(resume_dir, f"{infohash}.resume.json")
-        with open(resume_path, "w") as f:
-            json.dump(update.resume_data, f)
-    db_task = crud.update_task_status(db, infohash=infohash, status=update.status, message=update.message)
-    if db_task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return db_task
+    """
+    更新一个任务的最终状态。
+    如果提供了 resume_data，它将被直接存储在数据库中，而不是保存在临时文件里。
+    """
+    try:
+        db_task = crud.update_task_status(
+            db,
+            infohash=infohash,
+            status=update.status,
+            message=update.message,
+            resume_data=update.resume_data
+        )
+        if db_task is None:
+            raise HTTPException(status_code=404, detail="任务未找到")
+        return db_task
+    except Exception as e:
+        # 添加日志记录，以便在数据库操作失败时进行调试
+        # log.error("更新任务状态时数据库出错: %s", e)
+        raise HTTPException(status_code=500, detail=f"更新任务状态时发生内部错误: {e}")

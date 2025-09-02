@@ -63,17 +63,22 @@ def get_and_assign_next_task(db: Session, worker_id: str):
 
     return db_task
 
-def update_task_status(db: Session, infohash: str, status: str, message: Optional[str] = None):
+def update_task_status(db: Session, infohash: str, status: str, message: Optional[str] = None, resume_data: Optional[dict] = None):
     """
-    Updates the status and result message of a task.
-    Also clears the assigned worker when a task is finished.
+    更新任务的状态、结果消息和可选的恢复数据。
+    当任务完成（成功或失败）时，也会清除分配的工作节点ID。
     """
     db_task = get_task_by_infohash(db, infohash=infohash)
     if db_task:
         db_task.status = status
         db_task.result_message = message
+        if resume_data:
+            db_task.resume_data = resume_data
+
+        # 当任务进入最终状态或可恢复失败状态时，它不再被任何工作节点持有
         if status in ['success', 'permanent_failure', 'recoverable_failure']:
             db_task.assigned_worker_id = None
+
         db.commit()
         db.refresh(db_task)
     return db_task
