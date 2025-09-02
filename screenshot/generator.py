@@ -52,7 +52,8 @@ class ScreenshotGenerator:
                 # Schedule the callback on the main event loop from this worker thread.
                 # The callback expects infohash and filepath.
                 coro = self.on_success(infohash_hex, output_filename)
-                self.loop.call_soon_threadsafe(asyncio.create_task, coro)
+                # Use run_coroutine_threadsafe for safer, more reliable execution of coroutines from other threads.
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
         except Exception:
             log.exception("保存帧到文件 %s 时发生错误。", output_filename)
             raise

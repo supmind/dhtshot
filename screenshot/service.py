@@ -3,6 +3,7 @@ import asyncio
 import logging
 import io
 import struct
+import base64
 from typing import Generator, Tuple, Optional, Callable, Awaitable, Any
 from collections import defaultdict
 
@@ -288,7 +289,18 @@ class ScreenshotService:
         """从 resume_data 字典中恢复任务状态。"""
         extractor = KeyframeExtractor(moov_data=None)
         ext_info = data['extractor_info']
-        extractor.extradata = ext_info['extradata']
+
+        # Correctly handle extradata, which is base64-encoded in the resume_data
+        extradata = ext_info.get('extradata')
+        if extradata and isinstance(extradata, str):
+            try:
+                extractor.extradata = base64.b64decode(extradata)
+            except (base64.binascii.Error, TypeError) as e:
+                self.log.error(f"Failed to decode base64 extradata: {e}")
+                extractor.extradata = None # Or handle error appropriately
+        else:
+            extractor.extradata = extradata
+
         extractor.codec_name = ext_info.get('codec_name') # 使用 .get 兼容旧的 resume_data
         extractor.mode = ext_info['mode']
         extractor.nal_length_size = ext_info['nal_length_size']
