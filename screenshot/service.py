@@ -145,7 +145,10 @@ class ScreenshotService:
 
     def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
         """
-        一个健壮的 MP4 box 解析器，能应对 box 声明大小超出实际数据范围等错误。
+        一个更健壮的 MP4 box 解析器。
+        如果一个 box 声明的大小超出了可用数据范围，它不会失败，而是会 yield
+        它所拥有的部分数据，同时仍然报告在头部声明的完整大小。
+        这允许调用者决定如何处理部分 box。
         """
         stream_buffer = stream.getbuffer()
         buffer_size = len(stream_buffer)
@@ -155,25 +158,38 @@ class ScreenshotService:
             try:
                 header_data = stream.read(8)
                 if len(header_data) < 8: break
-                size, box_type_bytes = struct.unpack('>I4s', header_data)
+                declared_size, box_type_bytes = struct.unpack('>I4s', header_data)
                 box_type = box_type_bytes.decode('ascii', 'ignore')
             except struct.error:
-                raise MP4ParsingError(f"无法在偏移量 {current_offset} 处解析 MP4 box 头部。")
+                self.log.warning("在偏移量 %d 处解析 MP4 box 头部时遇到 struct.error。", current_offset)
+                break
 
             box_header_size = 8
-            if size == 1: # 64-bit size
-                if current_offset + 16 > buffer_size: raise MP4ParsingError(f"Box '{box_type}' 在偏移量 {current_offset} 处声明了64位的大小，但数据不足。")
-                size = struct.unpack('>Q', stream.read(8))[0]
+            if declared_size == 1: # 64-bit size
+                if current_offset + 16 > buffer_size:
+                    self.log.warning("Box '%s' 在偏移量 %d 处需要 64 位大小，但数据不足。", box_type, current_offset)
+                    break
+                declared_size = struct.unpack('>Q', stream.read(8))[0]
                 box_header_size = 16
-            elif size == 0: # Extends to end of file
-                size = buffer_size - current_offset
+            elif declared_size == 0: # Extends to end of file
+                declared_size = buffer_size - current_offset
 
-            if size < box_header_size: raise MP4ParsingError(f"Box '{box_type}' 在偏移量 {current_offset} 处声明了无效的大小 {size}。")
-            if current_offset + size > buffer_size: raise MP4ParsingError(f"Box '{box_type}' 在偏移量 {current_offset} 处声明的大小为 {size}，超出了可用数据范围。")
+            if declared_size < box_header_size:
+                self.log.warning("Box '%s' 在偏移量 %d 处声明了无效的大小 %d。", box_type, current_offset, declared_size)
+                break
 
-            full_box_data = stream_buffer[current_offset : current_offset + size]
-            yield box_type, bytes(full_box_data), current_offset, size
-            current_offset += size
+            # 关键改动：不再因为 box 超出范围而抛出异常。
+            # 我们计算在此缓冲区中实际可用的 box 大小。
+            effective_box_size = declared_size
+            if current_offset + declared_size > buffer_size:
+                self.log.debug("Box '%s' (大小: %d) 超出了缓冲区大小 %d。将 yield 部分数据。", box_type, declared_size, buffer_size)
+                effective_box_size = buffer_size - current_offset
+
+            # 我们 yield 我们拥有的数据（可能是部分的），但同时报告在头部声明的 *完整* 大小。
+            box_content = stream_buffer[current_offset : current_offset + effective_box_size]
+            yield box_type, bytes(box_content), current_offset, declared_size
+
+            current_offset += declared_size
 
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """
@@ -189,25 +205,26 @@ class ScreenshotService:
                 head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
                 head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
                 stream = io.BytesIO(head_data)
-                try:
-                    for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
-                        if box_type == 'moov':
-                            # 如果探测到的数据不完整，则下载完整的 'moov' box
-                            if len(partial_box_data) < box_size:
-                                full_moov_offset_in_torrent = video_file_offset + box_offset
-                                needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
-                                moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
-                                return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
-                            return partial_box_data
-                        if box_type == 'mdat':
-                            # 如果先找到 'mdat'，说明 'moov' 很可能在尾部，停止头部探测
-                            self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
-                            break
-                except MP4ParsingError as e:
-                    # 捕获解析错误，特别是当 box 声明的大小超出我们下载的探测数据范围时。
-                    # 这是一个强烈的信号，表明 'moov' 在文件末尾，因此我们不应失败，而是继续进行尾部探测。
-                    self.log.warning("[%s] 在头部探测时发生MP4解析错误 (这可能是正常的): %s", infohash_hex, e)
 
+                # 使用新的、更健壮的解析器
+                for box_type, partial_box_data, box_offset, declared_size in self._parse_mp4_boxes(stream):
+                    if box_type == 'moov':
+                        # 检查我们拥有的数据是否就是完整的 box
+                        if len(partial_box_data) >= declared_size:
+                            self.log.info("[%s] 在头部探测中找到了完整的 'moov' box。", infohash_hex)
+                            return partial_box_data
+
+                        # 如果数据不完整，说明 'moov' box 太大，需要专门下载它
+                        self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
+                        full_moov_offset_in_torrent = video_file_offset + box_offset
+                        needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
+                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                        return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
+
+                    if box_type == 'mdat':
+                        # 如果先找到 'mdat'，说明 'moov' 很可能在尾部，停止头部探测
+                        self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
+                        break
         except TorrentClientError as e:
             # 捕获 Torrent 客户端本身的错误（例如，超时）
             raise MoovFetchError(f"在 moov 头部探测期间获取 piece 失败: {e}", infohash_hex) from e

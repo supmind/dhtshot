@@ -123,16 +123,6 @@ def service(settings, mock_callbacks):
 
 # --- Test Cases ---
 
-def test_parse_mp4_boxes_raises_error_on_invalid_size(service):
-    """测试 MP4 box 解析器在 box 大小声明超出可用数据时是否抛出异常。"""
-    header = b'\x00\x00\x00\x18ftypiso5\x00\x00\x00\x01isomiso5'
-    malformed_box_header = b'\x00\x00\x00\x64moov'
-    data = header + malformed_box_header
-    stream = io.BytesIO(data)
-    # 移除 match 参数，只检查异常类型
-    with pytest.raises(MP4ParsingError):
-        list(service._parse_mp4_boxes(stream))
-
 def test_select_keyframes_logic(service):
     """测试 _select_keyframes 方法的逻辑。"""
     keyframes = [Keyframe(i, i, i, 1) for i in range(10)]
@@ -193,47 +183,49 @@ async def test_handle_task_successful_run(mock_generate, service, mock_callbacks
     mock_generate.assert_awaited_once()
 
 @pytest.mark.asyncio
-async def test_get_moov_atom_handles_parsing_error_in_head_probe(service):
+async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
     """
-    测试 _get_moov_atom_data 在头部探测遇到 MP4ParsingError 时，
-    是否能优雅地回退到尾部探测，而不是直接失败。
+    测试当 _get_moov_atom_data 在头部探测中找到一个部分的 'moov' box 时，
+    它是否能正确地触发一次额外的下载来获取完整的 box。
     """
     # 1. 模拟 service 的依赖
     mock_handle = MagicMock()
     service.client.fetch_pieces = AsyncMock()
 
-    # 2. 设置场景：
-    #    - 第一次调用 fetch_pieces（头部探测）返回一个会导致 MP4ParsingError 的数据
-    #    - 第二次调用 fetch_pieces（尾部探测）返回有效数据
-    malformed_head_data = b'\x00\x00\x00\x08ftypmp42\x00\x00\x01\x00mdat' # mdat box 声明的大小超过数据本身
-    # 一个结构有效（声明大小与实际大小一致）的虚拟 moov box
-    valid_moov_data = b'\x00\x00\x00\x18moov' + b'\x00' * 16
+    # 2. 设置场景数据
+    # 一个部分的 moov box，头部声明大小为 1000，但我们只有 50 字节
+    partial_moov_data = b'\x00\x00\x03\xe8moov' + b'\x01' * 42 # 头部(8) + 内容(42) = 50 字节
+    # 一个完整的 moov box，用于模拟第二次下载的结果
+    full_moov_data = b'\x00\x00\x03\xe8moov' + b'\xff' * (1000 - 8)
 
-    # 使用 side_effect 来模拟多次调用的不同返回值
+    # 模拟 fetch_pieces 的行为:
+    # - 第一次调用（头部探测）返回部分数据
+    # - 第二次调用（为获取完整 moov）返回完整数据
     service.client.fetch_pieces.side_effect = [
-        {0: malformed_head_data}, # 头部探测的数据
-        {100: valid_moov_data}    # 尾部探测的数据
+        {0: partial_moov_data},
+        {1: full_moov_data}
     ]
 
     # 模拟 _assemble_data_from_pieces 的行为
     def mock_assemble(pieces_data, *args):
         if 0 in pieces_data:
-            return malformed_head_data
-        if 100 in pieces_data:
-            return valid_moov_data
+            return partial_moov_data
+        if 1 in pieces_data:
+            return full_moov_data
         return b""
 
-    # 使用 patch.object 来临时替换实例上的方法
+    # 3. 使用 patch.object 来临时替换实例上的方法并执行
     with patch.object(service, '_assemble_data_from_pieces', side_effect=mock_assemble):
-        # 3. 执行被测试的函数
-        # 我们期望它能成功返回，而不是抛出 MoovFetchError
-        try:
-            result_moov_data = await service._get_moov_atom_data(mock_handle, 0, 1024*1024, 16384, "test_hash")
-            # 4. 断言
-            # 验证返回的是尾部探测到的数据
-            assert result_moov_data == valid_moov_data
-            # 验证 fetch_pieces 被调用了两次（一次头部，一次尾部）
-            assert service.client.fetch_pieces.call_count == 2
-        except MoovNotFoundError:
-            # 在这个测试中，如果找不到 moov，也算作失败，因为它应该在尾部找到
-            pytest.fail("即使在尾部探测中也未能找到 moov atom。")
+        result_moov_data = await service._get_moov_atom_data(mock_handle, 0, 2000, 512, "partial_moov_hash")
+
+    # 4. 断言
+    # 验证返回的是完整的 moov 数据
+    assert result_moov_data == full_moov_data
+    # 验证 fetch_pieces 被调用了两次
+    assert service.client.fetch_pieces.call_count == 2
+    # 验证第二次调用是去获取完整的 moov box (大小为 1000)
+    second_call_args = service.client.fetch_pieces.call_args_list[1]
+    # (handle, pieces_to_fetch, timeout=...)
+    pieces_to_fetch = second_call_args[0][1]
+    # 假设 box 在偏移量 0 处找到，piece_length=512。大小为1000的box会跨越 piece 0 和 1。
+    assert pieces_to_fetch == [0, 1]
