@@ -1,53 +1,81 @@
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Response
+# -*- coding: utf-8 -*-
+"""
+主应用程序文件，包含了所有 FastAPI 的 API 端点。
+这是分布式截图服务的调度器组件。
+"""
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Response, Query
 from sqlalchemy.orm import Session
 from typing import Optional
 import datetime
 import os
 import shutil
-import json
 import base64
+import logging
 
 from . import crud, models, schemas
 from .database import SessionLocal, engine
 
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# --- 数据库初始化 ---
+# 在应用启动时，根据定义的模型创建所有数据库表。
 models.Base.metadata.create_all(bind=engine)
 
+# --- FastAPI 应用实例 ---
 app = FastAPI(
-    title="Distributed Screenshot Scheduler",
-    description="The central scheduler for managing and distributing screenshot tasks.",
+    title="分布式截图调度器",
+    description="用于管理和分发截图任务的中心调度服务。",
     version="0.1.0",
 )
 
+# --- 依赖项 ---
 def get_db():
+    """
+    一个 FastAPI 依赖项，用于在每个请求的生命周期内提供数据库会话。
+    它确保数据库会话在使用后总是被关闭。
+    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-@app.get("/", tags=["General"])
-def read_root():
-    """A simple health check endpoint."""
-    return {"message": "Screenshot Scheduler is running"}
+# --- API 端点 ---
 
-@app.post("/tasks/", response_model=schemas.Task, status_code=status.HTTP_200_OK, tags=["Tasks"])
+@app.get("/", tags=["通用"])
+def read_root():
+    """一个简单的健康检查端点，用于确认服务正在运行。"""
+    return {"message": "截图调度器正在运行"}
+
+@app.post("/tasks/", response_model=schemas.Task, status_code=status.HTTP_200_OK, tags=["任务管理"])
 async def create_or_reactivate_task(
     response: Response,
-    infohash: str = Form(..., max_length=40),
-    torrent_file: Optional[UploadFile] = File(None),
+    infohash: str = Form(..., max_length=40, description="任务的 Infohash"),
+    torrent_file: Optional[UploadFile] = File(None, description="可选的 .torrent 元数据文件"),
     db: Session = Depends(get_db)
 ):
+    """
+    创建新任务或重新激活一个已存在的任务。
+    - 如果任务已存在且状态为 pending, working, 或 success，则直接返回任务信息。
+    - 如果任务为 permanent_failure，则拒绝请求。
+    - 如果任务为 recoverable_failure，则将其状态重置为 pending 并返回。
+    - 如果任务不存在，则创建新任务。
+    """
     db_task = crud.get_task_by_infohash(db, infohash=infohash)
     if db_task:
         if db_task.status in ["pending", "working", "success"]:
             return db_task
         elif db_task.status == "permanent_failure":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task has permanently failed and cannot be resubmitted.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="任务已永久失败，无法重新提交。")
         elif db_task.status == "recoverable_failure":
             db_task.status = "pending"
             db.commit()
             db.refresh(db_task)
             return db_task
+
+    # 如果是新任务，设置响应状态码为 201 Created
     response.status_code = status.HTTP_201_CREATED
     if torrent_file:
         METADATA_DIR = "temp_metadata"
@@ -55,23 +83,26 @@ async def create_or_reactivate_task(
         file_path = os.path.join(METADATA_DIR, f"{infohash}.torrent")
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(torrent_file.file, buffer)
+
     new_task = crud.create_task(db=db, task=schemas.TaskCreate(infohash=infohash))
     return new_task
 
-@app.get("/tasks/next", response_model=Optional[schemas.NextTaskResponse], tags=["Tasks"])
-def get_next_task(worker_id: str, db: Session = Depends(get_db)):
+@app.get("/tasks/next", response_model=Optional[schemas.NextTaskResponse], tags=["任务管理"])
+def get_next_task(worker_id: str = Query(..., description="请求任务的工作节点ID"), db: Session = Depends(get_db)):
     """
     为工作节点获取下一个待处理的任务。
-    此端点现在从数据库中直接读取 resume_data，而不是从临时文件中读取。
+    此端点会原子性地查询并分配一个 'pending' 状态的任务。
+    如果任务有关联的恢复数据 (resume_data)，则会优先提供恢复数据。
+    否则，如果存在元数据文件，则提供元数据文件。
     """
     METADATA_DIR = "temp_metadata"
     task = crud.get_and_assign_next_task(db, worker_id=worker_id)
     if not task:
-        return None
+        return None  # 返回 204 No Content
 
     response_data = {"infohash": task.infohash}
     if task.resume_data:
-        self.log.info("在任务 %s 中发现恢复数据，将其发送给工作节点。", task.infohash)
+        log.info("在任务 %s 中发现恢复数据，将其发送给工作节点 %s。", task.infohash, worker_id)
         response_data["resume_data"] = task.resume_data
         # 清除恢复数据，因为它是一次性的
         task.resume_data = None
@@ -83,22 +114,25 @@ def get_next_task(worker_id: str, db: Session = Depends(get_db)):
             with open(metadata_path, "rb") as f:
                 metadata_bytes = f.read()
                 response_data["metadata"] = base64.b64encode(metadata_bytes).decode('ascii')
-            # 考虑在成功分配后删除元数据文件，以防磁盘空间膨胀
+            # 成功分配后删除元数据文件，以防磁盘空间膨胀
             os.remove(metadata_path)
 
     return schemas.NextTaskResponse(**response_data)
 
-@app.get("/tasks/{infohash}", response_model=schemas.Task, tags=["Tasks"])
+@app.get("/tasks/{infohash}", response_model=schemas.Task, tags=["任务管理"])
 def read_task(infohash: str, db: Session = Depends(get_db)):
+    """根据 Infohash 查询特定任务的状态和详情。"""
     db_task = crud.get_task_by_infohash(db, infohash=infohash)
     if db_task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail="任务未找到")
     return db_task
 
-@app.post("/workers/register", response_model=schemas.Worker, tags=["Workers"])
+@app.post("/workers/register", response_model=schemas.Worker, tags=["工作节点管理"])
 def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db)):
+    """注册一个新的工作节点或更新一个已存在节点的状态。"""
     db_worker = crud.get_worker_by_id(db, worker_id=worker.worker_id)
     if db_worker:
+        # 如果工作节点已存在，则更新其最后心跳时间和状态
         db_worker.last_seen_at = datetime.datetime.utcnow()
         db_worker.status = 'idle'
         db.commit()
@@ -106,40 +140,46 @@ def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db))
         return db_worker
     return crud.create_worker(db=db, worker=worker)
 
-@app.post("/workers/heartbeat", response_model=schemas.Worker, tags=["Workers"])
+@app.post("/workers/heartbeat", response_model=schemas.Worker, tags=["工作节点管理"])
 def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(get_db)):
+    """接收工作节点的心跳，更新其状态和最后在线时间。"""
     db_worker = crud.update_worker_status(db, worker_id=heartbeat.worker_id, status=heartbeat.status)
     if db_worker is None:
-        raise HTTPException(status_code=404, detail="Worker not found. Please register first.")
+        raise HTTPException(status_code=404, detail="工作节点未找到，请先注册。")
     return db_worker
 
-@app.post("/screenshots/{infohash}", response_model=schemas.Task, tags=["Screenshots"])
-async def upload_screenshot(infohash: str, db: Session = Depends(get_db), file: UploadFile = File(...)):
+@app.post("/screenshots/{infohash}", response_model=schemas.Task, tags=["截图管理"])
+async def upload_screenshot(
+    infohash: str,
+    db: Session = Depends(get_db),
+    file: UploadFile = File(..., description="JPEG 格式的截图文件")
+):
     """
-    Uploads a screenshot and records it for the associated task in a single atomic operation.
+    接收工作节点上传的截图文件，并将其与任务关联。
+    此操作会原子性地将截图文件名记录到任务的数据库条目中。
     """
     save_dir = f"screenshots_output/{infohash}"
     os.makedirs(save_dir, exist_ok=True)
     file_path = os.path.join(save_dir, file.filename)
 
-    # Save the uploaded file
+    # 保存上传的文件到服务器
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Record the screenshot in the database
+    # 在数据库中记录截图信息
     db_task = crud.record_screenshot(db, infohash=infohash, filename=file.filename)
     if db_task is None:
-        # If the task doesn't exist, we should probably remove the orphaned file
+        # 如果任务不存在，这是一个异常情况，删除已上传的孤立文件
         os.remove(file_path)
-        raise HTTPException(status_code=404, detail="Task not found for this screenshot.")
+        raise HTTPException(status_code=404, detail="未找到与此截图关联的任务。")
 
     return db_task
 
-@app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["Tasks"])
+@app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["任务管理"])
 async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db)):
     """
     更新一个任务的最终状态。
-    如果提供了 resume_data，它将被直接存储在数据库中，而不是保存在临时文件里。
+    如果提供了 resume_data，它将被直接存储在数据库中，用于未来的任务恢复。
     """
     try:
         db_task = crud.update_task_status(
@@ -153,6 +193,5 @@ async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusU
             raise HTTPException(status_code=404, detail="任务未找到")
         return db_task
     except Exception as e:
-        # 添加日志记录，以便在数据库操作失败时进行调试
-        # log.error("更新任务状态时数据库出错: %s", e)
-        raise HTTPException(status_code=500, detail=f"更新任务状态时发生内部错误: {e}")
+        log.error("更新任务 %s 状态时发生数据库错误: %s", infohash, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"更新任务状态时发生内部错误。")

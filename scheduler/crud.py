@@ -1,17 +1,30 @@
+# -*- coding: utf-8 -*-
+"""
+本模块包含了所有与数据库交互的 CRUD (Create, Read, Update, Delete) 操作函数。
+这些函数封装了 SQLAlchemy 的查询逻辑，供 API 端点调用。
+"""
 import datetime
 from sqlalchemy.orm import Session
 from typing import Optional
 from . import models, schemas
 
-def get_task_by_infohash(db: Session, infohash: str):
+def get_task_by_infohash(db: Session, infohash: str) -> Optional[models.Task]:
     """
-    Retrieves a task from the database by its infohash.
+    根据 infohash 从数据库中检索任务。
+
+    :param db: 数据库会话。
+    :param infohash: 要查询的任务的 infohash。
+    :return: 找到的 Task 对象，如果不存在则返回 None。
     """
     return db.query(models.Task).filter(models.Task.infohash == infohash).first()
 
-def create_task(db: Session, task: schemas.TaskCreate):
+def create_task(db: Session, task: schemas.TaskCreate) -> models.Task:
     """
-    Creates a new task in the database.
+    在数据库中创建一个新任务。
+
+    :param db: 数据库会话。
+    :param task: 包含新任务信息的 Pydantic schema 对象。
+    :return: 新创建的 Task 对象。
     """
     db_task = models.Task(infohash=task.infohash)
     db.add(db_task)
@@ -19,15 +32,23 @@ def create_task(db: Session, task: schemas.TaskCreate):
     db.refresh(db_task)
     return db_task
 
-def get_worker_by_id(db: Session, worker_id: str):
+def get_worker_by_id(db: Session, worker_id: str) -> Optional[models.Worker]:
     """
-    Retrieves a worker from the database by its worker_id.
+    根据 worker_id 从数据库中检索工作节点。
+
+    :param db: 数据库会话。
+    :param worker_id: 要查询的工作节点的ID。
+    :return: 找到的 Worker 对象，如果不存在则返回 None。
     """
     return db.query(models.Worker).filter(models.Worker.worker_id == worker_id).first()
 
-def create_worker(db: Session, worker: schemas.WorkerCreate):
+def create_worker(db: Session, worker: schemas.WorkerCreate) -> models.Worker:
     """
-    Creates a new worker in the database.
+    在数据库中注册一个新的工作节点。
+
+    :param db: 数据库会话。
+    :param worker: 包含新工作节点信息的 Pydantic schema 对象。
+    :return: 新创建的 Worker 对象。
     """
     db_worker = models.Worker(worker_id=worker.worker_id, status=worker.status)
     db.add(db_worker)
@@ -35,9 +56,14 @@ def create_worker(db: Session, worker: schemas.WorkerCreate):
     db.refresh(db_worker)
     return db_worker
 
-def update_worker_status(db: Session, worker_id: str, status: str):
+def update_worker_status(db: Session, worker_id: str, status: str) -> Optional[models.Worker]:
     """
-    Updates the status and last_seen_at timestamp for a worker.
+    更新一个工作节点的状态和最后心跳时间。
+
+    :param db: 数据库会话。
+    :param worker_id: 要更新的工作节点的ID。
+    :param status: 工作节点的新状态。
+    :return: 更新后的 Worker 对象，如果工作节点不存在则返回 None。
     """
     db_worker = get_worker_by_id(db, worker_id=worker_id)
     if db_worker:
@@ -47,12 +73,16 @@ def update_worker_status(db: Session, worker_id: str, status: str):
         db.refresh(db_worker)
     return db_worker
 
-def get_and_assign_next_task(db: Session, worker_id: str):
+def get_and_assign_next_task(db: Session, worker_id: str) -> Optional[models.Task]:
     """
-    Atomically fetches the next pending task and assigns it to the given worker.
-    Uses a pessimistic lock (SELECT ... FOR UPDATE) to prevent race conditions.
+    原子性地获取下一个待处理任务，并将其分配给指定的工作节点。
+    使用悲观锁 (SELECT ... FOR UPDATE) 来防止多个工作节点获取到同一个任务的竞态条件。
+
+    :param db: 数据库会话。
+    :param worker_id: 请求任务的工作节点的ID。
+    :return: 被分配的任务对象，如果没有待处理任务则返回 None。
     """
-    # The .with_for_update() call is crucial for locking
+    # .with_for_update() 是实现行级锁的关键
     db_task = db.query(models.Task).filter(models.Task.status == 'pending').order_by(models.Task.created_at).with_for_update().first()
 
     if db_task:
@@ -63,10 +93,19 @@ def get_and_assign_next_task(db: Session, worker_id: str):
 
     return db_task
 
-def update_task_status(db: Session, infohash: str, status: str, message: Optional[str] = None, resume_data: Optional[dict] = None):
+def update_task_status(
+    db: Session, infohash: str, status: str, message: Optional[str] = None, resume_data: Optional[dict] = None
+) -> Optional[models.Task]:
     """
-    更新任务的状态、结果消息和可选的恢复数据。
-    当任务完成（成功或失败）时，也会清除分配的工作节点ID。
+    更新任务的最终状态、结果消息和可选的恢复数据。
+    当任务完成（成功或永久失败）或进入可恢复失败状态时，会清除分配的工作节点ID。
+
+    :param db: 数据库会话。
+    :param infohash: 要更新的任务的 infohash。
+    :param status: 任务的新状态。
+    :param message: 相关的结果消息。
+    :param resume_data: 用于任务恢复的上下文数据。
+    :return: 更新后的 Task 对象，如果任务不存在则返回 None。
     """
     db_task = get_task_by_infohash(db, infohash=infohash)
     if db_task:
@@ -83,22 +122,31 @@ def update_task_status(db: Session, infohash: str, status: str, message: Optiona
         db.refresh(db_task)
     return db_task
 
-def record_screenshot(db: Session, infohash: str, filename: str):
+def record_screenshot(db: Session, infohash: str, filename: str) -> Optional[models.Task]:
     """
-    Appends a successfully generated screenshot's filename to a task's record.
+    将一个成功生成的截图文件名附加到任务的记录中。
+    此操作通过行级锁保证原子性，可以防止竞态条件。
+
+    :param db: 数据库会话。
+    :param infohash: 截图所属任务的 infohash。
+    :param filename: 要记录的截图文件名。
+    :return: 更新后的 Task 对象，如果任务不存在则返回 None。
     """
-    db_task = get_task_by_infohash(db, infohash=infohash)
+    # 使用 with_for_update() 对任务行施加悲观锁。
+    # 这确保了从读取 successful_screenshots 字段到更新它的整个过程是原子的，
+    # 可以防止多个并发请求同时修改该字段时导致的数据丢失问题。
+    db_task = db.query(models.Task).filter(models.Task.infohash == infohash).with_for_update().first()
+
     if db_task:
-        if db_task.successful_screenshots:
-            # Note: This is not an atomic operation and can lead to race conditions
-            # in high-concurrency scenarios. A more robust solution would use
-            # database-specific JSON functions or a separate table.
-            current_screenshots = list(db_task.successful_screenshots)
-            if filename not in current_screenshots:
-                current_screenshots.append(filename)
-                db_task.successful_screenshots = current_screenshots
-        else:
-            db_task.successful_screenshots = [filename]
+        # 如果字段为 None，则初始化为一个空列表
+        current_screenshots = list(db_task.successful_screenshots) if db_task.successful_screenshots else []
+
+        if filename not in current_screenshots:
+            current_screenshots.append(filename)
+            db_task.successful_screenshots = current_screenshots
+
+        # 提交事务后，锁会自动释放
         db.commit()
         db.refresh(db_task)
+
     return db_task

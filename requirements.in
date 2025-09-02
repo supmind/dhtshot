@@ -17,6 +17,8 @@ pydantic-settings
 pytest
 pytest-asyncio
 pytest-cov
+respx
+numpy
 
 # For web server (scheduler)
 fastapi
