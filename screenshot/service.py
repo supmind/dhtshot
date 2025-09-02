@@ -189,18 +189,28 @@ class ScreenshotService:
                 head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
                 head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
                 stream = io.BytesIO(head_data)
-                for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
-                    if box_type == 'moov':
-                        # 如果探测到的数据不完整，则下载完整的 'moov' box
-                        if len(partial_box_data) < box_size:
-                            full_moov_offset_in_torrent = video_file_offset + box_offset
-                            needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
-                            moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
-                            return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
-                        return partial_box_data
-                    if box_type == 'mdat': break  # 如果先找到 'mdat'，说明 'moov' 在尾部，停止头部探测
-        except (MP4ParsingError, TorrentClientError) as e:
-            raise MoovFetchError(f"在 moov 头部探测期间失败: {e}", infohash_hex) from e
+                try:
+                    for box_type, partial_box_data, box_offset, box_size in self._parse_mp4_boxes(stream):
+                        if box_type == 'moov':
+                            # 如果探测到的数据不完整，则下载完整的 'moov' box
+                            if len(partial_box_data) < box_size:
+                                full_moov_offset_in_torrent = video_file_offset + box_offset
+                                needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, box_size, piece_length)
+                                moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                                return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, box_size, piece_length)
+                            return partial_box_data
+                        if box_type == 'mdat':
+                            # 如果先找到 'mdat'，说明 'moov' 很可能在尾部，停止头部探测
+                            self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
+                            break
+                except MP4ParsingError as e:
+                    # 捕获解析错误，特别是当 box 声明的大小超出我们下载的探测数据范围时。
+                    # 这是一个强烈的信号，表明 'moov' 在文件末尾，因此我们不应失败，而是继续进行尾部探测。
+                    self.log.warning("[%s] 在头部探测时发生MP4解析错误 (这可能是正常的): %s", infohash_hex, e)
+
+        except TorrentClientError as e:
+            # 捕获 Torrent 客户端本身的错误（例如，超时）
+            raise MoovFetchError(f"在 moov 头部探测期间获取 piece 失败: {e}", infohash_hex) from e
 
         # --- 阶段2: 探测文件尾部 ---
         try:

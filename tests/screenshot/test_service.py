@@ -191,3 +191,49 @@ async def test_handle_task_successful_run(mock_generate, service, mock_callbacks
     result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
     assert result.get("status") == "success"
     mock_generate.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_get_moov_atom_handles_parsing_error_in_head_probe(service):
+    """
+    测试 _get_moov_atom_data 在头部探测遇到 MP4ParsingError 时，
+    是否能优雅地回退到尾部探测，而不是直接失败。
+    """
+    # 1. 模拟 service 的依赖
+    mock_handle = MagicMock()
+    service.client.fetch_pieces = AsyncMock()
+
+    # 2. 设置场景：
+    #    - 第一次调用 fetch_pieces（头部探测）返回一个会导致 MP4ParsingError 的数据
+    #    - 第二次调用 fetch_pieces（尾部探测）返回有效数据
+    malformed_head_data = b'\x00\x00\x00\x08ftypmp42\x00\x00\x01\x00mdat' # mdat box 声明的大小超过数据本身
+    # 一个结构有效（声明大小与实际大小一致）的虚拟 moov box
+    valid_moov_data = b'\x00\x00\x00\x18moov' + b'\x00' * 16
+
+    # 使用 side_effect 来模拟多次调用的不同返回值
+    service.client.fetch_pieces.side_effect = [
+        {0: malformed_head_data}, # 头部探测的数据
+        {100: valid_moov_data}    # 尾部探测的数据
+    ]
+
+    # 模拟 _assemble_data_from_pieces 的行为
+    def mock_assemble(pieces_data, *args):
+        if 0 in pieces_data:
+            return malformed_head_data
+        if 100 in pieces_data:
+            return valid_moov_data
+        return b""
+
+    # 使用 patch.object 来临时替换实例上的方法
+    with patch.object(service, '_assemble_data_from_pieces', side_effect=mock_assemble):
+        # 3. 执行被测试的函数
+        # 我们期望它能成功返回，而不是抛出 MoovFetchError
+        try:
+            result_moov_data = await service._get_moov_atom_data(mock_handle, 0, 1024*1024, 16384, "test_hash")
+            # 4. 断言
+            # 验证返回的是尾部探测到的数据
+            assert result_moov_data == valid_moov_data
+            # 验证 fetch_pieces 被调用了两次（一次头部，一次尾部）
+            assert service.client.fetch_pieces.call_count == 2
+        except MoovNotFoundError:
+            # 在这个测试中，如果找不到 moov，也算作失败，因为它应该在尾部找到
+            pytest.fail("即使在尾部探测中也未能找到 moov atom。")
