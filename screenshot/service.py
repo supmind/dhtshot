@@ -473,6 +473,7 @@ class ScreenshotService:
             self.client.unsubscribe_pieces(infohash_hex, local_queue)
 
         successful_generations = 0
+        successful_kf_indices = set()
         # Create a list of keyframe indices from the map to iterate over, as the results correspond to this order.
         kf_indices = list(generation_tasks_map.keys())
         for i, result in enumerate(results):
@@ -481,8 +482,10 @@ class ScreenshotService:
                 self.log.error(f"生成截图时发生错误 (关键帧索引: {kf_index}): {result}", exc_info=result)
             else:
                 successful_generations += 1
+                successful_kf_indices.add(kf_index)
 
-        task_state.setdefault('processed_keyframes', set()).update(generation_tasks_map.keys())
+        # Bug Fix: Only update processed_keyframes with the ones that actually succeeded.
+        task_state.setdefault('processed_keyframes', set()).update(successful_kf_indices)
 
         if successful_generations < len(remaining_keyframes):
             # 如果部分成功，也认为是可恢复的失败，以便可以重试失败的部分

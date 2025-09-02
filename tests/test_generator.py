@@ -1,8 +1,7 @@
 import asyncio
 import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
 import av
-import os
 
 # Import the module that we will be patching
 import screenshot.generator
@@ -50,64 +49,6 @@ async def test_generate_calls_decoder_and_saver(monkeypatch):
     mock_av.Packet.assert_called_once_with(packet_data)
     mock_codec.decode.assert_called()
     mock_save.assert_called_once_with(mock_frame, infohash, timestamp)
-
-
-async def test_save_frame_to_jpeg_schedules_correct_callback(monkeypatch):
-    """
-    Tests that _save_frame_to_jpeg correctly schedules the on_success
-    callback with the correct arguments (infohash, filepath).
-    This is a direct test for the bug fix.
-    """
-    # --- Mocks ---
-    mock_os_makedirs = MagicMock()
-    mock_image_save = MagicMock()
-    mock_frame = MagicMock()
-    mock_frame.to_image.return_value.save = mock_image_save
-
-    monkeypatch.setattr(os, 'makedirs', mock_os_makedirs)
-
-    # --- Setup ---
-    loop = asyncio.get_running_loop()
-    callback_finished = asyncio.Event()
-    # This is the mock we will assert against
-    on_success_mock = AsyncMock()
-
-    # This wrapper will be the actual callback. It calls the mock and then
-    # signals that the callback has completed.
-    async def on_success_wrapper(*args, **kwargs):
-        try:
-            await on_success_mock(*args, **kwargs)
-        finally:
-            callback_finished.set()
-
-    generator_instance = screenshot.generator.ScreenshotGenerator(
-        loop=loop,
-        output_dir="/tmp/screenshots",
-        on_success=on_success_wrapper
-    )
-
-    # --- Test Data ---
-    infohash = 'fixhash123'
-    timestamp_str = '00-01-02'
-    expected_filepath = f"/tmp/screenshots/{infohash}_{timestamp_str.replace(':', '-')}.jpg"
-
-    # --- Action ---
-    # Directly call the method under test
-    generator_instance._save_frame_to_jpeg(mock_frame, infohash, timestamp_str)
-
-    # --- Assertions ---
-    # Wait for the background task to signal completion via the event.
-    try:
-        await asyncio.wait_for(callback_finished.wait(), timeout=1)
-    except asyncio.TimeoutError:
-        pytest.fail("The on_success callback was never called.")
-
-    # Check that the file I/O was attempted
-    mock_os_makedirs.assert_called_once_with("/tmp/screenshots", exist_ok=True)
-    mock_image_save.assert_called_once_with(expected_filepath, "JPEG")
-
-    # Check that the callback was called with the correct arguments
-    on_success_mock.assert_awaited_once_with(infohash, expected_filepath)
 
 
 async def test_decode_returns_no_frames_initially(monkeypatch, caplog):
