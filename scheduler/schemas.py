@@ -47,6 +47,11 @@ class NextTaskResponse(BaseModel):
     metadata: Optional[bytes] = Field(None, description="Torrent 的元数据文件内容 (如果可用)。")
     resume_data: Optional[dict] = Field(None, description="用于恢复失败任务的上下文数据 (如果可用)。")
 
+class TaskList(BaseModel):
+    """用于分页列出所有任务的响应体 Schema。"""
+    total: int = Field(..., description="数据库中任务的总数。")
+    tasks: List[Task] = Field(..., description="当前页的任务列表。")
+
 
 # --- 工作节点相关的 Schemas ---
 

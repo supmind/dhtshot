@@ -18,6 +18,19 @@ def get_task_by_infohash(db: Session, infohash: str) -> Optional[models.Task]:
     """
     return db.query(models.Task).filter(models.Task.infohash == infohash).first()
 
+def get_tasks(db: Session, skip: int = 0, limit: int = 100) -> tuple[int, list[models.Task]]:
+    """
+    分页检索任务列表。
+
+    :param db: 数据库会话。
+    :param skip: 要跳过的记录数。
+    :param limit: 要返回的最大记录数。
+    :return: 一个元组，包含任务总数和当前页的任务对象列表。
+    """
+    total = db.query(models.Task).count()
+    tasks = db.query(models.Task).order_by(models.Task.created_at.desc()).offset(skip).limit(limit).all()
+    return total, tasks
+
 def create_task(db: Session, task: schemas.TaskCreate) -> models.Task:
     """
     在数据库中创建一个新任务。

@@ -182,3 +182,28 @@ def test_update_task_status_endpoint(client):
     data = response.json()
     assert data["status"] == "success"
     assert data["result_message"] == "All done!"
+
+def test_list_all_tasks_with_pagination(client):
+    """测试 /tasks/all/ 分页端点是否能正常工作。"""
+    # 1. 在数据库中创建 25 个任务
+    db = TestingSessionLocal()
+    for i in range(25):
+        # 使用 f-string 创建唯一的 infohash
+        crud.create_task(db, schemas.TaskCreate(infohash=f"hash_{i:02d}"))
+    db.close()
+
+    # 2. 调用 API，请求第 2 页，每页 10 个
+    response = client.get("/tasks/all/", params={"skip": 10, "limit": 10})
+    assert response.status_code == 200
+
+    data = response.json()
+
+    # 3. 验证返回的数据结构和内容
+    assert data["total"] == 25
+    assert len(data["tasks"]) == 10
+
+    # 4. 验证分页逻辑是否正确
+    # 因为是按创建时间降序排序，所以第 11 个任务 (index 10) 应该是 "hash_14"
+    # (hash_24, hash_23, ..., hash_15 | hash_14, ..., hash_5 | hash_4, ...)
+    assert data["tasks"][0]["infohash"] == "hash_14"
+    assert data["tasks"][-1]["infohash"] == "hash_05"
