@@ -8,6 +8,7 @@
 """
 import logging
 import os
+import asyncio
 from typing import Optional
 import av  # PyAV 库，用于音视频处理
 
@@ -23,14 +24,16 @@ class ScreenshotGenerator:
     此类封装了与 PyAV 的所有交互。它接收解码所需的数据（编解码器名称、extradata 和数据包），
     并在一个独立的线程中执行解码和文件保存，以防止阻塞主事件循环。
     """
-    def __init__(self, loop, output_dir='./screenshots_output'):
+    def __init__(self, loop, output_dir='./screenshots_output', on_success=None):
         """
         初始化生成器。
         :param loop: asyncio 事件循环，用于调度线程池任务。
         :param output_dir: 保存生成截图的目录。
+        :param on_success: An async callback to be called with the filepath upon successful save.
         """
         self.loop = loop
         self.output_dir = output_dir
+        self.on_success = on_success
 
     def _save_frame_to_jpeg(self, frame: av.VideoFrame, infohash_hex: str, timestamp_str: str):
         """
@@ -45,6 +48,9 @@ class ScreenshotGenerator:
             # PyAV 的 to_image() 方法依赖于 Pillow 库来创建图像对象
             frame.to_image().save(output_filename, "JPEG")
             log.info("成功：截图已保存至 %s", output_filename)
+            if self.on_success:
+                # Schedule the callback on the main event loop from this worker thread
+                self.loop.call_soon_threadsafe(asyncio.create_task, self.on_success(output_filename))
         except Exception:
             log.exception("保存帧到文件 %s 时发生错误。", output_filename)
             raise

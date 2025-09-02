@@ -31,7 +31,7 @@ from .config import Settings
 
 class ScreenshotService:
     """协调截图生成过程的核心服务类。"""
-    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None):
+    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None):
         self.loop = loop or asyncio.get_event_loop()
         self.settings = settings
         self.log = logging.getLogger("ScreenshotService")
@@ -44,7 +44,11 @@ class ScreenshotService:
             save_path=self.settings.torrent_save_path,
             metadata_timeout=self.settings.metadata_timeout
         )
-        self.generator = ScreenshotGenerator(loop=self.loop, output_dir=self.settings.output_dir)
+        self.generator = ScreenshotGenerator(
+            loop=self.loop,
+            output_dir=self.settings.output_dir,
+            on_success=screenshot_callback
+        )
         self.status_callback = status_callback
         self.active_tasks = set()
         self._submit_lock = asyncio.Lock()

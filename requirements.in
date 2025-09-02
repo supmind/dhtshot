@@ -17,3 +17,13 @@ pydantic-settings
 pytest
 pytest-asyncio
 pytest-cov
+
+# For web server (scheduler)
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-multipart
+pysqlite3-binary
+
+# For worker
+aiohttp
