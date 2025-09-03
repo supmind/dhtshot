@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
+"""
+对 worker.py 的单元测试。
+"""
 import asyncio
 from contextlib import suppress
-from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock
+from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock, ANY
 
 import pytest
+from aiohttp import ClientSession
 
 import worker
 from config import Settings
@@ -12,108 +16,108 @@ from screenshot.service import ScreenshotService
 
 @pytest.fixture
 def mock_settings(tmp_path):
-    """Override settings for tests and set a default concurrency."""
+    """为测试提供一个 Settings 实例，并设置一个较小的队列上限。"""
     return Settings(
         scheduler_url="http://test-scheduler",
         output_dir=str(tmp_path),
-        worker_concurrency=1  # Default to 1 for simplicity in tests
+        worker_max_queue_size=5
     )
 
+@pytest.fixture
+def mock_client():
+    """提供一个 SchedulerAPIClient 的 AsyncMock 实例。"""
+    client = AsyncMock(spec=worker.SchedulerAPIClient)
+    client.get_next_task.side_effect = [None]  # 默认不返回任务
+    return client
 
-@pytest.mark.asyncio
-@patch('asyncio.sleep', new_callable=AsyncMock)
-@patch('worker.ScreenshotService', spec=True)
-@patch('worker.SchedulerAPIClient')
-async def test_worker_main_loop_fetches_task(MockAPIClient, MockScreenshotService, mock_sleep, mock_settings):
-    """
-    Test that the worker's main loop successfully registers, fetches a task,
-    and submits it to the ScreenshotService.
-    """
-    # --- Setup Mocks ---
-    mock_client = MockAPIClient.return_value
-    mock_client.register = AsyncMock(return_value=True)
-    mock_client.send_heartbeat = AsyncMock()
-    mock_client.get_next_task = AsyncMock(side_effect=[
-        {"infohash": "test_infohash", "metadata": None},
-        None
-    ])
-
-    mock_service = MockScreenshotService.return_value
-    mock_service.submit_task = AsyncMock()
-
-    # Use PropertyMock to simulate the `active_tasks` property.
-    type(mock_service).active_tasks = PropertyMock(return_value=set())
-    # Mock the new get_queue_size method.
-    mock_service.get_queue_size.return_value = 0
-
-    # --- Run Main Loop ---
-    main_task = asyncio.create_task(worker.main(session=MagicMock()))
-    await asyncio.sleep(0.01)
-    main_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await main_task
-
-    # --- Assertions ---
-    mock_client.register.assert_awaited_once()
-    assert mock_client.get_next_task.await_count == 2
-    mock_service.submit_task.assert_awaited_once_with(infohash="test_infohash", metadata=None)
-    mock_sleep.assert_called_once_with(worker.POLL_INTERVAL)
+@pytest.fixture
+def mock_service():
+    """提供一个 ScreenshotService 的 AsyncMock 实例。"""
+    service = AsyncMock(spec=ScreenshotService)
+    service.get_queue_size.return_value = 0
+    type(service).active_tasks = PropertyMock(return_value=set())
+    return service
 
 
 @pytest.mark.asyncio
+async def test_main_loop_fetches_task_when_queue_not_full(mock_settings, mock_client, mock_service):
+    """
+    测试：当服务队列大小低于上限时，主循环会获取一个新任务。
+    """
+    # --- 安排 ---
+    stop_event = asyncio.Event()
+    mock_service.get_queue_size.return_value = mock_settings.worker_max_queue_size - 1
+    mock_client.get_next_task.side_effect = [{"infohash": "test_hash"}, stop_event.set]
+
+    # --- 执行 ---
+    await worker.main_loop(stop_event, mock_client, mock_service, mock_settings)
+
+    # --- 断言 ---
+    mock_service.get_queue_size.assert_called()
+    mock_client.get_next_task.assert_called()
+    mock_service.submit_task.assert_awaited_once_with(infohash="test_hash")
+
+@pytest.mark.asyncio
 @patch('asyncio.sleep', new_callable=AsyncMock)
-@patch('worker.ScreenshotService', spec=True)
-@patch('worker.SchedulerAPIClient')
-async def test_worker_respects_concurrency_limit(MockAPIClient, MockScreenshotService, mock_sleep, mock_settings):
+async def test_main_loop_waits_when_queue_is_full(mock_sleep, mock_settings, mock_client, mock_service):
     """
-    Test that the worker does not fetch new tasks when it has reached its
-    concurrency limit.
+    测试：当服务队列大小达到上限时，主循环会等待。
     """
-    # --- Setup Mocks ---
-    # Correctly access the lowercase attribute.
-    mock_settings.worker_concurrency = 1
+    # --- 安排 ---
+    stop_event = asyncio.Event()
+    mock_service.get_queue_size.return_value = mock_settings.worker_max_queue_size
+    # 让 sleep 调用来停止循环，以验证 sleep 被调用了
+    mock_sleep.side_effect = stop_event.set
 
-    mock_client = MockAPIClient.return_value
-    mock_client.register = AsyncMock(return_value=True)
-    mock_client.send_heartbeat = AsyncMock()
-    mock_client.get_next_task = AsyncMock()
+    # --- 执行 ---
+    await worker.main_loop(stop_event, mock_client, mock_service, mock_settings)
 
-    mock_service = MockScreenshotService.return_value
-
-    active_tasks = {"some_active_task"}
-    type(mock_service).active_tasks = PropertyMock(return_value=active_tasks)
-    mock_service.get_queue_size.return_value = 0
-
-    # --- Run Main Loop ---
-    main_task = asyncio.create_task(worker.main(session=MagicMock()))
-    await asyncio.sleep(0.01)
-    main_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await main_task
-
-    # --- Assertions ---
-    mock_client.register.assert_awaited_once()
+    # --- 断言 ---
+    mock_service.get_queue_size.assert_called()
     mock_client.get_next_task.assert_not_awaited()
-    mock_sleep.assert_called_once_with(worker.POLL_INTERVAL)
-
+    mock_sleep.assert_awaited_once_with(worker.POLL_INTERVAL)
 
 @pytest.mark.asyncio
-@patch('worker.SchedulerAPIClient')
-async def test_on_task_finished_callback(MockAPIClient):
+async def test_on_task_finished_callback():
     """
-    Tests that the on_task_finished callback correctly calls the client's
-    update_task_status method.
+    测试：on_task_finished 回调函数能正确调用客户端的 update_task_status 方法。
     """
-    mock_client_instance = MockAPIClient.return_value
-    mock_client_instance.update_task_status = AsyncMock()
-
-    infohash = "test_hash"
-    status = "success"
-    message = "All good"
+    # --- 安排 ---
+    mock_client = AsyncMock(spec=worker.SchedulerAPIClient)
+    infohash, status, message = "test_hash", "success", "All good"
     resume_data = {"key": "value"}
 
-    await worker.on_task_finished(mock_client_instance, status, infohash, message, resume_data=resume_data)
+    # --- 执行 ---
+    await worker.on_task_finished(mock_client, status, infohash, message, resume_data=resume_data)
 
-    mock_client_instance.update_task_status.assert_awaited_once_with(
-        infohash, status, message, resume_data
+    # --- 断言 ---
+    mock_client.update_task_status.assert_awaited_once_with(infohash, status, message, resume_data)
+
+@pytest.mark.asyncio
+async def test_scheduler_api_client_send_heartbeat():
+    """
+    测试 SchedulerAPIClient.send_heartbeat 方法能构建并发送正确的负载。
+    """
+    # --- 安排 ---
+    mock_session = AsyncMock(spec=ClientSession)
+    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler")
+
+    mock_service = MagicMock(spec=ScreenshotService)
+    type(mock_service).active_tasks = PropertyMock(return_value={"t1", "t2", "t3"})
+    mock_service.get_queue_size.return_value = 1
+
+    # --- 执行 ---
+    await client.send_heartbeat("worker-id", mock_service, 50)
+
+    # --- 断言 ---
+    expected_payload = {
+        "worker_id": "worker-id",
+        "status": "busy",
+        "active_tasks_count": 2, # 3 (total) - 1 (queued) = 2 (processing)
+        "queue_size": 1,
+        "processed_tasks_count": 50
+    }
+    mock_session.post.assert_awaited_once_with(
+        "http://fake-scheduler/workers/heartbeat",
+        json=expected_payload
     )

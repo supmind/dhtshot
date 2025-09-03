@@ -229,3 +229,20 @@ async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
     pieces_to_fetch = second_call_args[0][1]
     # 假设 box 在偏移量 0 处找到，piece_length=512。大小为1000的box会跨越 piece 0 和 1。
     assert pieces_to_fetch == [0, 1]
+
+@pytest.mark.asyncio
+async def test_get_queue_size(service):
+    """测试 get_queue_size 方法是否能准确反映内部队列的大小。"""
+    # 1. 初始状态下，队列应为空
+    assert service.get_queue_size() == 0
+
+    # 2. 向队列中放入一些任务
+    await service.task_queue.put("task1")
+    await service.task_queue.put("task2")
+
+    # 3. 验证队列大小
+    assert service.get_queue_size() == 2
+
+    # 4. 取出一个任务后再次验证
+    _ = await service.task_queue.get()
+    assert service.get_queue_size() == 1

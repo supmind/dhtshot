@@ -61,6 +61,10 @@ class ScreenshotService:
         self.active_tasks = set()
         self._submit_lock = asyncio.Lock()
 
+    def get_queue_size(self) -> int:
+        """返回当前在服务内部队列中等待的任务数量。"""
+        return self.task_queue.qsize()
+
     async def run(self):
         """启动服务，包括底层的 Torrent 客户端和处理任务的工作协程。"""
         self.log.info("正在启动 ScreenshotService...")

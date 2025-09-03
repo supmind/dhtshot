@@ -137,50 +137,30 @@ async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: st
 
 # --- 主程序逻辑 ---
 
-async def heartbeat_loop(client: SchedulerAPIClient, service: ScreenshotService, processed_tasks_counter: dict):
+async def heartbeat_loop(
+    stop_event: asyncio.Event,
+    client: SchedulerAPIClient,
+    service: ScreenshotService,
+    processed_tasks_counter: dict
+):
     """一个独立的协程，定期向调度器发送心跳。"""
-    while True:
+    while not stop_event.is_set():
         await client.send_heartbeat(WORKER_ID, service, processed_tasks_counter['count'])
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
-async def main(session: aiohttp.ClientSession):
-    """工作节点的主函数，负责初始化和协调所有服务。"""
-    settings = Settings()
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-    processed_tasks_counter = {'count': 0}
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-
-    client = SchedulerAPIClient(session, settings.scheduler_url)
-
-    if not await client.register(WORKER_ID):
-        log.error("无法向调度器注册，程序退出。")
-        return
-
-    async def on_task_finished_with_counter(client: SchedulerAPIClient, status: str, infohash: str, message: str, **kwargs):
-        """当 ScreenshotService 完成一个任务时被调用的回调函数，并更新计数器。"""
-        if status == 'success':
-            processed_tasks_counter['count'] += 1
-            log.info(f"任务 {infohash} 成功完成。已处理任务总数: {processed_tasks_counter['count']}")
-        await on_task_finished(client, status, infohash, message, **kwargs)
-
-    status_cb = partial(on_task_finished_with_counter, client)
-    screenshot_cb = partial(on_screenshot_saved, client)
-
-    service = ScreenshotService(settings=settings, loop=loop, status_callback=status_cb, screenshot_callback=screenshot_cb)
-    await service.run()
-    log.info("ScreenshotService 已在后台运行。")
-
-    heartbeat_task = asyncio.create_task(heartbeat_loop(client, service, processed_tasks_counter))
-    log.info("心跳任务已启动。")
-
-    log.info("启动主任务轮询循环...")
+async def main_loop(
+    stop_event: asyncio.Event,
+    client: SchedulerAPIClient,
+    service: ScreenshotService,
+    settings: Settings
+):
+    """工作节点的主轮询循环，负责获取和提交任务。"""
     while not stop_event.is_set():
         try:
-            # Concurrency logic: keep fetching tasks as long as we are below the concurrency limit
-            if len(service.active_tasks) >= settings.WORKER_CONCURRENCY:
+            if service.get_queue_size() >= settings.worker_max_queue_size:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
@@ -190,27 +170,65 @@ async def main(session: aiohttp.ClientSession):
                 if metadata := task_data.get('metadata'):
                     task_data['metadata'] = base64.b64decode(metadata)
                 await service.submit_task(**task_data)
-                await asyncio.sleep(0.1) # Brief pause to prevent spamming the scheduler
+                await asyncio.sleep(0.1)
             else:
                 log.info("调度器中无更多可用任务，进入等待状态。")
                 await asyncio.sleep(POLL_INTERVAL)
-
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.error(f"主轮询循环发生意外错误: {e}", exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
 
+async def run_worker(session: aiohttp.ClientSession):
+    """设置并运行工作节点的所有组件。"""
+    settings = Settings()
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    processed_tasks_counter = {'count': 0}
 
-    log.info("收到停机信号，正在停止服务...")
-    heartbeat_task.cancel()
+    def _handle_signal():
+        log.info("接收到停机信号...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_signal)
+
+    client = SchedulerAPIClient(session, settings.scheduler_url)
+    if not await client.register(WORKER_ID):
+        log.error("无法向调度器注册，程序退出。")
+        return
+
+    async def on_task_finished_with_counter(*args, **kwargs):
+        if kwargs.get('status') == 'success':
+            processed_tasks_counter['count'] += 1
+        await on_task_finished(client, *args, **kwargs)
+
+    service = ScreenshotService(
+        settings=settings,
+        loop=loop,
+        status_callback=on_task_finished_with_counter,
+        screenshot_callback=partial(on_screenshot_saved, client)
+    )
+    await service.run()
+    log.info("ScreenshotService 已在后台运行。")
+
+    heartbeat = asyncio.create_task(heartbeat_loop(stop_event, client, service, processed_tasks_counter))
+    log.info("心跳任务已启动。")
+
+    log.info("启动主任务轮询循环...")
+    await main_loop(stop_event, client, service, settings)
+
+    log.info("正在停止服务...")
+    heartbeat.cancel()
     await service.stop()
     log.info("工作节点已成功关闭。")
+
 
 if __name__ == "__main__":
     async def run():
         async with aiohttp.ClientSession() as session:
-            await main(session)
+            await run_worker(session)
 
     try:
         asyncio.run(run())
