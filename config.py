@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     db_url: str = "sqlite:///./scheduler.db"
 
     # --- 工作节点设置 ---
-    num_workers: int = 100  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量
+    num_workers: int = 200  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量
     worker_idle_time: int = 30  # seconds
     worker_max_queue_size: int = 20  # 工作节点在暂停从调度器获取新任务前，其内部任务队列的最大长度
 
