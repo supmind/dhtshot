@@ -21,39 +21,52 @@ from contextlib import asynccontextmanager
 import tempfile
 
 from .errors import TorrentClientError, MetadataTimeoutError
+from config import Settings
 
 
 class TorrentClient:
     """
     一个 libtorrent 会话的异步包装器，用于处理 torrent 相关操作。
     """
-    def __init__(self, loop=None, save_path: str = None, metadata_timeout: int = 180):
+    def __init__(self, loop=None, settings: Settings = None):
         self.loop = loop or asyncio.get_event_loop()
         self.log = logging.getLogger("TorrentClient")
-        # 兼容性修复：如果未提供 save_path，则使用系统通用的临时目录
-        self.save_path = save_path or os.path.join(tempfile.gettempdir(), 'screenshot_service_torrents')
-        self.metadata_timeout = metadata_timeout
 
-        # libtorrent 会话设置，模拟一个常见的 BT 客户端
-        settings = {
-            'listen_interfaces': '0.0.0.0:6881',
+        # 如果没有提供 settings 对象，则使用默认值创建一个
+        app_settings = settings or Settings()
+
+        self.save_path = app_settings.torrent_save_path
+        self.metadata_timeout = app_settings.metadata_timeout
+
+        # libtorrent 会话设置，从应用配置中读取
+        settings_pack = {
+            # 基本设置
+            'listen_interfaces': app_settings.lt_listen_interfaces,
+            'user_agent': 'qBittorrent/4.5.2',
+            'peer_fingerprint': 'qB4520',
+            'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
             'enable_dht': True,
+
+            # 性能调优设置
+            'active_limit': app_settings.lt_active_limit,
+            'connections_limit': app_settings.lt_connections_limit,
+            'upload_rate_limit': app_settings.lt_upload_rate_limit,
+            'download_rate_limit': app_settings.lt_download_rate_limit,
+            'peer_connect_timeout': app_settings.lt_peer_connect_timeout,
+
+            # 缓存设置 (单位: 16KiB 块)
+            'cache_size': app_settings.lt_cache_size,
+
+            # 警报掩码
             'alert_mask': (
                 lt.alert_category.error |
                 lt.alert_category.status |
                 lt.alert_category.storage |
-                lt.alert_category.piece_progress 
+                lt.alert_category.piece_progress
             ),
-            'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
-            'user_agent': 'qBittorrent/4.5.2',
-            'peer_fingerprint': 'qB4520',
-                        # 性能调优设置
-            'active_limit': 120,
-            'connections_limit': 4096,
-            'peer_connect_timeout': 10,
         }
         # 会话及其对象不是线程安全的，需要锁来保护所有直接调用。
-        self._ses = lt.session(settings)
+        self._ses = lt.session(settings_pack)
         self._ses_lock = threading.Lock()
 
         self._thread = None

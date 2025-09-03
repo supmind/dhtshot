@@ -10,6 +10,7 @@ import asyncio
 
 from screenshot.client import TorrentClient
 from screenshot.errors import MetadataTimeoutError
+from config import Settings
 
 # 使用一个已知的、活跃度较高的 infohash 进行测试
 # 这是 Ubuntu 22.04.1 Desktop (64-bit) 的 torrent
@@ -25,7 +26,8 @@ async def test_torrent_client_fetches_metadata_and_piece():
     1. 获取元数据 (torrent info)。
     2. 下载并读取至少一个数据块 (piece 0)。
     """
-    client = TorrentClient(metadata_timeout=METADATA_FETCH_TIMEOUT)
+    settings = Settings(metadata_timeout=METADATA_FETCH_TIMEOUT)
+    client = TorrentClient(settings=settings)
     await client.start()
 
     handle = None

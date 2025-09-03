@@ -25,6 +25,17 @@ class Settings(BaseSettings):
     default_screenshots: int = 20
     target_interval_sec: int = 10
 
+    # --- Libtorrent 性能调优设置 ---
+    # 这些设置直接影响 libtorrent 会话的性能，对于高负载环境至关重要。
+    # 请根据您的硬件资源（CPU, 内存, 网络）和预期的负载来调整它们。
+    lt_listen_interfaces: str = "0.0.0.0:6881"  # libtorrent 监听的端口和网络接口
+    lt_active_limit: int = 500  # 同时处理的活动 torrent 最大数量
+    lt_connections_limit: int = 2000  # 全局最大连接数
+    lt_cache_size: int = 8192  # 磁盘 I/O 缓存大小，单位为 16KB 块 (例如 8192 * 16KB = 128MB)
+    lt_upload_rate_limit: int = 0  # 全局上传速率限制，单位 B/s (0 表示无限制)
+    lt_download_rate_limit: int = 0  # 全局下载速率限制，单位 B/s (0 表示无限制)
+    lt_peer_connect_timeout: int = 10  # 连接 peer 的超时时间（秒）
+
     # Timeouts for various operations
     metadata_timeout: int = 180  # 3 minutes
     moov_probe_timeout: int = 120  # 2 minutes

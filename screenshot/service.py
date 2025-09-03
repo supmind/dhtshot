@@ -49,8 +49,7 @@ class ScreenshotService:
 
         self.client = client or TorrentClient(
             loop=self.loop,
-            save_path=self.settings.torrent_save_path,
-            metadata_timeout=self.settings.metadata_timeout
+            settings=self.settings
         )
         self.generator = ScreenshotGenerator(
             loop=self.loop,
