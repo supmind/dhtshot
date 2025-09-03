@@ -117,11 +117,17 @@ class SchedulerAPIClient:
         """定期发送心跳以保持工作节点活动状态。"""
         url = f"{self._url}/workers/heartbeat"
         status = "busy" if service.active_tasks else "idle"
+
+        # 从 ScreenshotService 实例动态获取队列大小和活动任务数
+        queue_size = service.task_queue.qsize()
+        # 正在执行的任务数 = 总任务数 - 队列中的任务数
+        active_tasks_count = len(service.active_tasks) - queue_size
+
         payload = {
             "worker_id": worker_id,
             "status": status,
-            "active_tasks_count": len(service.active_tasks),
-            "queue_size": 0,  # 此 worker 实现没有内部队列
+            "active_tasks_count": active_tasks_count,
+            "queue_size": queue_size,
             "processed_tasks_count": processed_tasks_count
         }
         try:
