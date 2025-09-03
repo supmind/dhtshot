@@ -3,7 +3,8 @@
 本模块定义了与数据库表对应的 SQLAlchemy ORM 数据模型。
 """
 import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Text, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, ForeignKey
+from sqlalchemy.orm import relationship
 from .database import Base
 
 class Task(Base):
@@ -28,10 +29,13 @@ class Task(Base):
     resume_data = Column(JSON, nullable=True, comment="用于任务断点续传的恢复数据")
 
     result_message = Column(Text, nullable=True, comment="记录任务完成（成功或失败）时的最终消息")
-    assigned_worker_id = Column(String(255), nullable=True, comment="当前正在处理此任务的工作节点的ID")
+    assigned_worker_id = Column(String(255), ForeignKey("workers.worker_id"), nullable=True, comment="当前正在处理此任务的工作节点的ID")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, comment="任务创建时间")
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, comment="任务最后更新时间")
+
+    assigned_worker = relationship("Worker", back_populates="tasks")
+
 
 class Worker(Base):
     """
@@ -47,6 +51,10 @@ class Worker(Base):
     status = Column(String(50), nullable=False, default='idle', comment="工作节点的当前状态")
     active_tasks_count = Column(Integer, default=0, comment="该工作节点正在执行的任务数")
     queue_size = Column(Integer, default=0, comment="该工作节点内部任务队列的大小")
+    processed_tasks_count = Column(Integer, default=0, comment="该工作节点自启动以来已处理的任务总数")
+
 
     last_seen_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, comment="工作节点最后一次发送心跳的时间")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, comment="工作节点首次注册的时间")
+
+    tasks = relationship("Task", back_populates="assigned_worker")

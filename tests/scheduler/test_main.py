@@ -158,9 +158,20 @@ def test_worker_heartbeat(client):
     client.post("/workers/register", json={"worker_id": worker_id, "status": "idle"})
 
     # 发送心跳
-    response = client.post("/workers/heartbeat", json={"worker_id": worker_id, "status": "busy"})
+    heartbeat_payload = {
+        "worker_id": worker_id,
+        "status": "busy",
+        "active_tasks_count": 1,
+        "queue_size": 5,
+        "processed_tasks_count": 10
+    }
+    response = client.post("/workers/heartbeat", json=heartbeat_payload)
     assert response.status_code == 200
-    assert response.json()["status"] == "busy"
+    data = response.json()
+    assert data["status"] == "busy"
+    assert data["active_tasks_count"] == 1
+    assert data["queue_size"] == 5
+    assert data["processed_tasks_count"] == 10
 
 def test_upload_screenshot(client):
     infohash = "upload_hash"

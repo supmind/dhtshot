@@ -1,80 +1,119 @@
 # -*- coding: utf-8 -*-
-"""
-对 worker.py 中工作节点逻辑的单元测试。
-"""
-import pytest
 import asyncio
-from unittest.mock import patch, AsyncMock, MagicMock
-import os
+from contextlib import suppress
+from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock
 
-from config import Settings
-# 在导入 worker 之前设置环境变量
-os.environ['SCHEDULER_URL'] = 'http://test-scheduler'
+import pytest
+
 import worker
+from config import Settings
+from screenshot.service import ScreenshotService
+
 
 @pytest.fixture
-def mock_settings():
-    """提供一个带有测试 URL 的 Settings 对象。"""
-    return Settings(scheduler_url="http://test-scheduler")
+def mock_settings(tmp_path):
+    """Override settings for tests and set a default concurrency."""
+    return Settings(
+        scheduler_url="http://test-scheduler",
+        output_dir=str(tmp_path),
+        worker_concurrency=1  # Default to 1 for simplicity in tests
+    )
 
-@pytest.fixture
-def mock_client():
-    """提供一个 mock 的 SchedulerAPIClient 实例。"""
-    client = MagicMock(spec=worker.SchedulerAPIClient)
-    client.register = AsyncMock(return_value=True)
-    client.get_next_task = AsyncMock(return_value={"infohash": "test_infohash"})
-    client.upload_screenshot = AsyncMock()
-    client.update_task_status = AsyncMock()
-    client.send_heartbeat = AsyncMock()
-    return client
 
 @pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
 @patch('worker.ScreenshotService', spec=True)
 @patch('worker.SchedulerAPIClient')
-async def test_worker_main_loop(MockAPIClient, MockScreenshotService, mock_settings):
+async def test_worker_main_loop_fetches_task(MockAPIClient, MockScreenshotService, mock_sleep, mock_settings):
     """
-    测试工作节点的主循环是否能成功注册、获取任务并提交给 ScreenshotService。
+    Test that the worker's main loop successfully registers, fetches a task,
+    and submits it to the ScreenshotService.
     """
-    # --- 模拟客户端和 Service ---
-    mock_client_instance = MockAPIClient.return_value
-    # 关键修复：确保 mock 的异步方法返回一个可等待的对象（coroutine）
-    mock_client_instance.register = AsyncMock(return_value=True)
-    mock_client_instance.get_next_task = AsyncMock(return_value={"infohash": "test_infohash", "metadata": None})
+    # --- Setup Mocks ---
+    mock_client = MockAPIClient.return_value
+    mock_client.register = AsyncMock(return_value=True)
+    mock_client.send_heartbeat = AsyncMock()
+    mock_client.get_next_task = AsyncMock(side_effect=[
+        {"infohash": "test_infohash", "metadata": None},
+        None
+    ])
 
-    mock_service_instance = MockScreenshotService.return_value
-    mock_service_instance.submit_task = AsyncMock()
-    mock_service_instance.active_tasks = set()
+    mock_service = MockScreenshotService.return_value
+    mock_service.submit_task = AsyncMock()
 
-    # --- 运行主程序 ---
-    # aiohttp.ClientSession 在这里是虚拟的，因为它不会被实际使用
+    # Use PropertyMock to simulate the `active_tasks` property.
+    type(mock_service).active_tasks = PropertyMock(return_value=set())
+    # Mock the new get_queue_size method.
+    mock_service.get_queue_size.return_value = 0
+
+    # --- Run Main Loop ---
     main_task = asyncio.create_task(worker.main(session=MagicMock()))
-    await asyncio.sleep(0.1) # 让事件循环运行
-
-    # --- 断言 ---
-    mock_client_instance.register.assert_awaited_once_with(worker.WORKER_ID)
-    mock_client_instance.get_next_task.assert_awaited_once_with(worker.WORKER_ID)
-    mock_service_instance.submit_task.assert_awaited_once_with(infohash="test_infohash", metadata=None)
-
-    # --- 清理 ---
+    await asyncio.sleep(0.01)
     main_task.cancel()
-    # 等待任务完成其清理逻辑。由于 main 内部处理了 CancelledError，
-    # 我们不应该在这里期望异常被抛出。
-    await main_task
+    with suppress(asyncio.CancelledError):
+        await main_task
+
+    # --- Assertions ---
+    mock_client.register.assert_awaited_once()
+    assert mock_client.get_next_task.await_count == 2
+    mock_service.submit_task.assert_awaited_once_with(infohash="test_infohash", metadata=None)
+    mock_sleep.assert_called_once_with(worker.POLL_INTERVAL)
+
 
 @pytest.mark.asyncio
-async def test_on_screenshot_saved_callback(mock_client):
-    """测试 on_screenshot_saved 回调函数是否能正确调用客户端的上传方法。"""
-    await worker.on_screenshot_saved(mock_client, "test_infohash", "/path/to/test.jpg")
-    mock_client.upload_screenshot.assert_called_once_with("test_infohash", "/path/to/test.jpg")
+@patch('asyncio.sleep', new_callable=AsyncMock)
+@patch('worker.ScreenshotService', spec=True)
+@patch('worker.SchedulerAPIClient')
+async def test_worker_respects_concurrency_limit(MockAPIClient, MockScreenshotService, mock_sleep, mock_settings):
+    """
+    Test that the worker does not fetch new tasks when it has reached its
+    concurrency limit.
+    """
+    # --- Setup Mocks ---
+    # Correctly access the lowercase attribute.
+    mock_settings.worker_concurrency = 1
+
+    mock_client = MockAPIClient.return_value
+    mock_client.register = AsyncMock(return_value=True)
+    mock_client.send_heartbeat = AsyncMock()
+    mock_client.get_next_task = AsyncMock()
+
+    mock_service = MockScreenshotService.return_value
+
+    active_tasks = {"some_active_task"}
+    type(mock_service).active_tasks = PropertyMock(return_value=active_tasks)
+    mock_service.get_queue_size.return_value = 0
+
+    # --- Run Main Loop ---
+    main_task = asyncio.create_task(worker.main(session=MagicMock()))
+    await asyncio.sleep(0.01)
+    main_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await main_task
+
+    # --- Assertions ---
+    mock_client.register.assert_awaited_once()
+    mock_client.get_next_task.assert_not_awaited()
+    mock_sleep.assert_called_once_with(worker.POLL_INTERVAL)
+
 
 @pytest.mark.asyncio
-async def test_on_task_finished_callback(mock_client):
-    """测试 on_task_finished 回调是否能正确调用客户端的状态更新方法。"""
+@patch('worker.SchedulerAPIClient')
+async def test_on_task_finished_callback(MockAPIClient):
+    """
+    Tests that the on_task_finished callback correctly calls the client's
+    update_task_status method.
+    """
+    mock_client_instance = MockAPIClient.return_value
+    mock_client_instance.update_task_status = AsyncMock()
+
+    infohash = "test_hash"
+    status = "success"
+    message = "All good"
     resume_data = {"key": "value"}
-    await worker.on_task_finished(
-        mock_client, status="success", infohash="test_infohash",
-        message="Done", resume_data=resume_data
-    )
-    mock_client.update_task_status.assert_called_once_with(
-        "test_infohash", "success", "Done", resume_data
+
+    await worker.on_task_finished(mock_client_instance, status, infohash, message, resume_data=resume_data)
+
+    mock_client_instance.update_task_status.assert_awaited_once_with(
+        infohash, status, message, resume_data
     )

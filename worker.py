@@ -99,27 +99,13 @@ class SchedulerAPIClient:
         except aiohttp.ClientError as e:
             log.error(f"[{infohash}] 报告最终状态时发生连接错误: {e}")
 
-    async def get_queue_size(self) -> int:
-        """从调度器获取当前待处理任务队列的大小。"""
-        url = f"{self._url}/tasks/queue/size"
-        try:
-            async with self._session.get(url, timeout=5) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    log.warning(f"获取队列大小失败。状态码: {response.status}")
-                    return -1  # 返回一个无效值以表示错误
-        except aiohttp.ClientError as e:
-            log.error(f"连接调度器获取队列大小时出错: {e}")
-            return -1
-
     async def send_heartbeat(self, worker_id: str, service: ScreenshotService, processed_tasks_count: int):
         """定期发送心跳以保持工作节点活动状态。"""
         url = f"{self._url}/workers/heartbeat"
         status = "busy" if service.active_tasks else "idle"
 
         # 从 ScreenshotService 实例动态获取队列大小和活动任务数
-        queue_size = service.task_queue.qsize()
+        queue_size = service.get_queue_size()
         # 正在执行的任务数 = 总任务数 - 队列中的任务数
         active_tasks_count = len(service.active_tasks) - queue_size
 
@@ -193,38 +179,21 @@ async def main(session: aiohttp.ClientSession):
     log.info("启动主任务轮询循环...")
     while not stop_event.is_set():
         try:
-            queue_size = await client.get_queue_size()
-            if queue_size == -1:
-                log.warning("无法获取队列大小，将在10秒后重试。")
-                await asyncio.sleep(10)
+            # Concurrency logic: keep fetching tasks as long as we are below the concurrency limit
+            if len(service.active_tasks) >= settings.WORKER_CONCURRENCY:
+                await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            if queue_size > 20:
-                log.info(f"队列大小 ({queue_size}) 超过20，暂停获取任务。将在3秒后再次检查。")
-                await asyncio.sleep(3)
-                continue
-
-            while not stop_event.is_set():
-                if len(service.active_tasks) > 0:
-                    await asyncio.sleep(POLL_INTERVAL)
-                    break # 如果当前有任务在执行，则退出内层循环，等待下次检查
-
-                current_queue_size = await client.get_queue_size()
-                if current_queue_size > 20:
-                    log.info(f"在快速获取期间队列大小 ({current_queue_size}) 超过20，暂停。")
-                    break
-
-                task_data = await client.get_next_task(WORKER_ID)
-                if task_data:
-                    log.info(f"收到新任务: {task_data['infohash']}，提交到本地服务。")
-                    if metadata := task_data.get('metadata'):
-                        task_data['metadata'] = base64.b64decode(metadata)
-                    await service.submit_task(**task_data)
-                    await asyncio.sleep(0.1)
-                else:
-                    log.info("调度器中无更多可用任务，进入等待状态。")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    break
+            task_data = await client.get_next_task(WORKER_ID)
+            if task_data:
+                log.info(f"收到新任务: {task_data['infohash']}，提交到本地服务。")
+                if metadata := task_data.get('metadata'):
+                    task_data['metadata'] = base64.b64decode(metadata)
+                await service.submit_task(**task_data)
+                await asyncio.sleep(0.1) # Brief pause to prevent spamming the scheduler
+            else:
+                log.info("调度器中无更多可用任务，进入等待状态。")
+                await asyncio.sleep(POLL_INTERVAL)
 
         except asyncio.CancelledError:
             break
