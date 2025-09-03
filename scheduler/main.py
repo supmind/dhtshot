@@ -158,10 +158,33 @@ def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db))
     # 如果是首次注册，则在数据库中创建一个新的工作节点条目。
     return crud.create_worker(db=db, worker=worker)
 
+@app.get("/tasks/queue/size", response_model=int, tags=["任务管理"])
+def get_queue_size(db: Session = Depends(get_db)):
+    """获取当前待处理任务队列的大小。"""
+    return crud.get_pending_tasks_count(db)
+
+@app.get("/workers/", response_model=schemas.WorkerList, tags=["工作节点管理"])
+def list_all_workers(
+    skip: int = Query(0, ge=0, description="分页查询的起始位置"),
+    limit: int = Query(100, ge=1, le=500, description="每页返回的工作节点数量"),
+    db: Session = Depends(get_db)
+):
+    """分页列出所有已注册的工作节点。"""
+    total, workers = crud.get_workers(db, skip=skip, limit=limit)
+    return {"total": total, "workers": workers}
+
+
 @app.post("/workers/heartbeat", response_model=schemas.Worker, tags=["工作节点管理"])
 def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(get_db)):
     """接收工作节点的心跳，更新其状态和最后在线时间。"""
-    db_worker = crud.update_worker_status(db, worker_id=heartbeat.worker_id, status=heartbeat.status)
+    db_worker = crud.update_worker_status(
+        db,
+        worker_id=heartbeat.worker_id,
+        status=heartbeat.status,
+        active_tasks_count=heartbeat.active_tasks_count,
+        queue_size=heartbeat.queue_size,
+        processed_tasks_count=heartbeat.processed_tasks_count
+    )
     if db_worker is None:
         raise HTTPException(status_code=404, detail="工作节点未找到，请先注册。")
     return db_worker

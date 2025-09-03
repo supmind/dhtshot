@@ -69,19 +69,48 @@ def create_worker(db: Session, worker: schemas.WorkerCreate) -> models.Worker:
     db.refresh(db_worker)
     return db_worker
 
-def update_worker_status(db: Session, worker_id: str, status: str) -> Optional[models.Worker]:
+def get_workers(db: Session, skip: int = 0, limit: int = 100) -> tuple[int, list[models.Worker]]:
+    """
+    分页检索工作节点列表。
+
+    :param db: 数据库会话。
+    :param skip: 要跳过的记录数。
+    :param limit: 要返回的最大记录数。
+    :return: 一个元组，包含工作节点总数和当前页的工作节点对象列表。
+    """
+    total = db.query(models.Worker).count()
+    workers = db.query(models.Worker).order_by(models.Worker.created_at.desc()).offset(skip).limit(limit).all()
+    return total, workers
+
+def get_pending_tasks_count(db: Session) -> int:
+    """
+    计算状态为 'pending' 的任务总数。
+
+    :param db: 数据库会话。
+    :return: 待处理任务的数量。
+    """
+    return db.query(models.Task).filter(models.Task.status == 'pending').count()
+
+
+def update_worker_status(db: Session, worker_id: str, status: str, active_tasks_count: int, queue_size: int, processed_tasks_count: int) -> Optional[models.Worker]:
     """
     更新一个工作节点的状态和最后心跳时间。
 
     :param db: 数据库会话。
     :param worker_id: 要更新的工作节点的ID。
     :param status: 工作节点的新状态。
+    :param active_tasks_count: 工作节点正在执行的任务数。
+    :param queue_size: 工作节点内部的队列大小。
+    :param processed_tasks_count: 工作节点已处理的任务总数。
     :return: 更新后的 Worker 对象，如果工作节点不存在则返回 None。
     """
     db_worker = get_worker_by_id(db, worker_id=worker_id)
     if db_worker:
         db_worker.last_seen_at = datetime.datetime.utcnow()
         db_worker.status = status
+        db_worker.active_tasks_count = active_tasks_count
+        db_worker.queue_size = queue_size
+        db_worker.processed_tasks_count = processed_tasks_count
         db.commit()
         db.refresh(db_worker)
     return db_worker

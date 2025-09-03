@@ -45,6 +45,8 @@ class Worker(Base):
 
     # 工作节点状态: 'idle' (空闲), 'busy' (繁忙)
     status = Column(String(50), nullable=False, default='idle', comment="工作节点的当前状态")
+    active_tasks_count = Column(Integer, default=0, comment="该工作节点正在执行的任务数")
+    queue_size = Column(Integer, default=0, comment="该工作节点内部任务队列的大小")
 
     last_seen_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, comment="工作节点最后一次发送心跳的时间")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, comment="工作节点首次注册的时间")

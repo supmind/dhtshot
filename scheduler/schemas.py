@@ -67,6 +67,8 @@ class WorkerCreate(WorkerBase):
 class Worker(WorkerBase):
     """用于 API 响应的完整工作节点模型。"""
     id: int
+    active_tasks_count: int = Field(0, description="该工作节点当前正在执行的任务数")
+    queue_size: int = Field(0, description="该工作节点内部任务队列的大小")
     last_seen_at: datetime.datetime
     created_at: datetime.datetime
 
@@ -77,3 +79,11 @@ class WorkerHeartbeat(BaseModel):
     """用于工作节点发送心跳的请求体 Schema。"""
     worker_id: str
     status: str
+    active_tasks_count: int = Field(..., description="该工作节点当前正在执行的任务数")
+    queue_size: int = Field(..., description="该工作节点当前内部任务队列的大小")
+    processed_tasks_count: int = Field(..., description="该工作节点自启动以来已处理的任务总数")
+
+class WorkerList(BaseModel):
+    """用于分页列出所有工作节点的响应体 Schema。"""
+    total: int = Field(..., description="系统中已注册的工作节点总数。")
+    workers: List[Worker] = Field(..., description="当前页的工作节点列表。")

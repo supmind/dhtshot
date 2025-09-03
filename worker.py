@@ -99,11 +99,31 @@ class SchedulerAPIClient:
         except aiohttp.ClientError as e:
             log.error(f"[{infohash}] 报告最终状态时发生连接错误: {e}")
 
-    async def send_heartbeat(self, worker_id: str, service: ScreenshotService):
+    async def get_queue_size(self) -> int:
+        """从调度器获取当前待处理任务队列的大小。"""
+        url = f"{self._url}/tasks/queue/size"
+        try:
+            async with self._session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    log.warning(f"获取队列大小失败。状态码: {response.status}")
+                    return -1  # 返回一个无效值以表示错误
+        except aiohttp.ClientError as e:
+            log.error(f"连接调度器获取队列大小时出错: {e}")
+            return -1
+
+    async def send_heartbeat(self, worker_id: str, service: ScreenshotService, processed_tasks_count: int):
         """定期发送心跳以保持工作节点活动状态。"""
         url = f"{self._url}/workers/heartbeat"
         status = "busy" if service.active_tasks else "idle"
-        payload = {"worker_id": worker_id, "status": status}
+        payload = {
+            "worker_id": worker_id,
+            "status": status,
+            "active_tasks_count": len(service.active_tasks),
+            "queue_size": 0,  # 此 worker 实现没有内部队列
+            "processed_tasks_count": processed_tasks_count
+        }
         try:
             async with self._session.post(url, json=payload) as response:
                 if response.status != 200:
@@ -125,10 +145,10 @@ async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: st
 
 # --- 主程序逻辑 ---
 
-async def heartbeat_loop(client: SchedulerAPIClient, service: ScreenshotService):
+async def heartbeat_loop(client: SchedulerAPIClient, service: ScreenshotService, processed_tasks_counter: dict):
     """一个独立的协程，定期向调度器发送心跳。"""
     while True:
-        await client.send_heartbeat(WORKER_ID, service)
+        await client.send_heartbeat(WORKER_ID, service, processed_tasks_counter['count'])
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 async def main(session: aiohttp.ClientSession):
@@ -136,6 +156,7 @@ async def main(session: aiohttp.ClientSession):
     settings = Settings()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    processed_tasks_counter = {'count': 0}
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
@@ -146,32 +167,62 @@ async def main(session: aiohttp.ClientSession):
         log.error("无法向调度器注册，程序退出。")
         return
 
-    status_cb = partial(on_task_finished, client)
+    async def on_task_finished_with_counter(client: SchedulerAPIClient, status: str, infohash: str, message: str, **kwargs):
+        """当 ScreenshotService 完成一个任务时被调用的回调函数，并更新计数器。"""
+        if status == 'success':
+            processed_tasks_counter['count'] += 1
+            log.info(f"任务 {infohash} 成功完成。已处理任务总数: {processed_tasks_counter['count']}")
+        await on_task_finished(client, status, infohash, message, **kwargs)
+
+    status_cb = partial(on_task_finished_with_counter, client)
     screenshot_cb = partial(on_screenshot_saved, client)
 
     service = ScreenshotService(settings=settings, loop=loop, status_callback=status_cb, screenshot_callback=screenshot_cb)
     await service.run()
     log.info("ScreenshotService 已在后台运行。")
 
-    heartbeat_task = asyncio.create_task(heartbeat_loop(client, service))
+    heartbeat_task = asyncio.create_task(heartbeat_loop(client, service, processed_tasks_counter))
     log.info("心跳任务已启动。")
 
     log.info("启动主任务轮询循环...")
     while not stop_event.is_set():
         try:
-            if not service.active_tasks:
-                if task_data := await client.get_next_task(WORKER_ID):
+            queue_size = await client.get_queue_size()
+            if queue_size == -1:
+                log.warning("无法获取队列大小，将在10秒后重试。")
+                await asyncio.sleep(10)
+                continue
+
+            if queue_size > 20:
+                log.info(f"队列大小 ({queue_size}) 超过20，暂停获取任务。将在3秒后再次检查。")
+                await asyncio.sleep(3)
+                continue
+
+            while not stop_event.is_set():
+                if len(service.active_tasks) > 0:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    break # 如果当前有任务在执行，则退出内层循环，等待下次检查
+
+                current_queue_size = await client.get_queue_size()
+                if current_queue_size > 20:
+                    log.info(f"在快速获取期间队列大小 ({current_queue_size}) 超过20，暂停。")
+                    break
+
+                task_data = await client.get_next_task(WORKER_ID)
+                if task_data:
                     log.info(f"收到新任务: {task_data['infohash']}，提交到本地服务。")
                     if metadata := task_data.get('metadata'):
                         task_data['metadata'] = base64.b64decode(metadata)
                     await service.submit_task(**task_data)
-
-            await asyncio.sleep(POLL_INTERVAL)
+                    await asyncio.sleep(0.1)
+                else:
+                    log.info("调度器中无更多可用任务，进入等待状态。")
+                    await asyncio.sleep(POLL_INTERVAL)
+                    break
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            # 捕获其他潜在的异常，以防主循环崩溃
             log.error(f"主轮询循环发生意外错误: {e}", exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
 
