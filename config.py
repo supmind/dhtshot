@@ -13,24 +13,24 @@ class Settings(BaseSettings):
     db_url: str = "sqlite:///./scheduler.db"
 
     # --- 工作节点设置 ---
-    num_workers: int = 10  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量
+    num_workers: int = 100  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量
     worker_idle_time: int = 30  # seconds
     worker_max_queue_size: int = 20  # 工作节点在暂停从调度器获取新任务前，其内部任务队列的最大长度
 
     # --- 截图服务设置 ---
     output_dir: str = "./screenshots_output"  # 存储最终截图的目录
     torrent_save_path: str = "./torrent_files"  # 存储 .torrent 文件的目录
-    min_screenshots: int = 2
-    max_screenshots: int = 10
+    min_screenshots: int = 5
+    max_screenshots: int = 60
     default_screenshots: int = 20
-    target_interval_sec: int = 10
+    target_interval_sec: int = 180
 
     # --- Libtorrent 性能调优设置 ---
     # 这些设置直接影响 libtorrent 会话的性能，对于高负载环境至关重要。
     # 请根据您的硬件资源（CPU, 内存, 网络）和预期的负载来调整它们。
     lt_listen_interfaces: str = "0.0.0.0:6881"  # libtorrent 监听的端口和网络接口
     lt_active_limit: int = 500  # 同时处理的活动 torrent 最大数量
-    lt_connections_limit: int = 2000  # 全局最大连接数
+    lt_connections_limit: int = 4096  # 全局最大连接数
     lt_cache_size: int = 8192  # 磁盘 I/O 缓存大小，单位为 16KB 块 (例如 8192 * 16KB = 128MB)
     lt_upload_rate_limit: int = 0  # 全局上传速率限制，单位 B/s (0 表示无限制)
     lt_download_rate_limit: int = 0  # 全局下载速率限制，单位 B/s (0 表示无限制)
