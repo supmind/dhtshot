@@ -47,6 +47,10 @@ class TorrentClient:
             'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
             'user_agent': 'qBittorrent/4.5.2',
             'peer_fingerprint': 'qB4520',
+                        # 性能调优设置
+            'active_limit': 120,
+            'connections_limit': 4096,
+            'peer_connect_timeout': 10,
         }
         # 会话及其对象不是线程安全的，需要锁来保护所有直接调用。
         self._ses = lt.session(settings)
