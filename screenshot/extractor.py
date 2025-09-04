@@ -194,18 +194,28 @@ class KeyframeExtractor:
                 self.codec_name = config['codec']
                 config_box_name = config.get('config_box')
 
-                if config_box_name: # 带外配置 (Out-of-band)
+                if config_box_name:  # 带外配置 (Out-of-band)
                     sample_entry_payload.seek(78)
                     config_box_payload = self._find_box_payload(sample_entry_payload, [config_box_name])
                     if config_box_payload and len(config_box_payload.getvalue()) > 5:
-                        self.mode = 'avc1' if self.codec_name in ['h264', 'hevc'] else 'av01'
+                        # 如果找到了有效的解码器配置盒，说明码流是长度前缀格式，需要转换。
+                        # 我们使用 'avc1' 作为需要进行 Annex B 转换的通用模式标志。
+                        self.mode = 'avc1'
                         config_data = config_box_payload.getvalue()
                         self.extradata = config_data
-                        if self.codec_name == 'h264': self.nal_length_size = (config_data[4] & 0x03) + 1
-                        elif self.codec_name == 'hevc': self.nal_length_size = (config_data[21] & 0x03) + 1
-                    else: # 回退到带内配置
+
+                        # 根据不同的编解码器，从配置数据中解析 NALU 长度字段的大小。
+                        if self.codec_name == 'h264':
+                            # 对于 H.264 (avcC box)，该信息在第5个字节的低2位。
+                            self.nal_length_size = (config_data[4] & 0x03) + 1
+                        elif self.codec_name == 'hevc':
+                            # 对于 HEVC (hvcC box)，该信息在第22个字节的低2位。
+                            self.nal_length_size = (config_data[21] & 0x03) + 1
+                    else:
+                        # 如果没有找到有效的配置盒，则回退到带内模式。
                         self.mode = 'avc3'
-                else: # 带内配置 (In-band)
+                else:  # 带内配置 (In-band)
+                    # 如果编解码器格式本身就不需要带外配置盒（如 'avc3'），则直接设为带内模式。
                     self.mode = 'avc3'
 
                 found_codec = True; break
