@@ -16,7 +16,6 @@ import os
 import time
 import libtorrent as lt
 import threading
-import queue
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import tempfile
@@ -67,10 +66,9 @@ class TorrentClient:
                 lt.alert_category.piece_progress
             ),
         }
-        # 所有对会话的调用都必须在专用的 libtorrent 线程中完成。
-        # 我们使用一个队列来从 asyncio 线程封送调用。
+        # 会话及其对象不是线程安全的，需要锁来保护所有直接调用。
         self._ses = lt.session(settings_pack)
-        self._cmd_queue = queue.Queue()
+        self._ses_lock = threading.Lock()
 
         self._thread = None
         self._running = False
@@ -94,21 +92,17 @@ class TorrentClient:
         self.subscribers_lock = threading.Lock()
 
     async def _execute_sync(self, func, *args, **kwargs):
-        """
-        在 libtorrent 线程上异步执行一个函数，并等待其结果。
-        这是与 libtorrent 会话交互的主要方式。
-        """
-        future = self.loop.create_future()
-        self._cmd_queue.put((future, func, args, kwargs))
-        # 使用一个线程安全的调用来唤醒会话的 wait_for_alert()，
-        # 以便它可以立即处理我们的命令。
-        self._ses.post_session_stats()
-        return await future
+        """在一个独立的线程中安全地执行同步的 libtorrent 调用，以避免阻塞事件循环。"""
+        return await self.loop.run_in_executor(None, self._sync_wrapper, func, *args, **kwargs)
+
+    def _sync_wrapper(self, func, *args, **kwargs):
+        """在执行 libtorrent 调用前获取会话锁，确保线程安全。"""
+        with self._ses_lock:
+            return func(*args, **kwargs)
 
     def _execute_sync_nowait(self, func, *args, **kwargs):
-        """以“即发即忘”的方式在 libtorrent 线程上执行一个函数。"""
-        self._cmd_queue.put((None, func, args, kwargs))
-        self._ses.post_session_stats()
+        """以“即发即忘”的方式执行一个 libtorrent 调用，不等待其完成。"""
+        self.loop.run_in_executor(None, self._sync_wrapper, func, *args, **kwargs)
 
     async def start(self):
         """启动 torrent 客户端并开始在后台线程中监听警报。"""
@@ -400,35 +394,17 @@ class TorrentClient:
 
     def _alert_loop(self):
         """
-        在后台线程中运行的主循环。它持续等待并处理来自 libtorrent 的警报，
-        并执行来自 asyncio 事件循环的命令。
+        在后台线程中运行的主循环。它持续等待并处理来自 libtorrent 的警报。
         """
         while self._running:
-            # --- 阶段 1: 处理来自 asyncio 事件循环的命令 ---
-            while not self._cmd_queue.empty():
-                try:
-                    future, func, args, kwargs = self._cmd_queue.get_nowait()
-                    try:
-                        result = func(*args, **kwargs)
-                        if future and not future.done():
-                            self.loop.call_soon_threadsafe(future.set_result, result)
-                    except Exception as e:
-                        if future and not future.done():
-                            self.loop.call_soon_threadsafe(future.set_exception, e)
-                except queue.Empty:
-                    break  # 即使在检查后队列也可能变空
+            alerts = []
+            with self._ses_lock:
+                if not self._running: break
+                # 等待最多1秒，然后超时以再次检查 `self._running` 标志
+                alert = self._ses.wait_for_alert(1000)
+                if alert:
+                    alerts = self._ses.pop_alerts()
 
-            # --- 阶段 2: 处理 libtorrent 警报 ---
-            if not self._running:
-                break
-
-            # 等待最多200毫秒。这决定了循环对 `self._running` 标志变化的响应性。
-            # 实际的命令响应由 `_ses.post_session_stats()` 触发的即时唤醒处理。
-            alert = self._ses.wait_for_alert(200)
-            if not alert:
-                continue
-
-            alerts = self._ses.pop_alerts()
             for alert in alerts:
                 if alert.category() & lt.alert_category.error:
                     self.log.error("Libtorrent 警报: %s", alert)
@@ -443,21 +419,22 @@ class TorrentClient:
                     lt.torrent_finished_alert: self._handle_torrent_finished,
                 }
                 handler = alert_map.get(type(alert))
-                if handler:
-                    handler(alert)
+                if handler: handler(alert)
 
                 # 打印状态更新日志
                 elif type(alert) == lt.state_update_alert:
-                    for s in alert.status:
-                        if s.state != lt.torrent_status.states.seeding:
-                            self.log.info(
-                                "  状态更新 - %s: %s %.2f%% | 下载速度: %.1f kB/s | 节点: %d (%d 种子)",
-                                s.name, s.state_str, s.progress * 100,
-                                s.download_rate / 1000, s.num_peers, s.num_seeds
-                            )
+                    with self._ses_lock:
+                        for s in alert.status:
+                            if s.state != lt.torrent_status.states.seeding:
+                                self.log.info(
+                                    "  状态更新 - %s: %s %.2f%% | 下载速度: %.1f kB/s | 节点: %d (%d 种子)",
+                                    s.name, s.state_str, s.progress * 100,
+                                    s.download_rate / 1000, s.num_peers, s.num_seeds
+                                )
             # 定期打印 DHT 状态
             now = time.time()
             if now - self.last_dht_log_time > 10:
-                status = self._ses.status()
+                with self._ses_lock:
+                    status = self._ses.status()
                 self.log.info("DHT 状态: %d 个节点。", status.dht_nodes)
                 self.last_dht_log_time = now
