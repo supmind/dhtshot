@@ -28,9 +28,10 @@ class TaskError(ScreenshotError):
     所有与特定 torrent 任务失败相关的异常都应继承此类。
     它强制要求包含 `infohash`，以便在日志和错误处理中提供关键的上下文信息。
     """
-    def __init__(self, message: str, infohash: str):
+    def __init__(self, message: str, infohash: str, resume_data=None):
         super().__init__(message)
         self.infohash = infohash
+        self.resume_data = resume_data
 
     def __str__(self):
         # 重写 __str__ 方法，自动在错误消息前加上 infohash 前缀。
@@ -75,9 +76,7 @@ class FrameDownloadTimeoutError(TaskError):
     这通常是由于网络问题或缺少 peer 造成的。
     它包含 `resume_data`，理论上允许任务从断点处恢复。
     """
-    def __init__(self, message: str, infohash: str, resume_data=None):
-        super().__init__(message, infohash)
-        self.resume_data = resume_data
+    pass
 
 
 class FrameDecodeError(TaskError):
