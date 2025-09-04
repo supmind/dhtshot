@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     lt_peer_connect_timeout: int = 10  # 连接 peer 的超时时间（秒）
 
     # Timeouts for various operations
-    metadata_timeout: int = 180  # 3 minutes
-    moov_probe_timeout: int = 120  # 2 minutes
-    piece_fetch_timeout: int = 60  # 1 minute
-    piece_queue_timeout: int = 300  # 5 minutes
+    metadata_timeout: int = 600  # 3 minutes
+    moov_probe_timeout: int = 600  # 2 minutes
+    piece_fetch_timeout: int = 600  # 1 minute
+    piece_queue_timeout: int = 600  # 5 minutes
