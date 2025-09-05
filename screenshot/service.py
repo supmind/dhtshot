@@ -407,7 +407,7 @@ class ScreenshotService:
             else: packet_data = packet_data_bytes
 
             ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
-            m, s = divmod(ts_sec, 60); h, m = divmod(m, 60); timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+            timestamp_str = str(int(ts_sec))
             return self.loop.create_task(self.generator.generate(extractor.codec_name, extractor.extradata, packet_data, infohash_hex, timestamp_str))
 
         torrent_is_complete = False
