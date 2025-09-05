@@ -171,14 +171,15 @@ def read_task(infohash: str, db: Session = Depends(get_db)):
 
 @app.get("/tasks/all/", response_model=schemas.TaskList, tags=["任务管理"])
 def list_all_tasks(
+    status: Optional[str] = Query(None, description="按任务状态筛选 (e.g., pending, working, success)"),
     skip: int = Query(0, ge=0, description="分页查询的起始位置"),
     limit: int = Query(100, ge=1, le=500, description="每页返回的任务数量"),
     db: Session = Depends(get_db)
 ):
     """
-    分页列出系统中的所有任务。
+    分页列出系统中的所有任务，可选择按状态进行筛选。
     """
-    total, tasks = crud.get_tasks(db, skip=skip, limit=limit)
+    total, tasks = crud.get_tasks(db, status=status, skip=skip, limit=limit)
     return {"total": total, "tasks": tasks}
 
 @app.post("/workers/register", response_model=schemas.Worker, tags=["工作节点管理"])

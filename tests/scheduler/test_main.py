@@ -323,30 +323,46 @@ def test_get_next_task_with_resume_file(client):
     if os.path.exists(resume_dir) and not os.listdir(resume_dir):
         os.rmdir(resume_dir)
 
-def test_list_all_tasks_with_pagination(client):
-    """测试 /tasks/all/ 分页端点是否能正常工作。"""
-    # 1. 在数据库中创建 25 个任务
+def test_list_all_tasks_with_filtering_and_pagination(client):
+    """测试 /tasks/all/ 端点，包括分页和状态筛选功能。"""
+    # 1. 在数据库中创建 25 个任务，15 个 pending, 10 个 success
     db = TestingSessionLocal()
-    for i in range(25):
-        # 使用 f-string 创建唯一的 infohash
-        crud.create_task(db, schemas.TaskCreate(infohash=f"hash_{i:02d}"))
+    for i in range(15):
+        crud.create_task(db, schemas.TaskCreate(infohash=f"pending_{i:02d}"))
+    for i in range(10):
+        task = crud.create_task(db, schemas.TaskCreate(infohash=f"success_{i:02d}"))
+        crud.update_task_status(db, task.infohash, "success")
     db.close()
 
-    # 2. 调用 API，请求第 2 页，每页 10 个
-    response = client.get("/tasks/all/", params={"skip": 10, "limit": 10})
-    assert response.status_code == 200
+    # 2. 测试无筛选的分页
+    response_all = client.get("/tasks/all/", params={"skip": 20, "limit": 10})
+    assert response_all.status_code == 200
+    data_all = response_all.json()
+    assert data_all["total"] == 25
+    assert len(data_all["tasks"]) == 5 # (25 - 20 = 5)
 
-    data = response.json()
+    # 3. 测试按 'pending' 状态筛选
+    response_pending = client.get("/tasks/all/", params={"status": "pending"})
+    assert response_pending.status_code == 200
+    data_pending = response_pending.json()
+    assert data_pending["total"] == 15
+    assert len(data_pending["tasks"]) == 15 # 默认 limit=100
+    assert all(t["status"] == "pending" for t in data_pending["tasks"])
 
-    # 3. 验证返回的数据结构和内容
-    assert data["total"] == 25
-    assert len(data["tasks"]) == 10
+    # 4. 测试按 'success' 状态筛选并分页
+    response_success = client.get("/tasks/all/", params={"status": "success", "skip": 5, "limit": 5})
+    assert response_success.status_code == 200
+    data_success = response_success.json()
+    assert data_success["total"] == 10
+    assert len(data_success["tasks"]) == 5
+    assert data_success["tasks"][0]["infohash"] == "success_04" # 降序排列
 
-    # 4. 验证分页逻辑是否正确
-    # 因为是按创建时间降序排序，所以第 11 个任务 (index 10) 应该是 "hash_14"
-    # (hash_24, hash_23, ..., hash_15 | hash_14, ..., hash_5 | hash_4, ...)
-    assert data["tasks"][0]["infohash"] == "hash_14"
-    assert data["tasks"][-1]["infohash"] == "hash_05"
+    # 5. 测试不存在的状态
+    response_nonexistent = client.get("/tasks/all/", params={"status": "nonexistent"})
+    assert response_nonexistent.status_code == 200
+    data_nonexistent = response_nonexistent.json()
+    assert data_nonexistent["total"] == 0
+    assert len(data_nonexistent["tasks"]) == 0
 
 def test_update_task_details_endpoint(client):
     """测试更新任务详情的 API 端点。"""
