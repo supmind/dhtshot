@@ -465,7 +465,7 @@ class ScreenshotService:
                     "video_filename": video_filename,
                     "video_duration_seconds": int(duration_sec)
                 }
-                self.loop.create_task(self.details_callback(infohash_hex, details))
+                await self.details_callback(infohash_hex, details)
 
             all_keyframes = extractor.keyframes
             selected_keyframes = self._select_keyframes(
