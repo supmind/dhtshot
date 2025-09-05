@@ -186,25 +186,22 @@ def get_and_assign_next_task(db: Session, worker_id: str) -> Optional[models.Tas
     return db_task
 
 def update_task_status(
-    db: Session, infohash: str, status: str, message: Optional[str] = None, resume_data: Optional[dict] = None
+    db: Session, infohash: str, status: str, message: Optional[str] = None
 ) -> Optional[models.Task]:
     """
-    更新任务的最终状态、结果消息和可选的恢复数据。
+    更新任务的最终状态和结果消息。
     当任务完成（成功或永久失败）或进入可恢复失败状态时，会清除分配的工作节点ID。
 
     :param db: 数据库会话。
     :param infohash: 要更新的任务的 infohash。
     :param status: 任务的新状态。
     :param message: 相关的结果消息。
-    :param resume_data: 用于任务恢复的上下文数据。
     :return: 更新后的 Task 对象，如果任务不存在则返回 None。
     """
     db_task = get_task_by_infohash(db, infohash=infohash)
     if db_task:
         db_task.status = status
         db_task.result_message = message
-        if resume_data:
-            db_task.resume_data = resume_data
 
         # 当任务进入最终状态或可恢复失败状态时，它不再被任何工作节点持有
         if status in ['success', 'permanent_failure', 'recoverable_failure']:

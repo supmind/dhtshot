@@ -25,7 +25,6 @@ class Task(TaskBase):
     assigned_worker_id: Optional[str] = None
     result_message: Optional[str] = None
     successful_screenshots: Optional[List[str]] = Field([], description="成功生成的截图文件名列表。")
-    resume_data: Optional[Dict[str, Any]] = Field(None, description="用于任务恢复的上下文数据。")
 
     class Config:
         orm_mode = True

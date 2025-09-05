@@ -95,18 +95,16 @@ def test_update_non_existent_task_status(db_session):
     assert updated_task is None
 
 def test_update_task_status(db_session):
-    """测试更新任务最终状态的功能，包括 resume_data 和 message。"""
+    """测试更新任务最终状态的功能。"""
     crud.create_task(db_session, task=schemas.TaskCreate(infohash="task_to_update"))
     crud.get_and_assign_next_task(db_session, worker_id="worker-005")
 
-    resume_data = {"key": "value"}
     message = "Completed with data"
-    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message, resume_data=resume_data)
+    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message)
 
     assert updated_task.status == "success"
     assert updated_task.assigned_worker_id is None
     assert updated_task.result_message == message
-    assert updated_task.resume_data == resume_data
 
 def test_record_screenshot_for_non_existent_task(db_session):
     """测试为不存在的任务记录截图时应返回 None。"""

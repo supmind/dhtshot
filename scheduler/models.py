@@ -27,10 +27,6 @@ class Task(Base):
     # 在支持原生 JSON 的数据库（如 PostgreSQL）上性能更佳，在 SQLite 上会回退到 TEXT 类型。
     successful_screenshots = Column(JSON, nullable=True, comment="已成功生成的截图文件名列表")
 
-    # 用于存储任务失败时可用于恢复的上下文数据。
-    # 它由工作节点生成，并由调度器保存，以便在重试时传递给下一个工作节点。
-    resume_data = Column(JSON, nullable=True, comment="用于任务断点续传的恢复数据")
-
     result_message = Column(Text, nullable=True, comment="记录任务完成（成功或失败）时的最终消息")
     assigned_worker_id = Column(String(255), ForeignKey("workers.worker_id"), nullable=True, comment="当前正在处理此任务的工作节点的ID")
 

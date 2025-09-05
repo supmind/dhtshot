@@ -12,6 +12,7 @@ import shutil
 import base64
 import logging
 import asyncio
+import json
 
 from . import crud, models, schemas
 from .database import SessionLocal, engine
@@ -135,14 +136,23 @@ def get_next_task(worker_id: str = Query(..., description="请求任务的工作
         return None  # 返回 204 No Content
 
     response_data = {"infohash": task.infohash}
-    if task.resume_data:
-        log.info("在任务 %s 中发现恢复数据，将其发送给工作节点 %s。", task.infohash, worker_id)
-        response_data["resume_data"] = task.resume_data
-        # 清除恢复数据，因为它是一次性的
-        task.resume_data = None
-        db.commit()
-    else:
-        # 仅在没有恢复数据时才发送元数据
+
+    # 优先检查并附加恢复数据（如果存在）
+    RESUME_DIR = "resume_data"
+    resume_file_path = os.path.join(RESUME_DIR, f"{task.infohash}.resume")
+    if os.path.exists(resume_file_path):
+        try:
+            with open(resume_file_path, "r") as f:
+                resume_data = json.load(f)
+            response_data["resume_data"] = resume_data
+            os.remove(resume_file_path) # 恢复数据是一次性的，使用后即删除
+            log.info("在任务 %s 中发现并加载了恢复数据文件。", task.infohash)
+        except (IOError, json.JSONDecodeError) as e:
+            log.error(f"为任务 {task.infohash} 读取或删除恢复数据文件时失败: {e}")
+
+    # 如果没有恢复数据，再检查并附加元数据（如果存在）
+    if "resume_data" not in response_data:
+        METADATA_DIR = "temp_metadata"
         metadata_path = os.path.join(METADATA_DIR, f"{task.infohash}.torrent")
         if os.path.exists(metadata_path):
             with open(metadata_path, "rb") as f:
@@ -243,15 +253,29 @@ async def upload_screenshot(
 async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db)):
     """
     更新一个任务的最终状态。
-    如果提供了 resume_data，它将被直接存储在数据库中，用于未来的任务恢复。
+    如果提供了 resume_data，它将被保存为文件，用于未来的任务恢复。
     """
+    # 如果 worker 发送了 resume_data，则将其保存到文件系统
+    if update.resume_data:
+        RESUME_DIR = "resume_data"
+        os.makedirs(RESUME_DIR, exist_ok=True)
+        file_path = os.path.join(RESUME_DIR, f"{infohash}.resume")
+        try:
+            with open(file_path, "w") as f:
+                json.dump(update.resume_data, f)
+            log.info(f"已为任务 {infohash} 保存恢复数据到 {file_path}")
+        except (IOError, TypeError) as e:
+            log.error(f"为任务 {infohash} 保存恢复数据时失败: {e}")
+            # 即使保存失败，也继续更新任务状态，但不抛出500错误
+            # 因为状态更新更重要
+            pass
+
     try:
         db_task = crud.update_task_status(
             db,
             infohash=infohash,
             status=update.status,
             message=update.message,
-            resume_data=update.resume_data
         )
         if db_task is None:
             raise HTTPException(status_code=404, detail="任务未找到")

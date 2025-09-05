@@ -3,6 +3,8 @@
 对 scheduler/main.py 中 FastAPI 端点的单元测试。
 """
 import pytest
+import os
+import json
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -182,7 +184,8 @@ def test_upload_screenshot(client):
     task_data = client.get(f"/tasks/{infohash}").json()
     assert "test.jpg" in task_data["successful_screenshots"]
 
-def test_update_task_status_endpoint(client):
+def test_update_task_status_endpoint_no_resume(client):
+    """测试更新任务状态（不带恢复数据）的端点。"""
     infohash = "update_status_hash"
     client.post("/tasks/", data={"infohash": infohash})
     payload = {"status": "success", "message": "All done!", "resume_data": None}
@@ -191,6 +194,67 @@ def test_update_task_status_endpoint(client):
     data = response.json()
     assert data["status"] == "success"
     assert data["result_message"] == "All done!"
+
+def test_update_task_status_endpoint_with_resume_data(client):
+    """测试更新任务状态时，是否能正确地将 resume_data 保存为文件。"""
+    infohash = "update_status_hash_resume"
+    client.post("/tasks/", data={"infohash": infohash})
+
+    resume_data = {"some_key": "some_value"}
+    payload = {"status": "recoverable_failure", "message": "A recoverable error", "resume_data": resume_data}
+
+    # 确保测试开始前文件不存在
+    resume_dir = "resume_data"
+    resume_file = os.path.join(resume_dir, f"{infohash}.resume")
+    if os.path.exists(resume_file):
+        os.remove(resume_file)
+    if os.path.exists(resume_dir) and not os.listdir(resume_dir):
+        os.rmdir(resume_dir)
+
+    response = client.post(f"/tasks/{infohash}/status", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "recoverable_failure"
+
+    # 验证文件是否已创建
+    assert os.path.exists(resume_file)
+
+    # 验证文件内容
+    with open(resume_file, "r") as f:
+        saved_data = json.load(f)
+    assert saved_data == resume_data
+
+    # 清理
+    os.remove(resume_file)
+    os.rmdir(resume_dir)
+
+
+def test_get_next_task_with_resume_file(client):
+    """测试当存在恢复文件时，/tasks/next 是否能正确返回 resume_data。"""
+    infohash = "next_with_resume_file"
+    client.post("/tasks/", data={"infohash": infohash})
+
+    # 准备恢复文件
+    resume_dir = "resume_data"
+    os.makedirs(resume_dir, exist_ok=True)
+    resume_file = os.path.join(resume_dir, f"{infohash}.resume")
+    resume_data = {"state": "halfway"}
+    with open(resume_file, "w") as f:
+        json.dump(resume_data, f)
+
+    response = client.get("/tasks/next", params={"worker_id": "worker-1"})
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["infohash"] == infohash
+    assert data["resume_data"] == resume_data
+
+    # 验证文件是否已被删除
+    assert not os.path.exists(resume_file)
+
+    # 清理
+    if os.path.exists(resume_dir) and not os.listdir(resume_dir):
+        os.rmdir(resume_dir)
 
 def test_list_all_tasks_with_pagination(client):
     """测试 /tasks/all/ 分页端点是否能正常工作。"""
