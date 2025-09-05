@@ -10,7 +10,8 @@ from scheduler.database import Base
 from scheduler import crud, models, schemas
 
 # --- 测试数据库设置 ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
+import os
+SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
@@ -187,3 +188,55 @@ def test_reset_stuck_tasks(db_session):
     updated_task = crud.get_task_by_infohash(db_session, infohash)
     assert updated_task.status == 'pending'
     assert updated_task.assigned_worker_id is None
+
+
+def test_update_details_race_condition(db_session):
+    """
+    测试 `update_task_details` 和 `record_screenshot` 之间的竞态条件。
+    在没有锁的情况下，此测试应该会失败，因为其中一个更新会被另一个覆盖。
+    """
+    import threading
+    import time
+
+    infohash = "race_condition_task"
+    initial_task = schemas.TaskCreate(infohash=infohash)
+    crud.create_task(db_session, task=initial_task)
+
+    # 模拟两个并发操作
+    def update_details_worker():
+        """工作线程1：更新任务详情"""
+        # 每个线程需要自己的数据库会话
+        db = TestingSessionLocal()
+        try:
+            details_to_update = schemas.TaskDetailsUpdate(video_filename="new_video.mp4")
+            # 直接调用我们正在测试的、已修复的函数
+            crud.update_task_details(db, infohash=infohash, details=details_to_update)
+        finally:
+            db.close()
+
+    def record_screenshot_worker():
+        """工作线程2：记录截图"""
+        db = TestingSessionLocal()
+        try:
+            # crud.record_screenshot 内部使用了锁，是安全的
+            crud.record_screenshot(db, infohash=infohash, filename="screenshot.jpg")
+        finally:
+            db.close()
+
+    # 创建并启动线程
+    thread1 = threading.Thread(target=update_details_worker)
+    thread2 = threading.Thread(target=record_screenshot_worker)
+
+    thread1.start()
+    thread2.start()
+
+    # 等待两个线程完成
+    thread1.join()
+    thread2.join()
+
+    # 验证最终结果
+    final_task = crud.get_task_by_infohash(db_session, infohash)
+    assert final_task is not None
+    # 在没有修复的情况下，下面的一条或两条断言可能会失败
+    assert final_task.video_filename == "new_video.mp4"
+    assert final_task.successful_screenshots == ["screenshot.jpg"]

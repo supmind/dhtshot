@@ -222,12 +222,15 @@ def update_task_details(db: Session, infohash: str, details: schemas.TaskDetails
     更新任务的详细信息，如 torrent 名称、视频文件名和时长。
     这个函数会忽略值为 None 的字段，只更新被提供值的字段。
 
+    此函数通过 `with_for_update()` 实现了悲观锁，以防止在并发更新时
+    出现“丢失更新”的竞态条件。
+
     :param db: 数据库会话。
     :param infohash: 要更新的任务的 infohash。
     :param details: 包含要更新的详细信息的 Pydantic schema 对象。
     :return: 更新后的 Task 对象，如果任务不存在则返回 None。
     """
-    db_task = get_task_by_infohash(db, infohash=infohash)
+    db_task = db.query(models.Task).filter(models.Task.infohash == infohash).with_for_update().first()
     if db_task:
         # 使用 model_dump 替代已废弃的 dict，并排除未设置的字段
         update_data = details.model_dump(exclude_unset=True)
