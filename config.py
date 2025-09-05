@@ -30,9 +30,8 @@ class Settings(BaseSettings):
     # 请根据您的硬件资源（CPU, 内存, 网络）和预期的负载来调整它们。
     lt_listen_interfaces: str = "0.0.0.0:6881"  # libtorrent 监听的端口和网络接口
     lt_active_limit: int = 500  # 同时处理的活动 torrent 最大数量
-    lt_active_downloads: int = 500  # 同时处理的下载中 torrent 最大数量
     lt_connections_limit: int = 4096  # 全局最大连接数
-    lt_cache_size: int = 2048  # 磁盘 I/O 缓存大小，单位为 16KB 块 (例如 2048 * 16KB = 32MB)
+    lt_cache_size: int = 8192  # 磁盘 I/O 缓存大小，单位为 16KB 块 (例如 8192 * 16KB = 128MB)
     lt_upload_rate_limit: int = 0  # 全局上传速率限制，单位 B/s (0 表示无限制)
     lt_download_rate_limit: int = 0  # 全局下载速率限制，单位 B/s (0 表示无限制)
     lt_peer_connect_timeout: int = 10  # 连接 peer 的超时时间（秒）

@@ -200,16 +200,9 @@ class KeyframeExtractor:
                     if config_box_payload and len(config_box_payload.getvalue()) > 5:
                         self.mode = 'avc1' if self.codec_name in ['h264', 'hevc'] else 'av01'
                         config_data = config_box_payload.getvalue()
-
-                        if self.codec_name == 'h264':
-                            self.extradata = config_data
-                            self.nal_length_size = (config_data[4] & 0x03) + 1
-                        elif self.codec_name == 'hevc':
-                            self.extradata = self._parse_hvcC_extradata(config_data)
-                            self.nal_length_size = (config_data[21] & 0x03) + 1
-                        elif self.codec_name == 'av1':
-                            self.extradata = config_data
-
+                        self.extradata = config_data
+                        if self.codec_name == 'h264': self.nal_length_size = (config_data[4] & 0x03) + 1
+                        elif self.codec_name == 'hevc': self.nal_length_size = (config_data[21] & 0x03) + 1
                     else: # 回退到带内配置
                         self.mode = 'avc3'
                 else: # 带内配置 (In-band)
@@ -274,30 +267,3 @@ class KeyframeExtractor:
         keyframe_samples = [s for s in self.samples if s.is_keyframe]
         self.keyframes = [Keyframe(i, s.index, s.pts, self.timescale) for i, s in enumerate(keyframe_samples)]
         log.info("完成采样地图构建。共找到 %d 个样本，其中 %d 个是关键帧。", len(self.samples), len(self.keyframes))
-
-    def _parse_hvcC_extradata(self, config_data: bytes) -> bytes:
-        """
-        解析 hvcC box，提取 VPS, SPS, PPS 等参数集，并将其格式化为
-        解码器期望的 Annex B 格式的 extradata。
-
-        Annex B 格式要求每个 NAL 单元前都有一个起始码 (0x00000001)。
-        """
-        stream = BytesIO(config_data)
-        stream.seek(22) # 跳转到 numOfArrays 字段
-        num_of_arrays = struct.unpack('>B', stream.read(1))[0]
-
-        annexb_extradata = bytearray()
-        start_code = b'\x00\x00\x00\x01'
-
-        for _ in range(num_of_arrays):
-            # 读取数组信息：array_completeness (1 bit), reserved (1 bit), NAL_unit_type (6 bits)
-            stream.read(1)
-
-            num_nalus = struct.unpack('>H', stream.read(2))[0]
-            for _ in range(num_nalus):
-                nalu_len = struct.unpack('>H', stream.read(2))[0]
-                nalu_data = stream.read(nalu_len)
-                annexb_extradata.extend(start_code)
-                annexb_extradata.extend(nalu_data)
-
-        return bytes(annexb_extradata)
