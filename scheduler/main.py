@@ -221,32 +221,17 @@ def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="工作节点未找到，请先注册。")
     return db_worker
 
-@app.post("/screenshots/{infohash}", response_model=schemas.Task, tags=["截图管理"])
-async def upload_screenshot(
-    infohash: str,
-    db: Session = Depends(get_db),
-    file: UploadFile = File(..., description="JPEG 格式的截图文件")
-):
-    """
-    接收工作节点上传的截图文件，并将其与任务关联。
-    此操作会原子性地将截图文件名记录到任务的数据库条目中。
-    """
-    save_dir = f"screenshots_output/{infohash}"
-    os.makedirs(save_dir, exist_ok=True)
-    file_path = os.path.join(save_dir, file.filename)
 
-    # 保存上传的文件到服务器
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # 在数据库中记录截图信息
-    db_task = crud.record_screenshot(db, infohash=infohash, filename=file.filename)
+@app.post("/tasks/{infohash}/screenshots", response_model=schemas.Task, tags=["任务管理"])
+async def record_screenshot_endpoint(infohash: str, record: schemas.ScreenshotRecord, db: Session = Depends(get_db)):
+    """
+    记录一个已成功上传到对象存储的截图文件名。
+    """
+    db_task = crud.record_screenshot(db, infohash=infohash, filename=record.filename)
     if db_task is None:
-        # 如果任务不存在，这是一个异常情况，删除已上传的孤立文件
-        os.remove(file_path)
         raise HTTPException(status_code=404, detail="未找到与此截图关联的任务。")
-
     return db_task
+
 
 @app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["任务管理"])
 async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db)):

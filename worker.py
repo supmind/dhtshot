@@ -83,19 +83,17 @@ class SchedulerAPIClient:
             log.error(f"连接调度器获取任务时出错: {e}")
         return None
 
-    async def upload_screenshot_from_bytes(self, infohash: str, image_bytes: bytes, timestamp_str: str):
-        """从内存中的字节直接上传一个已生成的截图。"""
-        filename = f"{infohash}_{timestamp_str.replace(':', '-')}.jpg"
-        log.info(f"[{infohash}] 准备从内存上传截图 {filename}...")
-        upload_url = f"{self._url}/screenshots/{infohash}"
+    async def record_screenshot(self, infohash: str, filename: str):
+        """向调度器报告一个截图已成功生成并上传。"""
+        log.info(f"[{infohash}] 正在向调度器报告截图: {filename}")
+        url = f"{self._url}/tasks/{infohash}/screenshots"
+        payload = {"filename": filename}
         try:
-            data = aiohttp.FormData()
-            data.add_field('file', image_bytes, filename=filename, content_type='image/jpeg')
-            async with self._session.post(upload_url, data=data) as response:
+            async with self._session.post(url, json=payload) as response:
                 if response.status != 200:
-                    log.error(f"[{infohash}] 上传/记录截图 {filename} 失败。状态码: {response.status}, 响应: {await response.text()}")
+                    log.error(f"[{infohash}] 报告截图失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
-            log.error(f"[{infohash}] 上传截图 {filename} 时发生连接错误: {e}")
+            log.error(f"[{infohash}] 报告截图时发生连接错误: {e}")
 
     async def update_task_status(self, infohash: str, status: str, message: str, resume_data: Optional[dict]):
         """向调度器报告任务的最终状态。"""
@@ -151,11 +149,76 @@ class SchedulerAPIClient:
             log.warning(f"发送心跳时发生连接错误: {e}")
 
 
+# --- R2 Uploader ---
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+
+class R2Uploader:
+    """
+    一个封装了向 Cloudflare R2 上传逻辑的类。
+    """
+    def __init__(self, settings: Settings):
+        if not BOTO3_AVAILABLE:
+            log.warning("boto3 未安装，R2 上传功能将被禁用。")
+            self.client = None
+            return
+
+        if not all([settings.r2_endpoint_url, settings.r2_access_key_id, settings.r2_secret_access_key, settings.r2_bucket_name]):
+            log.warning("R2 配置不完整，上传功能将被禁用。请检查 .env 文件。")
+            self.client = None
+            return
+
+        self.client = boto3.client(
+            's3',
+            endpoint_url=settings.r2_endpoint_url,
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            region_name="auto" # R2 通常使用 "auto"
+        )
+        self.bucket_name = settings.r2_bucket_name
+        log.info(f"R2 Uploader 已初始化，目标存储桶: {self.bucket_name}")
+
+    def upload(self, data: bytes, object_name: str) -> bool:
+        """
+        将字节数据上传到 R2 存储桶。
+
+        :param data: 要上传的字节数据。
+        :param object_name: 在存储桶中的对象名称 (包含路径)。
+        :return: 上传成功返回 True，否则返回 False。
+        """
+        if not self.client:
+            log.error("R2 客户端未初始化，上传操作中止。")
+            return False
+        try:
+            self.client.put_object(Bucket=self.bucket_name, Key=object_name, Body=data, ContentType='image/jpeg')
+            log.info(f"成功上传 {object_name} 到 R2 存储桶 {self.bucket_name}")
+        except ClientError as e:
+            log.error(f"上传到 R2 时发生错误: {e}")
+            return False
+        return True
+
+
 # --- 回调函数定义 ---
 
-async def on_screenshot_generated(client: SchedulerAPIClient, infohash: str, image_bytes: bytes, timestamp_str: str):
-    """当 ScreenshotService 成功生成一个截图的字节数据时被调用的回调函数。"""
-    await client.upload_screenshot_from_bytes(infohash, image_bytes, timestamp_str)
+async def on_screenshot_generated(uploader: R2Uploader, client: SchedulerAPIClient, infohash: str, image_bytes: bytes, timestamp_str: str):
+    """
+    当 ScreenshotService 成功生成一个截图的字节数据时被调用的回调函数。
+    它负责将截图上传到 R2，并在成功后通知调度器。
+    """
+    filename = f"{infohash}_{timestamp_str}.jpg"
+    object_name = f"{infohash}/{filename}"
+
+    # 在事件循环的默认执行器中运行阻塞的上传操作
+    loop = asyncio.get_running_loop()
+    success = await loop.run_in_executor(None, uploader.upload, image_bytes, object_name)
+
+    if success:
+        await client.record_screenshot(infohash, filename)
 
 async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: str, message: str, **kwargs):
     """当 ScreenshotService 完成一个任务时被调用的回调函数。"""
@@ -229,11 +292,13 @@ async def run_worker(session: aiohttp.ClientSession):
         log.error("无法向调度器注册，程序退出。")
         return
 
+    uploader = R2Uploader(settings)
+
     service = ScreenshotService(
         settings=settings,
         loop=loop,
         status_callback=partial(on_task_finished, client),
-        screenshot_callback=partial(on_screenshot_generated, client),
+        screenshot_callback=partial(on_screenshot_generated, uploader, client),
         details_callback=partial(on_task_details_extracted, client)
     )
     await service.run()

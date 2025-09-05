@@ -50,6 +50,10 @@ class TaskDetailsUpdate(BaseModel):
     video_duration_seconds: Optional[int] = None
 
 
+class ScreenshotRecord(BaseModel):
+    filename: str = Field(..., description="要记录的截图文件名。")
+
+
 # --- 工作节点 (Worker) 相关的模型 ---
 
 class WorkerBase(BaseModel):

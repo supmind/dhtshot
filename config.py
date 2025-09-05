@@ -42,3 +42,10 @@ class Settings(BaseSettings):
     moov_probe_timeout: int = 120  # 2 minutes
     piece_fetch_timeout: int = 60  # 1 minute
     piece_queue_timeout: int = 300  # 5 minutes
+
+    # --- R2 存储设置 ---
+    # 请在 .env 文件中配置这些值
+    r2_endpoint_url: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""

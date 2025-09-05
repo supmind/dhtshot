@@ -211,16 +211,25 @@ def test_worker_heartbeat(client):
     assert data["active_tasks_count"] == 1
     assert data["queue_size"] == 5
 
-def test_upload_screenshot(client):
-    infohash = "upload_hash"
+def test_record_screenshot_endpoint(client):
+    """测试记录截图文件名的 API 端点。"""
+    infohash = "record_screenshot_hash"
     client.post("/tasks/", data={"infohash": infohash})
-    response = client.post(
-        f"/screenshots/{infohash}",
-        files={"file": ("test.jpg", BytesIO(b"content"), "image/jpeg")}
-    )
-    assert response.status_code == 200
-    task_data = client.get(f"/tasks/{infohash}").json()
-    assert "test.jpg" in task_data["successful_screenshots"]
+
+    # 记录第一个截图
+    payload1 = {"filename": "screenshot_01.jpg"}
+    response1 = client.post(f"/tasks/{infohash}/screenshots", json=payload1)
+    assert response1.status_code == 200
+    data1 = response1.json()
+    assert "screenshot_01.jpg" in data1["successful_screenshots"]
+
+    # 记录第二个截图
+    payload2 = {"filename": "screenshot_02.jpg"}
+    response2 = client.post(f"/tasks/{infohash}/screenshots", json=payload2)
+    assert response2.status_code == 200
+    data2 = response2.json()
+    assert "screenshot_01.jpg" in data2["successful_screenshots"]
+    assert "screenshot_02.jpg" in data2["successful_screenshots"]
 
 def test_update_status_success_deletes_metadata(client):
     """测试任务状态更新为 'success' 时，是否会删除关联的元数据文件。"""
