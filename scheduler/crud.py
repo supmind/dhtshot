@@ -96,6 +96,7 @@ def reset_stuck_tasks(db: Session, timeout_seconds: int) -> int:
     db.commit()
     return updated_count
 
+
 def get_worker_by_id(db: Session, worker_id: str) -> Optional[models.Worker]:
     """
     根据 worker_id 从数据库中检索工作节点。

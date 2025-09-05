@@ -226,11 +226,6 @@ class KeyframeExtractor:
                 found_codec = True; break
         if not found_codec: raise ValueError("在 'stsd' Box 中未找到任何受支持的视频采样条目 (H.264, H.265, AV1)。")
 
-        # 新增：对 avc3 格式的健壮性检查
-        if self.codec_name == 'h264' and self.mode == 'avc3' and self.extradata is None:
-            log.warning("检测到 H.264 视频流使用 'avc3' (带内参数)，但未找到 extradata。此模式当前不受支持。")
-            raise ValueError("不支持不带 extradata 的 H.264 'avc3' 模式。")
-
         # --- 2. 构建采样地图 ---
         # stsz: Sample Size Box - 包含每个样本的大小。
         stsz_payload = tables.get('stsz'); stsz_payload.seek(4)
