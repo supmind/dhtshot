@@ -83,22 +83,19 @@ class SchedulerAPIClient:
             log.error(f"连接调度器获取任务时出错: {e}")
         return None
 
-    async def upload_screenshot(self, infohash: str, filepath: str):
-        """上传一个已生成的截图文件。"""
-        log.info(f"[{infohash}] 截图已保存至 {filepath}。准备上传...")
-        filename = os.path.basename(filepath)
+    async def upload_screenshot_from_bytes(self, infohash: str, image_bytes: bytes, timestamp_str: str):
+        """从内存中的字节直接上传一个已生成的截图。"""
+        filename = f"{infohash}_{timestamp_str.replace(':', '-')}.jpg"
+        log.info(f"[{infohash}] 准备从内存上传截图 {filename}...")
         upload_url = f"{self._url}/screenshots/{infohash}"
         try:
-            with open(filepath, "rb") as f:
-                data = aiohttp.FormData()
-                data.add_field('file', f, filename=filename, content_type='image/jpeg')
-                async with self._session.post(upload_url, data=data) as response:
-                    if response.status != 200:
-                        log.error(f"[{infohash}] 上传/记录截图 {filename} 失败。状态码: {response.status}, 响应: {await response.text()}")
+            data = aiohttp.FormData()
+            data.add_field('file', image_bytes, filename=filename, content_type='image/jpeg')
+            async with self._session.post(upload_url, data=data) as response:
+                if response.status != 200:
+                    log.error(f"[{infohash}] 上传/记录截图 {filename} 失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
             log.error(f"[{infohash}] 上传截图 {filename} 时发生连接错误: {e}")
-        except FileNotFoundError:
-            log.error(f"[{infohash}] 找不到待上传的文件: {filepath}")
 
     async def update_task_status(self, infohash: str, status: str, message: str, resume_data: Optional[dict]):
         """向调度器报告任务的最终状态。"""
@@ -146,9 +143,9 @@ class SchedulerAPIClient:
 
 # --- 回调函数定义 ---
 
-async def on_screenshot_saved(client: SchedulerAPIClient, infohash: str, filepath: str):
-    """当 ScreenshotService 成功保存一个截图文件时被调用的回调函数。"""
-    await client.upload_screenshot(infohash, filepath)
+async def on_screenshot_generated(client: SchedulerAPIClient, infohash: str, image_bytes: bytes, timestamp_str: str):
+    """当 ScreenshotService 成功生成一个截图的字节数据时被调用的回调函数。"""
+    await client.upload_screenshot_from_bytes(infohash, image_bytes, timestamp_str)
 
 async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: str, message: str, **kwargs):
     """当 ScreenshotService 完成一个任务时被调用的回调函数。"""
@@ -228,7 +225,7 @@ async def run_worker(session: aiohttp.ClientSession):
         settings=settings,
         loop=loop,
         status_callback=on_task_finished_with_counter,
-        screenshot_callback=partial(on_screenshot_saved, client)
+        screenshot_callback=partial(on_screenshot_generated, client)
     )
     await service.run()
     log.info("ScreenshotService 已在后台运行。")
