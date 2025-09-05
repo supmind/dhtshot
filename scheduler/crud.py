@@ -229,9 +229,17 @@ def update_task_details(db: Session, infohash: str, details: schemas.TaskDetails
     """
     db_task = get_task_by_infohash(db, infohash=infohash)
     if db_task:
-        update_data = details.dict(exclude_unset=True)
-        for key, value in update_data.items():
-            setattr(db_task, key, value)
+        # 使用 model_dump 替代已废弃的 dict，并排除未设置的字段
+        update_data = details.model_dump(exclude_unset=True)
+
+        # 显式地更新每个字段，以提高代码的清晰度和健壮性
+        if "torrent_name" in update_data:
+            db_task.torrent_name = update_data["torrent_name"]
+        if "video_filename" in update_data:
+            db_task.video_filename = update_data["video_filename"]
+        if "video_duration_seconds" in update_data:
+            db_task.video_duration_seconds = update_data["video_duration_seconds"]
+
         db.commit()
         db.refresh(db_task)
     return db_task
