@@ -49,6 +49,7 @@ class TorrentClient:
 
             # 性能调优设置
             'active_limit': app_settings.lt_active_limit,
+            'active_downloads': app_settings.lt_active_downloads,
             'connections_limit': app_settings.lt_connections_limit,
             'upload_rate_limit': app_settings.lt_upload_rate_limit,
             'download_rate_limit': app_settings.lt_download_rate_limit,
