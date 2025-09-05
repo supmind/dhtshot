@@ -144,7 +144,7 @@ def get_pending_tasks_count(db: Session) -> int:
     return db.query(models.Task).filter(models.Task.status == 'pending').count()
 
 
-def update_worker_status(db: Session, worker_id: str, status: str, active_tasks_count: int, queue_size: int, processed_tasks_count: int) -> Optional[models.Worker]:
+def update_worker_status(db: Session, worker_id: str, status: str, active_tasks_count: int, queue_size: int) -> Optional[models.Worker]:
     """
     更新一个工作节点的状态和最后心跳时间。
 
@@ -153,7 +153,6 @@ def update_worker_status(db: Session, worker_id: str, status: str, active_tasks_
     :param status: 工作节点的新状态。
     :param active_tasks_count: 工作节点正在执行的任务数。
     :param queue_size: 工作节点内部的队列大小。
-    :param processed_tasks_count: 工作节点已处理的任务总数。
     :return: 更新后的 Worker 对象，如果工作节点不存在则返回 None。
     """
     db_worker = get_worker_by_id(db, worker_id=worker_id)
@@ -162,7 +161,6 @@ def update_worker_status(db: Session, worker_id: str, status: str, active_tasks_
         db_worker.status = status
         db_worker.active_tasks_count = active_tasks_count
         db_worker.queue_size = queue_size
-        db_worker.processed_tasks_count = processed_tasks_count
         db.commit()
         db.refresh(db_worker)
     return db_worker

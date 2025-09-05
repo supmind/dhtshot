@@ -65,7 +65,7 @@ def test_update_non_existent_worker_status(db_session):
     """测试更新一个不存在的工作节点状态时应返回 None。"""
     updated_worker = crud.update_worker_status(
         db_session, worker_id="non_existent_worker", status="busy",
-        active_tasks_count=0, queue_size=0, processed_tasks_count=0
+        active_tasks_count=0, queue_size=0
     )
     assert updated_worker is None
 
@@ -74,12 +74,11 @@ def test_update_worker_status(db_session):
     crud.create_worker(db_session, worker=schemas.WorkerCreate(worker_id="worker-002", status="idle"))
     updated_worker = crud.update_worker_status(
         db_session, worker_id="worker-002", status="busy",
-        active_tasks_count=1, queue_size=1, processed_tasks_count=10
+        active_tasks_count=1, queue_size=1
     )
     assert updated_worker.status == "busy"
     assert updated_worker.active_tasks_count == 1
     assert updated_worker.queue_size == 1
-    assert updated_worker.processed_tasks_count == 10
 
 def test_get_and_assign_next_task(db_session):
     """测试原子性地获取并分配下一个待处理任务的功能。"""

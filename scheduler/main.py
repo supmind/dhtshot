@@ -206,8 +206,7 @@ def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(g
         worker_id=heartbeat.worker_id,
         status=heartbeat.status,
         active_tasks_count=heartbeat.active_tasks_count,
-        queue_size=heartbeat.queue_size,
-        processed_tasks_count=heartbeat.processed_tasks_count
+        queue_size=heartbeat.queue_size
     )
     if db_worker is None:
         raise HTTPException(status_code=404, detail="工作节点未找到，请先注册。")

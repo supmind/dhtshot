@@ -54,7 +54,6 @@ class WorkerHeartbeat(WorkerBase):
     status: str
     active_tasks_count: int
     queue_size: int
-    processed_tasks_count: int
 
 class Worker(WorkerBase):
     id: int
@@ -63,7 +62,6 @@ class Worker(WorkerBase):
     last_seen_at: datetime.datetime
     active_tasks_count: int
     queue_size: int
-    processed_tasks_count: int = 0
 
     class Config:
         orm_mode = True
