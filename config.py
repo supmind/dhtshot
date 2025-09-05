@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     # --- 调度器设置 ---
     scheduler_url: str = "http://127.0.0.1:8000"
     db_url: str = "sqlite:///./scheduler.db"
+    scheduler_api_key: str = "a_very_secret_and_complex_key_for_dev" # 用于保护调度器 API 的密钥
 
     # --- 工作节点设置 ---
     num_workers: int = 50  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量

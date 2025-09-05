@@ -50,16 +50,21 @@ class SchedulerAPIClient:
     一个封装了与调度器所有 API 交互的客户端。
     这使得网络逻辑集中化，并简化了测试（通过 mock 这个类而不是网络请求）。
     """
-    def __init__(self, session: aiohttp.ClientSession, scheduler_url: str):
+    def __init__(self, session: aiohttp.ClientSession, scheduler_url: str, api_key: str):
         self._session = session
         self._url = scheduler_url
+        self._api_key = api_key
+
+    def _get_headers(self) -> Dict[str, str]:
+        """构造带有认证信息的请求头。"""
+        return {"X-API-Key": self._api_key}
 
     async def register(self, worker_id: str) -> bool:
         """向调度器注册当前工作节点。"""
         url = f"{self._url}/workers/register"
         payload = {"worker_id": worker_id, "status": "idle"}
         try:
-            async with self._session.post(url, json=payload) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
                 if response.status == 200:
                     log.info(f"工作节点 {worker_id} 注册成功。")
                     return True
@@ -73,7 +78,7 @@ class SchedulerAPIClient:
         """向调度器请求下一个待处理的任务。"""
         url = f"{self._url}/tasks/next?worker_id={worker_id}"
         try:
-            async with self._session.get(url, timeout=15) as response:
+            async with self._session.get(url, timeout=15, headers=self._get_headers()) as response:
                 if response.status == 200:
                     return await response.json()
                 elif response.status == 204:
@@ -89,7 +94,7 @@ class SchedulerAPIClient:
         url = f"{self._url}/tasks/{infohash}/screenshots"
         payload = {"filename": filename}
         try:
-            async with self._session.post(url, json=payload) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 报告截图失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -108,7 +113,7 @@ class SchedulerAPIClient:
 
         payload = {"status": status, "message": str(message), "resume_data": resume_data}
         try:
-            async with self._session.post(url, json=payload) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 报告最终状态失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -119,7 +124,7 @@ class SchedulerAPIClient:
         log.info(f"[{infohash}] 正在上报任务详情: {details}")
         url = f"{self._url}/tasks/{infohash}/details"
         try:
-            async with self._session.post(url, json=details) as response:
+            async with self._session.post(url, json=details, headers=self._get_headers()) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 上报任务详情失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -142,7 +147,7 @@ class SchedulerAPIClient:
             "queue_size": queue_size,
         }
         try:
-            async with self._session.post(url, json=payload) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
                 if response.status != 200:
                     log.warning(f"发送心跳失败。状态码: {response.status}")
         except aiohttp.ClientError as e:
@@ -287,7 +292,7 @@ async def run_worker(session: aiohttp.ClientSession):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    client = SchedulerAPIClient(session, settings.scheduler_url)
+    client = SchedulerAPIClient(session, settings.scheduler_url, settings.scheduler_api_key)
     if not await client.register(WORKER_ID):
         log.error("无法向调度器注册，程序退出。")
         return

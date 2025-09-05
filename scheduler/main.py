@@ -16,6 +16,7 @@ import json
 
 from . import crud, models, schemas
 from .database import SessionLocal, engine
+from .security import get_api_key
 
 # --- 日志配置 ---
 logging.basicConfig(level=logging.INFO)
@@ -89,7 +90,8 @@ async def create_or_reactivate_task(
     response: Response,
     infohash: str = Form(..., max_length=40, description="任务的 Infohash"),
     torrent_file: Optional[UploadFile] = File(None, description="可选的 .torrent 元数据文件"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     创建新任务或重新激活一个已存在的任务。
@@ -123,7 +125,7 @@ async def create_or_reactivate_task(
     return new_task
 
 @app.get("/tasks/next", response_model=Optional[schemas.NextTaskResponse], tags=["任务管理"])
-def get_next_task(worker_id: str = Query(..., description="请求任务的工作节点ID"), db: Session = Depends(get_db)):
+def get_next_task(worker_id: str = Query(..., description="请求任务的工作节点ID"), db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     为工作节点获取下一个待处理的任务。
     此端点会原子性地查询并分配一个 'pending' 状态的任务。
@@ -162,7 +164,7 @@ def get_next_task(worker_id: str = Query(..., description="请求任务的工作
     return schemas.NextTaskResponse(**response_data)
 
 @app.get("/tasks/{infohash}", response_model=schemas.Task, tags=["任务管理"])
-def read_task(infohash: str, db: Session = Depends(get_db)):
+def read_task(infohash: str, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """根据 Infohash 查询特定任务的状态和详情。"""
     db_task = crud.get_task_by_infohash(db, infohash=infohash)
     if db_task is None:
@@ -174,7 +176,8 @@ def list_all_tasks(
     status: Optional[str] = Query(None, description="按任务状态筛选 (e.g., pending, working, success)"),
     skip: int = Query(0, ge=0, description="分页查询的起始位置"),
     limit: int = Query(100, ge=1, le=500, description="每页返回的任务数量"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     分页列出系统中的所有任务，可选择按状态进行筛选。
@@ -183,7 +186,7 @@ def list_all_tasks(
     return {"total": total, "tasks": tasks}
 
 @app.post("/workers/register", response_model=schemas.Worker, tags=["工作节点管理"])
-def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db)):
+def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     注册一个新的工作节点或更新一个已存在节点的状态。
     此端点是幂等的。如果工作节点已存在，则更新其状态和最后心跳时间；
@@ -192,7 +195,7 @@ def register_worker(worker: schemas.WorkerCreate, db: Session = Depends(get_db))
     return crud.upsert_worker(db=db, worker_id=worker.worker_id, status=worker.status)
 
 @app.get("/tasks/queue/size", response_model=int, tags=["任务管理"])
-def get_queue_size(db: Session = Depends(get_db)):
+def get_queue_size(db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """获取当前待处理任务队列的大小。"""
     return crud.get_pending_tasks_count(db)
 
@@ -200,7 +203,8 @@ def get_queue_size(db: Session = Depends(get_db)):
 def list_all_workers(
     skip: int = Query(0, ge=0, description="分页查询的起始位置"),
     limit: int = Query(100, ge=1, le=500, description="每页返回的工作节点数量"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """分页列出所有已注册的工作节点。"""
     total, workers = crud.get_workers(db, skip=skip, limit=limit)
@@ -208,7 +212,7 @@ def list_all_workers(
 
 
 @app.post("/workers/heartbeat", response_model=schemas.Worker, tags=["工作节点管理"])
-def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(get_db)):
+def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """接收工作节点的心跳，更新其状态和最后在线时间。"""
     db_worker = crud.update_worker_status(
         db,
@@ -223,7 +227,7 @@ def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(g
 
 
 @app.post("/tasks/{infohash}/screenshots", response_model=schemas.Task, tags=["任务管理"])
-async def record_screenshot_endpoint(infohash: str, record: schemas.ScreenshotRecord, db: Session = Depends(get_db)):
+async def record_screenshot_endpoint(infohash: str, record: schemas.ScreenshotRecord, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     记录一个已成功上传到对象存储的截图文件名。
     """
@@ -234,7 +238,7 @@ async def record_screenshot_endpoint(infohash: str, record: schemas.ScreenshotRe
 
 
 @app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["任务管理"])
-async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db)):
+async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     更新一个任务的最终状态。
     如果提供了 resume_data，它将被保存为文件，用于未来的任务恢复。
@@ -281,7 +285,7 @@ async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusU
 
 
 @app.post("/tasks/{infohash}/details", response_model=schemas.Task, tags=["任务管理"])
-async def update_task_details_endpoint(infohash: str, details: schemas.TaskDetailsUpdate, db: Session = Depends(get_db)):
+async def update_task_details_endpoint(infohash: str, details: schemas.TaskDetailsUpdate, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     更新任务的元数据详情，如种子名称、视频文件名和时长。
     此端点由工作节点在解析任务后调用。
