@@ -158,8 +158,6 @@ def get_next_task(worker_id: str = Query(..., description="请求任务的工作
             with open(metadata_path, "rb") as f:
                 metadata_bytes = f.read()
                 response_data["metadata"] = base64.b64encode(metadata_bytes).decode('ascii')
-            # 成功分配后删除元数据文件，以防磁盘空间膨胀
-            os.remove(metadata_path)
 
     return schemas.NextTaskResponse(**response_data)
 
@@ -269,6 +267,17 @@ async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusU
             # 即使保存失败，也继续更新任务状态，但不抛出500错误
             # 因为状态更新更重要
             pass
+
+    # 如果任务成功完成，则清理相关的元数据文件
+    if update.status == 'success':
+        METADATA_DIR = "temp_metadata"
+        metadata_path = os.path.join(METADATA_DIR, f"{infohash}.torrent")
+        if os.path.exists(metadata_path):
+            try:
+                os.remove(metadata_path)
+                log.info(f"任务 {infohash} 成功，已清理元数据文件: {metadata_path}")
+            except OSError as e:
+                log.error(f"清理元数据文件 {metadata_path} 时失败: {e}")
 
     try:
         db_task = crud.update_task_status(

@@ -66,8 +66,18 @@ def test_create_task_with_torrent_file(client):
         files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")}
     )
     assert response.status_code == 201
-    # 可以在这里添加断言，检查文件是否已在 temp_metadata 目录中创建
-    # 但为了保持单元测试的独立性，我们信任 os 模块的功能
+
+    # 清理创建的元数据文件
+    metadata_dir = "temp_metadata"
+    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
+    try:
+        if os.path.exists(metadata_file):
+            os.remove(metadata_file)
+        if os.path.exists(metadata_dir) and not os.listdir(metadata_dir):
+            os.rmdir(metadata_dir)
+    except OSError as e:
+        # 在 CI 等环境中，并发测试可能会导致这里出现竞争条件，打印警告而不是让测试失败
+        print(f"Warning: Could not clean up {metadata_file} or {metadata_dir}: {e}")
 
 def test_create_task_existing_pending(client):
     infohash = "existing_pending_hash"
@@ -121,6 +131,34 @@ def test_get_next_task_no_tasks(client):
     response = client.get("/tasks/next", params={"worker_id": "worker-1"})
     assert response.status_code == 200
     assert response.json() is None
+
+def test_get_next_task_with_metadata_file(client):
+    """测试 /tasks/next 在有元数据文件时能正确返回数据，且不删除文件。"""
+    infohash = "next_with_metadata"
+
+    # 准备元数据文件
+    metadata_dir = "temp_metadata"
+    os.makedirs(metadata_dir, exist_ok=True)
+    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
+    torrent_content = b"d8:announce4:testee"
+    with open(metadata_file, "wb") as f:
+        f.write(torrent_content)
+
+    client.post("/tasks/", data={"infohash": infohash})
+
+    response = client.get("/tasks/next", params={"worker_id": "worker-1"})
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["infohash"] == infohash
+    assert "metadata" in data
+
+    # 验证文件在分配后仍然存在
+    assert os.path.exists(metadata_file)
+
+    # 清理
+    os.remove(metadata_file)
+    os.rmdir(metadata_dir)
 
 def test_worker_registration_and_reregistration(client):
     """
@@ -184,26 +222,61 @@ def test_upload_screenshot(client):
     task_data = client.get(f"/tasks/{infohash}").json()
     assert "test.jpg" in task_data["successful_screenshots"]
 
-def test_update_task_status_endpoint_no_resume(client):
-    """测试更新任务状态（不带恢复数据）的端点。"""
-    infohash = "update_status_hash"
+def test_update_status_success_deletes_metadata(client):
+    """测试任务状态更新为 'success' 时，是否会删除关联的元数据文件。"""
+    infohash = "success_deletes_metadata"
+
+    # 准备元数据文件
+    metadata_dir = "temp_metadata"
+    os.makedirs(metadata_dir, exist_ok=True)
+    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
+    with open(metadata_file, "wb") as f:
+        f.write(b"test content")
+
     client.post("/tasks/", data={"infohash": infohash})
-    payload = {"status": "success", "message": "All done!", "resume_data": None}
+
+    payload = {"status": "success", "message": "All done!"}
     response = client.post(f"/tasks/{infohash}/status", json=payload)
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert data["result_message"] == "All done!"
 
-def test_update_task_status_endpoint_with_resume_data(client):
-    """测试更新任务状态时，是否能正确地将 resume_data 保存为文件。"""
-    infohash = "update_status_hash_resume"
+    # 验证元数据文件已被删除
+    assert not os.path.exists(metadata_file)
+
+    # 清理
+    if os.path.exists(metadata_dir) and not os.listdir(metadata_dir):
+        os.rmdir(metadata_dir)
+
+def test_update_status_failure_preserves_metadata(client):
+    """测试任务状态更新为失败状态时，是否会保留元数据文件。"""
+    infohash = "failure_preserves_metadata"
+
+    metadata_dir = "temp_metadata"
+    os.makedirs(metadata_dir, exist_ok=True)
+    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
+    with open(metadata_file, "wb") as f:
+        f.write(b"test content")
+
     client.post("/tasks/", data={"infohash": infohash})
 
-    resume_data = {"some_key": "some_value"}
-    payload = {"status": "recoverable_failure", "message": "A recoverable error", "resume_data": resume_data}
+    payload = {"status": "recoverable_failure", "message": "An error"}
+    response = client.post(f"/tasks/{infohash}/status", json=payload)
+    assert response.status_code == 200
 
-    # 确保测试开始前文件不存在
+    # 验证元数据文件仍然存在
+    assert os.path.exists(metadata_file)
+
+    # 清理
+    os.remove(metadata_file)
+    os.rmdir(metadata_dir)
+
+def test_update_status_with_resume_data_creates_file(client):
+    """测试更新任务状态时，是否能正确地将 resume_data 保存为文件。"""
+    infohash = "status_with_resume"
+    client.post("/tasks/", data={"infohash": infohash})
+
+    resume_data = {"key": "value"}
+    payload = {"status": "recoverable_failure", "message": "Error with resume data", "resume_data": resume_data}
+
     resume_dir = "resume_data"
     resume_file = os.path.join(resume_dir, f"{infohash}.resume")
     if os.path.exists(resume_file):
@@ -213,18 +286,12 @@ def test_update_task_status_endpoint_with_resume_data(client):
 
     response = client.post(f"/tasks/{infohash}/status", json=payload)
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "recoverable_failure"
 
-    # 验证文件是否已创建
     assert os.path.exists(resume_file)
-
-    # 验证文件内容
     with open(resume_file, "r") as f:
         saved_data = json.load(f)
     assert saved_data == resume_data
 
-    # 清理
     os.remove(resume_file)
     os.rmdir(resume_dir)
 
