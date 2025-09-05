@@ -216,3 +216,29 @@ def test_list_all_tasks_with_pagination(client):
     # (hash_24, hash_23, ..., hash_15 | hash_14, ..., hash_5 | hash_4, ...)
     assert data["tasks"][0]["infohash"] == "hash_14"
     assert data["tasks"][-1]["infohash"] == "hash_05"
+
+def test_update_task_details_endpoint(client):
+    """测试更新任务详情的 API 端点。"""
+    infohash = "details_update_hash"
+    # 1. 先创建一个任务
+    client.post("/tasks/", data={"infohash": infohash})
+
+    # 2. 调用新端点更新详情
+    details_payload = {
+        "torrent_name": "My Test Torrent",
+        "video_filename": "movie.mp4",
+        "video_duration_seconds": 3600
+    }
+    response = client.post(f"/tasks/{infohash}/details", json=details_payload)
+    assert response.status_code == 200
+    data = response.json()
+
+    # 3. 验证返回的数据是否已更新
+    assert data["torrent_name"] == "My Test Torrent"
+    assert data["video_filename"] == "movie.mp4"
+    assert data["video_duration_seconds"] == 3600
+
+    # 4. 再次获取任务，确保数据已持久化
+    response2 = client.get(f"/tasks/{infohash}")
+    data2 = response2.json()
+    assert data2["torrent_name"] == "My Test Torrent"

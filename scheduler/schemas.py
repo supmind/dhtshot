@@ -18,6 +18,9 @@ class TaskCreate(TaskBase):
 class Task(TaskBase):
     id: int
     status: str = Field("pending", description="任务的当前状态 (e.g., pending, working, success, failure)。")
+    torrent_name: Optional[str] = None
+    video_filename: Optional[str] = None
+    video_duration_seconds: Optional[int] = None
     created_at: datetime.datetime
     assigned_worker_id: Optional[str] = None
     result_message: Optional[str] = None
@@ -40,6 +43,12 @@ class TaskStatusUpdate(BaseModel):
     status: str
     message: Optional[str] = None
     resume_data: Optional[Dict[str, Any]] = None
+
+
+class TaskDetailsUpdate(BaseModel):
+    torrent_name: Optional[str] = None
+    video_filename: Optional[str] = None
+    video_duration_seconds: Optional[int] = None
 
 
 # --- 工作节点 (Worker) 相关的模型 ---

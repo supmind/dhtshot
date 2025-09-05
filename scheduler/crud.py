@@ -214,6 +214,26 @@ def update_task_status(
         db.refresh(db_task)
     return db_task
 
+
+def update_task_details(db: Session, infohash: str, details: schemas.TaskDetailsUpdate) -> Optional[models.Task]:
+    """
+    更新任务的详细信息，如 torrent 名称、视频文件名和时长。
+    这个函数会忽略值为 None 的字段，只更新被提供值的字段。
+
+    :param db: 数据库会话。
+    :param infohash: 要更新的任务的 infohash。
+    :param details: 包含要更新的详细信息的 Pydantic schema 对象。
+    :return: 更新后的 Task 对象，如果任务不存在则返回 None。
+    """
+    db_task = get_task_by_infohash(db, infohash=infohash)
+    if db_task:
+        update_data = details.dict(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(db_task, key, value)
+        db.commit()
+        db.refresh(db_task)
+    return db_task
+
 def record_screenshot(db: Session, infohash: str, filename: str) -> Optional[models.Task]:
     """
     将一个成功生成的截图文件名附加到任务的 `successful_screenshots` JSON 数组中。

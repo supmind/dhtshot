@@ -116,7 +116,18 @@ class SchedulerAPIClient:
         except aiohttp.ClientError as e:
             log.error(f"[{infohash}] 报告最终状态时发生连接错误: {e}")
 
-    async def send_heartbeat(self, worker_id: str, service: ScreenshotService, processed_tasks_count: int):
+    async def update_task_details(self, infohash: str, details: dict):
+        """向调度器报告任务的元数据详情。"""
+        log.info(f"[{infohash}] 正在上报任务详情: {details}")
+        url = f"{self._url}/tasks/{infohash}/details"
+        try:
+            async with self._session.post(url, json=details) as response:
+                if response.status != 200:
+                    log.error(f"[{infohash}] 上报任务详情失败。状态码: {response.status}, 响应: {await response.text()}")
+        except aiohttp.ClientError as e:
+            log.error(f"[{infohash}] 上报任务详情时发生连接错误: {e}")
+
+    async def send_heartbeat(self, worker_id: str, service: ScreenshotService):
         """定期发送心跳以保持工作节点活动状态。"""
         url = f"{self._url}/workers/heartbeat"
         status = "busy" if service.active_tasks else "idle"
@@ -131,7 +142,6 @@ class SchedulerAPIClient:
             "status": status,
             "active_tasks_count": active_tasks_count,
             "queue_size": queue_size,
-            "processed_tasks_count": processed_tasks_count
         }
         try:
             async with self._session.post(url, json=payload) as response:
@@ -152,17 +162,21 @@ async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: st
     await client.update_task_status(infohash, status, message, kwargs.get("resume_data"))
 
 
+async def on_task_details_extracted(client: SchedulerAPIClient, infohash: str, details: dict):
+    """当 ScreenshotService 提取出任务元数据时被调用的回调函数。"""
+    await client.update_task_details(infohash, details)
+
+
 # --- 主程序逻辑 ---
 
 async def heartbeat_loop(
     stop_event: asyncio.Event,
     client: SchedulerAPIClient,
-    service: ScreenshotService,
-    processed_tasks_counter: dict
+    service: ScreenshotService
 ):
     """一个独立的协程，定期向调度器发送心跳。"""
     while not stop_event.is_set():
-        await client.send_heartbeat(WORKER_ID, service, processed_tasks_counter['count'])
+        await client.send_heartbeat(WORKER_ID, service)
         try:
             await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=HEARTBEAT_INTERVAL)
         except asyncio.TimeoutError:
@@ -202,7 +216,6 @@ async def run_worker(session: aiohttp.ClientSession):
     settings = Settings()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    processed_tasks_counter = {'count': 0}
 
     def _handle_signal():
         log.info("接收到停机信号...")
@@ -216,21 +229,17 @@ async def run_worker(session: aiohttp.ClientSession):
         log.error("无法向调度器注册，程序退出。")
         return
 
-    async def on_task_finished_with_counter(*args, **kwargs):
-        if kwargs.get('status') == 'success':
-            processed_tasks_counter['count'] += 1
-        await on_task_finished(client, *args, **kwargs)
-
     service = ScreenshotService(
         settings=settings,
         loop=loop,
-        status_callback=on_task_finished_with_counter,
-        screenshot_callback=partial(on_screenshot_generated, client)
+        status_callback=partial(on_task_finished, client),
+        screenshot_callback=partial(on_screenshot_generated, client),
+        details_callback=partial(on_task_details_extracted, client)
     )
     await service.run()
     log.info("ScreenshotService 已在后台运行。")
 
-    heartbeat = asyncio.create_task(heartbeat_loop(stop_event, client, service, processed_tasks_counter))
+    heartbeat = asyncio.create_task(heartbeat_loop(stop_event, client, service))
     log.info("心跳任务已启动。")
 
     log.info("启动主任务轮询循环...")

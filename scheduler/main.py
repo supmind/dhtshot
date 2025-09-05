@@ -259,3 +259,15 @@ async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusU
     except Exception as e:
         log.error("更新任务 %s 状态时发生数据库错误: %s", infohash, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"更新任务状态时发生内部错误。")
+
+
+@app.post("/tasks/{infohash}/details", response_model=schemas.Task, tags=["任务管理"])
+async def update_task_details_endpoint(infohash: str, details: schemas.TaskDetailsUpdate, db: Session = Depends(get_db)):
+    """
+    更新任务的元数据详情，如种子名称、视频文件名和时长。
+    此端点由工作节点在解析任务后调用。
+    """
+    db_task = crud.update_task_details(db, infohash=infohash, details=details)
+    if db_task is None:
+        raise HTTPException(status_code=404, detail="任务未找到")
+    return db_task

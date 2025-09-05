@@ -39,7 +39,7 @@ class ScreenshotService:
     7.  管理任务状态，支持从失败中恢复 (断点续传)。
     8.  通过回调函数向上层报告任务的最终状态和生成的截图。
     """
-    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None):
+    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None, details_callback: Optional[Callable] = None):
         self.loop = loop or asyncio.get_event_loop()
         self.settings = settings
         self.log = logging.getLogger("ScreenshotService")
@@ -57,6 +57,7 @@ class ScreenshotService:
             on_success=screenshot_callback
         )
         self.status_callback = status_callback
+        self.details_callback = details_callback
         self.active_tasks = set()
         self._submit_lock = asyncio.Lock()
 
@@ -262,14 +263,18 @@ class ScreenshotService:
 
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
-    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int]:
+    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str]]:
         """在 torrent 中查找最大的视频文件（目前仅支持.mp4）并返回其信息。"""
-        video_file_index, video_file_size, video_file_offset = -1, -1, -1
+        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
         fs = ti.files()
         for i in range(fs.num_files()):
-            if fs.file_path(i).lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
-                video_file_size, video_file_index, video_file_offset = fs.file_size(i), i, fs.file_offset(i)
-        return video_file_index, video_file_size, video_file_offset
+            file_path = fs.file_path(i)
+            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+                video_file_size = fs.file_size(i)
+                video_file_index = i
+                video_file_offset = fs.file_offset(i)
+                video_filename = file_path
+        return video_file_index, video_file_size, video_file_offset, video_filename
 
     def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
         """
@@ -445,13 +450,23 @@ class ScreenshotService:
         if not resume_data:
             ti = handle.get_torrent_info()
             piece_length = ti.piece_length()
-            video_file_index, video_file_size, video_file_offset = self._find_video_file(ti)
+            video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
             if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
             moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
             try:
                 extractor = KeyframeExtractor(moov_data)
                 if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
             except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
+
+            if self.details_callback:
+                duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
+                details = {
+                    "torrent_name": ti.name(),
+                    "video_filename": video_filename,
+                    "video_duration_seconds": int(duration_sec)
+                }
+                self.loop.create_task(self.details_callback(infohash_hex, details))
+
             all_keyframes = extractor.keyframes
             selected_keyframes = self._select_keyframes(
                 all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples

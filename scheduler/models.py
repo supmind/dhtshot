@@ -16,6 +16,9 @@ class Task(Base):
 
     id = Column(Integer, primary_key=True, index=True, comment="任务的唯一标识符")
     infohash = Column(String(40), unique=True, index=True, nullable=False, comment="任务关联的 Torrent Infohash，40个字符的十六进制字符串")
+    torrent_name = Column(String, nullable=True, comment="Torrent的名称")
+    video_filename = Column(String, nullable=True, comment="所选视频文件的名称")
+    video_duration_seconds = Column(Integer, nullable=True, comment="视频时长（秒）")
 
     # 任务状态: 'pending', 'working', 'success', 'recoverable_failure', 'permanent_failure'
     status = Column(String(50), nullable=False, default='pending', comment="任务的当前状态")
