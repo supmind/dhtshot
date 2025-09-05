@@ -89,3 +89,15 @@ def test_extractor_with_invalid_data():
     invalid_data = b'this is not a valid moov box'
     with pytest.raises(ValueError, match="在 'moov' Box 中未找到有效的视频轨道"):
         KeyframeExtractor(invalid_data)
+
+def test_extractor_fails_on_unsupported_avc3(moov_atom_data):
+    """
+    测试当 H.264 视频使用 'avc3' 模式且没有 extradata 时，
+    KeyframeExtractor 是否会按预期引发 ValueError。
+    """
+    # 通过将 'avc1' 替换为 'avc3' 来模拟一个 'avc3' moov box
+    # 这是一个简化处理，但足以触发我们想要测试的逻辑路径
+    avc3_moov_data = moov_atom_data.replace(b'avc1', b'avc3', 1)
+
+    with pytest.raises(ValueError, match="不支持不带 extradata 的 H.264 'avc3' 模式。"):
+        KeyframeExtractor(avc3_moov_data)

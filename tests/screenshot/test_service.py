@@ -124,11 +124,43 @@ def service(settings, mock_callbacks):
 # --- Test Cases ---
 
 def test_select_keyframes_logic(service):
-    """测试 _select_keyframes 方法的逻辑。"""
-    keyframes = [Keyframe(i, i, i, 1) for i in range(10)]
-    samples = [MagicMock(pts=180 * 90000)]
-    selected = service._select_keyframes(keyframes, 90000, samples)
+    """
+    测试新的 _select_keyframes 逻辑，确保它是根据时间戳均匀选择，
+    而不是根据关键帧在列表中的索引。
+    """
+    # 1. 创建一组时间戳分布不均的关键帧
+    # Keyframe(index, sample_index, pts, timescale)
+    all_keyframes = [
+        Keyframe(0, 0, 0, 90000),      # 0s
+        Keyframe(1, 1, 10 * 90000, 90000), # 10s
+        Keyframe(2, 2, 20 * 90000, 90000), # 20s
+        Keyframe(3, 3, 88 * 90000, 90000), # 88s
+        Keyframe(4, 4, 95 * 90000, 90000), # 95s
+        Keyframe(5, 5, 170 * 90000, 90000) # 170s
+    ]
+
+    # 视频总时长为 180s
+    duration_pts = 180 * 90000
+
+    # 根据 settings (min=2, max=5, interval=60), 180s 的视频应该生成 180/60 = 3 张截图
+    # 目标时间点应该是: 0s, 60s, 120s
+
+    # 2. 调用被测方法
+    selected = service._select_keyframes(all_keyframes, 90000, duration_pts, None)
+
+    # 3. 断言
     assert len(selected) == 3
+
+    selected_pts = [kf.pts for kf in selected]
+
+    # 验证逻辑：
+    # 目标时间点 (PTS): [0, 5400000, 10800000] (0s, 60s, 120s)
+    #
+    # target = 0 -> closest is 0
+    # target = 5400000 (60s) -> closest is 88s (PTS 7920000), diff=28s.
+    # target = 10800000 (120s) -> closest is 95s (PTS 8550000), diff=25s.
+    expected_pts = [0, 88 * 90000, 95 * 90000]
+    assert sorted(selected_pts) == sorted(expected_pts)
 
 @patch('screenshot.service.KeyframeExtractor')
 def test_load_state_from_resume_data(MockKeyframeExtractor, service):

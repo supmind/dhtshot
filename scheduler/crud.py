@@ -45,6 +45,57 @@ def create_task(db: Session, task: schemas.TaskCreate) -> models.Task:
     db.refresh(db_task)
     return db_task
 
+
+def upsert_worker(db: Session, worker_id: str, status: str) -> models.Worker:
+    """
+    原子性地插入或更新一个工作节点。
+    如果工作节点已存在，则更新其状态和最后心跳时间；如果不存在，则创建一个新记录。
+    这对于处理工作节点注册和心跳的竞争条件至关重要。
+
+    :param db: 数据库会话。
+    :param worker_id: 工作节点的唯一标识符。
+    :param status: 工作节点的当前状态。
+    :return: 创建或更新后的 Worker 对象。
+    """
+    db_worker = db.query(models.Worker).filter(models.Worker.worker_id == worker_id).with_for_update().first()
+    if db_worker:
+        db_worker.status = status
+        db_worker.last_seen_at = datetime.datetime.utcnow()
+    else:
+        db_worker = models.Worker(
+            worker_id=worker_id,
+            status=status,
+            last_seen_at=datetime.datetime.utcnow()
+        )
+        db.add(db_worker)
+    db.commit()
+    db.refresh(db_worker)
+    return db_worker
+
+def reset_stuck_tasks(db: Session, timeout_seconds: int) -> int:
+    """
+    重置长时间处于 'working' 状态的任务。
+    如果一个任务处于 'working' 状态，但其 `updated_at` 时间戳早于指定的超时时间，
+    则将其状态重置为 'pending'，以便其他工作节点可以接手。
+
+    :param db: 数据库会话。
+    :param timeout_seconds: 定义任务被视为“卡住”的秒数。
+    :return: 被重置的任务数量。
+    """
+    timeout_threshold = datetime.datetime.utcnow() - datetime.timedelta(seconds=timeout_seconds)
+
+    # 注意： `update()` 方法是原子性的，并且比先查询再逐个更新要高效得多
+    updated_count = db.query(models.Task).filter(
+        models.Task.status == 'working',
+        models.Task.updated_at < timeout_threshold
+    ).update({
+        'status': 'pending',
+        'assigned_worker_id': None
+    }, synchronize_session=False)
+
+    db.commit()
+    return updated_count
+
 def get_worker_by_id(db: Session, worker_id: str) -> Optional[models.Worker]:
     """
     根据 worker_id 从数据库中检索工作节点。

@@ -271,19 +271,57 @@ class ScreenshotService:
                 video_file_size, video_file_index, video_file_offset = fs.file_size(i), i, fs.file_offset(i)
         return video_file_index, video_file_size, video_file_offset
 
-    def _select_keyframes(self, all_keyframes: list, timescale: int, samples: list) -> list:
-        """根据配置的规则，从所有关键帧中均匀地选择一个有代表性的子集用于生成截图。"""
-        if not all_keyframes: return []
-        duration_sec = samples[-1].pts / timescale if timescale > 0 and samples else 0
+    def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
+        """
+        根据关键帧的显示时间戳 (PTS) 从所有关键帧中均匀地选择一个代表性子集。
+        这种方法确保了截图在视频的时间线上是均匀分布的，而不是基于关键帧在列表中的索引。
 
+        :param all_keyframes: 包含所有关键帧的列表。
+        :param timescale: 视频的 timescale，用于将 PTS 转换为秒。
+        :param duration_pts: 视频的总时长 (以 PTS 为单位)。
+        :param samples: 视频的样本列表，用于在 duration_pts 不可用时作为备用。
+        :return: 一个代表性的关键帧子集。
+        """
+        if not all_keyframes:
+            return []
+
+        # 如果从 'mdhd' box 中未能成功解析出时长，则回退到基于最后一个样本时间戳的估算
+        if duration_pts == 0 and samples:
+            self.log.warning("duration_pts 为 0，将使用最后一个样本的 PTS 作为估算时长。")
+            duration_pts = samples[-1].pts
+
+        duration_sec = duration_pts / timescale if timescale > 0 else 0
+
+        # 根据视频时长和配置计算目标截图数量
         num_screenshots = self.settings.default_screenshots
         if duration_sec > 0:
-            num_screenshots = max(self.settings.min_screenshots, min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots))
+            num_screenshots = max(
+                self.settings.min_screenshots,
+                min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots)
+            )
 
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
-        indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
-        return [all_keyframes[i] for i in sorted(list(set(indices)))]
+
+        # 计算目标时间点
+        target_timestamps_pts = [
+            int(i * duration_pts / num_screenshots) for i in range(num_screenshots)
+        ]
+
+        selected_keyframes = []
+        # 对于每个目标时间点，找到 PTS 最接近它的关键帧
+        for target_pts in target_timestamps_pts:
+            # 使用 min 函数和一个 lambda 来找到差值最小的关键帧
+            closest_keyframe = min(
+                all_keyframes,
+                key=lambda kf: abs(kf.pts - target_pts)
+            )
+            if closest_keyframe not in selected_keyframes:
+                selected_keyframes.append(closest_keyframe)
+
+        # 按 PTS 排序，以确保截图顺序与视频播放顺序一致
+        selected_keyframes.sort(key=lambda kf: kf.pts)
+        return selected_keyframes
 
     def _serialize_task_state(self, state: dict) -> dict:
         """将一个实时的、包含复杂对象的任务状态，转换为一个 JSON 可序列化的字典，用于任务恢复。"""
@@ -415,7 +453,9 @@ class ScreenshotService:
                 if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
             except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
             all_keyframes = extractor.keyframes
-            selected_keyframes = self._select_keyframes(all_keyframes, extractor.timescale, extractor.samples)
+            selected_keyframes = self._select_keyframes(
+                all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples
+            )
             task_state = {
                 "infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset,
                 "video_file_size": video_file_size, "extractor": extractor, "all_keyframes": all_keyframes,
