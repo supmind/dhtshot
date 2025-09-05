@@ -20,7 +20,27 @@ from config import Settings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("Worker")
 
-WORKER_ID = f"worker-{uuid.uuid4()}"
+ID_FILE = ".worker_id"
+
+def get_persistent_worker_id() -> str:
+    """
+    获取持久化的 Worker ID。
+    如果 .worker_id 文件存在，则从中读取 ID。
+    如果不存在，则生成一个新的 UUID，保存到文件中，然后返回。
+    """
+    if os.path.exists(ID_FILE):
+        with open(ID_FILE, "r") as f:
+            worker_uuid = f.read().strip()
+            log.info(f"从 {ID_FILE} 文件中加载到已存在的 Worker ID: {worker_uuid}")
+            return worker_uuid
+
+    worker_uuid = str(uuid.uuid4())
+    with open(ID_FILE, "w") as f:
+        f.write(worker_uuid)
+    log.info(f"生成了新的 Worker ID 并保存至 {ID_FILE}: {worker_uuid}")
+    return worker_uuid
+
+WORKER_ID = f"worker-{get_persistent_worker_id()}"
 HEARTBEAT_INTERVAL = 30
 POLL_INTERVAL = 10
 
