@@ -1,82 +1,75 @@
 # -*- coding: utf-8 -*-
 """
-本模块提供了 KeyframeExtractor 类，其核心功能是从 MP4 文件的 'moov' atom 中
-提取视频关键帧的元数据。它负责解析复杂的 MP4 内部结构，以定位解码所需的
-所有信息，支持 H.264, H.265 (HEVC), 和 AV1 等多种现代视频编解码器。
+本模块提供了用于从视频文件中提取关键帧元数据的提取器基类和具体实现。
+它负责解析复杂的视频文件内部结构，以定位解码所需的关键信息。
 """
 import struct
 import logging
 from io import BytesIO
+from abc import ABC, abstractmethod
 from collections import namedtuple
-from typing import BinaryIO, Generator, Tuple, Optional
+from typing import BinaryIO, Generator, Tuple, Optional, List
 
 # --- 日志配置 ---
 log = logging.getLogger(__name__)
 
 # --- 数据结构定义 ---
-# SampleInfo: 代表一个媒体样本（通常是一帧视频或音频）的详细信息。
 SampleInfo = namedtuple("SampleInfo", ["offset", "size", "is_keyframe", "index", "pts"])
-# Keyframe: 代表一个视频关键帧（或同步点）的简化信息。
 Keyframe = namedtuple("Keyframe", ["index", "sample_index", "pts", "timescale"])
 
 
-class KeyframeExtractor:
+class BaseExtractor(ABC):
+    """
+    提取器抽象基类，定义了所有具体格式提取器（如 MP4, MKV）的通用接口。
+    """
+    def __init__(self):
+        self.keyframes: List[Keyframe] = []
+        self.samples: List[SampleInfo] = []
+        self.extradata: Optional[bytes] = None
+        self.codec_name: Optional[str] = None
+        self.mode: str = "unknown"
+        self.nal_length_size: int = 4
+        self.timescale: int = 1000
+        self.duration_pts: int = 0
+
+    @abstractmethod
+    def parse(self):
+        """
+        解析元数据。每个子类必须实现此方法。
+        """
+        raise NotImplementedError
+
+
+class MP4Extractor(BaseExtractor):
     """
     一个健壮的 MP4 视频关键帧提取器。
-
     它的核心功能是仅通过解析 'moov' box 的二进制数据，就能提取出视频流中所有
-    关键帧的位置、大小、时间戳和解码所需配置等元数据。这使得我们可以在不下载
-    整个视频文件的情况下，精确地请求和解码任意一个关键帧。
-
-    主要工作流程：
-    1.  解析 'moov' box，找到视频轨道 ('trak')。
-    2.  从视频轨道中找到 'stbl' (Sample Table) box，这是所有元数据的核心。
-    3.  依次解析 'stbl' 中的多个子表：
-        - 'stsd' (Sample Description): 获取解码器类型 (H.264/HEVC/AV1) 和解码器
-          配置数据 (extradata，如 SPS/PPS)。
-        - 'stsz' (Sample Size): 获取每一帧的大小。
-        - 'stss' (Sync Sample): 获取哪些帧是关键帧。
-        - 'stco'/'co64' (Chunk Offset): 获取数据块在文件中的位置。
-        - 'stsc' (Sample to Chunk): 描述了帧如何被组织成数据块。
-        - 'stts' (Time to Sample): 获取每一帧的显示时间戳 (PTS)。
-    4.  将以上所有信息整合成一个完整的 `samples` 列表，其中每个元素都代表一帧，
-        包含其所有元数据。
-    5.  从 `samples` 列表中筛选出关键帧，生成一个简化的 `keyframes` 列表。
+    关键帧的位置、大小、时间戳和解码所需配置等元数据。
     """
 
-    def __init__(self, moov_data: Optional[bytes]):
+    def __init__(self, moov_data: bytes):
         """
-        初始化提取器。
-        如果提供了 `moov_data`，将立即开始解析。
-        如果 `moov_data` 为 None，则对象将被初始化为空白状态（用于从序列化状态恢复）。
-
+        初始化 MP4 提取器。
         :param moov_data: 包含 'moov' box 完整内容的字节串。
         """
-        if moov_data:
-            self.moov_stream = BytesIO(moov_data)
-        else:
-            self.moov_stream = None
-
-        self.keyframes: list[Keyframe] = []
-        self.samples: list[SampleInfo] = []
-        self.extradata: Optional[bytes] = None  # 解码器特定配置数据 (如 SPS/PPS)
-        self.codec_name: Optional[str] = None   # 编解码器名称 (如 'h264', 'hevc')
-        self.mode: str = "unknown"              # 码流模式 (如 'avc1', 'avc3')
-        self.nal_length_size: int = 4           # NAL 单元长度字段的字节数
-        self.timescale: int = 1000              # 媒体时间尺度
-        self.duration_pts: int = 0              # 视频轨道总时长 (以 timescale 为单位)
-
+        super().__init__()
+        self.moov_stream = BytesIO(moov_data)
         if moov_data:
             try:
-                self._parse_structure()
+                self.parse()
             except Exception as e:
                 log.error("解析 'moov' box 时发生严重错误: %s", e, exc_info=True)
-                raise # 将异常向上传播，由服务层处理
+                raise
+
+    def parse(self):
+        """
+        解析 'moov' box 的核心逻辑。
+        """
+        self._parse_structure()
 
     def _parse_boxes(self, stream: BinaryIO) -> Generator[Tuple[str, BytesIO], None, None]:
         """
         一个 MP4 box 解析器生成器。
-        它能迭代地从给定的二进制流中解析出 box，并处理 32 位和 64 位大小的 box。
         """
         while True:
             current_offset = stream.tell()
@@ -113,7 +106,6 @@ class KeyframeExtractor:
     def _find_box_payload(self, stream: BinaryIO, box_path: list[str]) -> Optional[BytesIO]:
         """
         从流的当前位置开始，递归地查找一个按路径指定的嵌套 Box，并返回其 payload。
-        例如 `box_path=['mdia', 'hdlr']` 会查找 `stream` -> `mdia` -> `hdlr`。
         """
         if not box_path: return stream
         target_box, remaining_path = box_path[0], box_path[1:]
@@ -124,13 +116,9 @@ class KeyframeExtractor:
 
     def _parse_structure(self):
         """
-        解析 'moov' box 的核心逻辑。
-        这是一个多步骤的过程，旨在找到视频轨道并构建出一个完整的“采样地图”，
-        该地图包含了每个视频帧的位置、大小、时间和类型等所有必要信息。
+        解析 'moov' box 的结构，找到视频轨道并构建采样地图。
         """
         stream = self.moov_stream
-
-        # 'moov' box 本身可能被另一个 'moov' box 包裹，这里处理这种情况
         stream.seek(0)
         _, box_type = struct.unpack('>I4s', stream.read(8))
         stream.seek(0)
@@ -140,8 +128,6 @@ class KeyframeExtractor:
                     stream = payload; break
         moov_payload = stream; moov_payload.seek(0)
 
-        # 步骤 1: 在 'moov' 中找到视频轨道 ('trak')
-        # 通过查找 'hdlr' box 并检查其处理器类型是否为 'vide' 来识别视频轨道。
         trak_payload = None
         for t_type, t_payload_iter in self._parse_boxes(moov_payload):
             if t_type == 'trak':
@@ -154,8 +140,6 @@ class KeyframeExtractor:
                         trak_payload = t_payload_iter; break
         if not trak_payload: raise ValueError("在 'moov' Box 中未找到有效的视频轨道。")
 
-        # 步骤 2: 从 'mdhd' (Media Header) box 获取 timescale 和总时长
-        # Timescale 是定义媒体时间单位的关键参数。
         mdhd_payload = self._find_box_payload(trak_payload, ['mdia', 'mdhd'])
         if mdhd_payload:
             version = struct.unpack('>B', mdhd_payload.read(1))[0]
@@ -163,7 +147,7 @@ class KeyframeExtractor:
                 mdhd_payload.seek(12)
                 self.timescale = struct.unpack('>I', mdhd_payload.read(4))[0]
                 self.duration_pts = struct.unpack('>I', mdhd_payload.read(4))[0]
-            else:  # version 1
+            else:
                 mdhd_payload.seek(20)
                 self.timescale = struct.unpack('>I', mdhd_payload.read(4))[0]
                 self.duration_pts = struct.unpack('>Q', mdhd_payload.read(8))[0]
@@ -171,23 +155,17 @@ class KeyframeExtractor:
             log.warning("在视频轨道中未找到 'mdhd' box，无法确定 timescale 和 duration。")
         trak_payload.seek(0)
 
-        # 步骤 3: 找到 'stbl' (Sample Table) box，它是所有采样信息的核心容器。
         stbl_payload = self._find_box_payload(trak_payload, ['mdia', 'minf', 'stbl'])
         if not stbl_payload: raise ValueError("在视频轨道中未找到 'stbl' Box。")
 
-        # 步骤 4: 解析 'stbl' 内的所有子表。
         tables = {b_type: b_payload for b_type, b_payload in self._parse_boxes(stbl_payload)}
-
-        # 步骤 5: 建立采样地图并获取解码器配置。
         self._build_sample_map_and_config(tables)
 
     def _build_sample_map_and_config(self, tables: dict):
         """
         解析 stbl 内的各个表，以获取解码器配置 (extradata) 并构建完整的采样地图。
-        这是整个类中最复杂的部分，因为它需要关联来自多个表的信息。
         """
-        # --- 1. 获取解码器配置 ---
-        stsd_payload = tables.get('stsd') # Sample Description Box
+        stsd_payload = tables.get('stsd')
         if not stsd_payload: raise ValueError("在 'stbl' Box 中未找到 'stsd' Box。")
         stsd_payload.seek(8)
 
@@ -203,7 +181,7 @@ class KeyframeExtractor:
                 self.codec_name = config['codec']
                 config_box_name = config.get('config_box')
 
-                if config_box_name: # 带外配置 (Out-of-band)
+                if config_box_name:
                     sample_entry_payload.seek(78)
                     config_box_payload = self._find_box_payload(sample_entry_payload, [config_box_name])
                     if config_box_payload and len(config_box_payload.getvalue()) > 5:
@@ -218,28 +196,24 @@ class KeyframeExtractor:
                             self.nal_length_size = (config_data[21] & 0x03) + 1
                         elif self.codec_name == 'av1':
                             self.extradata = config_data
-                    else: # 回退到带内配置
+                    else:
                         self.mode = 'avc3'
-                else: # 带内配置 (In-band)
+                else:
                     self.mode = 'avc3'
 
                 found_codec = True; break
         if not found_codec: raise ValueError("在 'stsd' Box 中未找到任何受支持的视频采样条目 (H.264, H.265, AV1)。")
 
-        # --- 2. 构建采样地图 ---
-        # stsz: Sample Size Box - 包含每个样本的大小。
         stsz_payload = tables.get('stsz'); stsz_payload.seek(4)
         sample_size, sample_count = struct.unpack('>II', stsz_payload.read(8))
         sample_sizes = list(struct.unpack(f'>{sample_count}I', stsz_payload.read(sample_count * 4))) if sample_size == 0 else []
 
-        # stss: Sync Sample Box - 包含所有关键帧的索引。如果不存在，则所有帧都是关键帧。
         stss_payload = tables.get('stss'); keyframe_set = set()
         if stss_payload:
             stss_payload.seek(4); entry_count = struct.unpack('>I', stss_payload.read(4))[0]
             if entry_count > 0: keyframe_set = set(struct.unpack(f'>{entry_count}I', stss_payload.read(entry_count * 4)))
         else: keyframe_set = set(range(1, sample_count + 1))
 
-        # stco/co64: Chunk Offset Box - 包含每个数据块 (chunk) 在文件中的偏移量。
         co_box = tables.get('stco') or tables.get('co64')
         if not co_box: raise ValueError("未找到 'stco' 或 'co64' box。")
         co_payload = co_box; co_payload.seek(4)
@@ -247,18 +221,14 @@ class KeyframeExtractor:
         unpack_char = '>I' if tables.get('stco') else '>Q'
         chunk_offsets = struct.unpack(f'>{entry_count}{unpack_char[-1]}', co_payload.read(entry_count * struct.calcsize(unpack_char)))
 
-        # stsc: Sample to Chunk Box - 定义了样本如何组织成块。
         stsc_payload = tables.get('stsc'); stsc_payload.seek(4)
         entry_count = struct.unpack('>I', stsc_payload.read(4))[0]
         stsc_entries = [struct.unpack('>III', stsc_payload.read(12)) for _ in range(entry_count)]
 
-        # stts: Time to Sample Box - 定义每个样本的持续时间，用于计算时间戳。
         stts_payload = tables.get('stts'); stts_payload.seek(4)
         entry_count = struct.unpack('>I', stts_payload.read(4))[0]
         stts_entries = [struct.unpack('>II', stts_payload.read(8)) for _ in range(entry_count)]
 
-        # --- 3. 迭代并创建完整的样本列表 ---
-        # 这是最关键的逻辑，它将上述所有表的信息组合起来，为每个样本计算出精确的偏移量、大小和时间戳。
         samples, stsc_idx, sample_idx, current_time = [], 0, 0, 0
         stts_iter = iter(stts_entries); stts_count, stts_duration = next(stts_iter, (0, 0)); stts_sample_idx_in_entry = 0
 
@@ -287,20 +257,16 @@ class KeyframeExtractor:
         """
         解析 hvcC box，提取 VPS, SPS, PPS 等参数集，并将其格式化为
         解码器期望的 Annex B 格式的 extradata。
-
-        Annex B 格式要求每个 NAL 单元前都有一个起始码 (0x00000001)。
         """
         stream = BytesIO(config_data)
-        stream.seek(22) # 跳转到 numOfArrays 字段
+        stream.seek(22)
         num_of_arrays = struct.unpack('>B', stream.read(1))[0]
 
         annexb_extradata = bytearray()
         start_code = b'\x00\x00\x00\x01'
 
         for _ in range(num_of_arrays):
-            # 读取数组信息：array_completeness (1 bit), reserved (1 bit), NAL_unit_type (6 bits)
             stream.read(1)
-
             num_nalus = struct.unpack('>H', stream.read(2))[0]
             for _ in range(num_nalus):
                 nalu_len = struct.unpack('>H', stream.read(2))[0]
@@ -309,3 +275,118 @@ class KeyframeExtractor:
                 annexb_extradata.extend(nalu_data)
 
         return bytes(annexb_extradata)
+
+
+class MKVExtractor(BaseExtractor):
+    """
+    一个 MKV 视频关键帧提取器。
+    此类将负责解析 MKV (Matroska) 文件格式，特别是 'Cues' (线索点)
+    部分，以提取关键帧的元数据。
+    """
+    def __init__(self, head_data: bytes, cues_data: bytes):
+        super().__init__()
+        self.head_stream = BytesIO(head_data)
+        self.cues_stream = BytesIO(cues_data)
+        self.schema = None
+
+    def parse(self):
+        """
+        解析 MKV 元数据。
+        这需要一个分阶段的方法，因为元数据（如 Cues）可能不在文件的开头。
+        此方法首先解析头部和轨道信息。
+        """
+        try:
+            from ebmlite import loadSchema
+            self.schema = loadSchema('matroska.xml')
+        except ImportError:
+            log.error("未能导入 ebmlite 库。请确保它已正确安装。")
+            raise
+        except FileNotFoundError:
+            log.error("未能找到 matroska.xml schema 文件。")
+            raise
+
+        head_doc = self.schema.loads(self.head_stream.getvalue())
+        self._parse_tracks(head_doc)
+
+        cues_doc = self.schema.loads(self.cues_stream.getvalue())
+        self._parse_cues(cues_doc)
+
+    def _parse_tracks(self, doc):
+        """ 从 MKV 文档中解析轨道信息，找到视频轨道并提取编解码器数据。 """
+        segment = next((el for el in doc if el.name == 'Segment'), None)
+        if not segment: return
+
+        ts_element = next((el for el in segment if el.name == 'TimecodeScale'), None)
+        if ts_element:
+            self.timescale = ts_element.value
+
+        tracks = next((el for el in segment if el.name == 'Tracks'), None)
+        if not tracks: return
+
+        for track_entry in (el for el in tracks if el.name == 'TrackEntry'):
+            children = {el.name: el for el in track_entry}
+            track_type = children.get('TrackType')
+
+            if track_type and track_type.value == 1: # 1 = video track
+                codec_id_el = children.get('CodecID')
+                if codec_id_el:
+                    self.codec_name = self._map_codec_id(codec_id_el.value)
+
+                private_data_el = children.get('CodecPrivate')
+                if private_data_el:
+                    self.extradata = private_data_el.value
+
+                return
+
+    def _parse_cues(self, doc):
+        """ 从 MKV 文档中解析 Cues (线索点) 以构建关键帧列表。 """
+        segment = next((el for el in doc if el.name == 'Segment'), None)
+        if not segment: return
+
+        cues = next((el for el in segment if el.name == 'Cues'), None)
+        if not cues:
+            log.info("在提供的 MKV 数据中未找到 Cues 元素。")
+            return
+
+        samples = []
+        timescale_ns = self.timescale
+
+        for i, cue_point in enumerate(el for el in cues if el.name == 'CuePoint'):
+            cue_children = {el.name: el for el in cue_point}
+            cue_time_el = cue_children.get('CueTime')
+            if not cue_time_el: continue
+
+            track_pos = cue_children.get('CueTrackPositions')
+            if not track_pos: continue
+
+            track_pos_children = {el.name: el for el in track_pos}
+            cluster_offset_el = track_pos_children.get('CueClusterPosition')
+            if not cluster_offset_el: continue
+
+            cue_time_ns = cue_time_el.value
+            cluster_offset = cluster_offset_el.value
+
+            # Note: MKV Cues do not provide sample sizes. We use 0 as a placeholder.
+            # The service layer will need to handle fetching potentially more data than needed.
+            sample = SampleInfo(
+                offset=cluster_offset,
+                size=0, # Placeholder
+                is_keyframe=True,
+                index=i + 1, # Sample indices are 1-based
+                pts=int(cue_time_ns / (timescale_ns / self.timescale))
+            )
+            samples.append(sample)
+
+        self.samples = samples
+        self.keyframes = [Keyframe(i, s.index, s.pts, self.timescale) for i, s in enumerate(self.samples)]
+        log.info("从 Cues 构建了 %d 个样本和 %d 个关键帧。", len(self.samples), len(self.keyframes))
+
+
+    def _map_codec_id(self, codec_id: str) -> Optional[str]:
+        """ 将 MKV 的 CodecID 映射到我们内部使用的编解码器名称。 """
+        mapping = {
+            "V_MPEG4/ISO/AVC": "h264",
+            "V_MPEGH/ISO/HEVC": "hevc",
+            "V_AV1": "av1",
+        }
+        return mapping.get(codec_id)

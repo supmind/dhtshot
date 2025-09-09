@@ -9,6 +9,7 @@ Pillow
 # For parsing
 bitstring
 six
+ebmlite~=3.4.1
 
 # For configuration
 pydantic-settings

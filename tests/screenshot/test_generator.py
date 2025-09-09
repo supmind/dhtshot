@@ -8,8 +8,7 @@ import asyncio
 from PIL import Image
 
 from screenshot.generator import ScreenshotGenerator
-from screenshot.extractor import KeyframeExtractor
-from tests.screenshot.test_extractor import moov_atom_data # 复用 extractor 测试的 fixture
+from screenshot.extractor import MP4Extractor
 
 # --- 测试资源 ---
 TEST_VIDEO_PATH = "tests/assets/test_video.mp4"
@@ -20,8 +19,8 @@ def video_packet_data(moov_atom_data):
     一个 Pytest fixture，从测试视频中提取解码第一帧所需的所有信息。
     包括：codec_name, extradata, 和第一个数据包 (packet) 的内容。
     """
-    # 1. 使用 KeyframeExtractor 获取元数据
-    extractor = KeyframeExtractor(moov_atom_data)
+    # 1. 使用 MP4Extractor 获取元数据
+    extractor = MP4Extractor(moov_atom_data)
     assert extractor.samples, "测试视频中未找到样本"
 
     # 2. 读取第一个样本（即视频帧）的原始数据

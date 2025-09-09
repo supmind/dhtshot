@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     min_screenshots: int = 5
     max_screenshots: int = 60
     default_screenshots: int = 20
+    mkv_default_fetch_size: int = 2 * 1024 * 1024 # 2MB
     target_interval_sec: int = 180
 
     # --- Libtorrent 性能调优设置 ---

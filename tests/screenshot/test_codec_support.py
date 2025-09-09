@@ -14,7 +14,7 @@ import tempfile
 import pytest
 from typing import BinaryIO, Generator, Tuple
 
-from screenshot.extractor import KeyframeExtractor
+from screenshot.extractor import MP4Extractor
 from screenshot.generator import ScreenshotGenerator
 from config import Settings
 

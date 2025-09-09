@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from screenshot.service import ScreenshotService, StatusCallback
 from config import Settings
 from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
-from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
+from screenshot.extractor import Keyframe, SampleInfo, MP4Extractor
 from screenshot.client import TorrentClient
 
 
@@ -63,7 +63,7 @@ class TestAssembleData:
 def test_serialize_task_state(service):
     """测试 _serialize_task_state 方法是否能正确地将一个复杂的任务状态对象转换为字典。"""
     # 1. 创建模拟的 extractor 和其他状态数据
-    mock_extractor = MagicMock(spec=KeyframeExtractor)
+    mock_extractor = MagicMock(spec=MP4Extractor)
     mock_extractor.extradata = b"some_bytes"
     mock_extractor.codec_name = "h264"
     mock_extractor.mode = "avc1"
@@ -162,12 +162,12 @@ def test_select_keyframes_logic(service):
     expected_pts = [0, 88 * 90000, 95 * 90000]
     assert sorted(selected_pts) == sorted(expected_pts)
 
-@patch('screenshot.service.KeyframeExtractor')
-def test_load_state_from_resume_data(MockKeyframeExtractor, service):
+@patch('screenshot.extractor.MP4Extractor')
+def test_load_state_from_resume_data(MockMP4Extractor, service):
     """测试从 resume_data 恢复任务状态的逻辑。"""
-    mock_extractor_instance = MockKeyframeExtractor.return_value
+    mock_extractor_instance = MockMP4Extractor.return_value
     resume_data = {
-        "infohash": "r_hash", "piece_length": 2, "video_file_offset": 3, "video_file_size": 4,
+        "infohash": "r_hash", "piece_length": 2, "video_file_offset": 3, "video_file_size": 4, "file_type": "mp4",
         "extractor_info": { "extradata": "AQIDBA==", "codec_name": "h264", "mode": "avc1", "nal_length_size": 4, "timescale": 90000,
             "samples": [{"offset": 1, "size": 1, "is_keyframe": True, "index": 1, "pts": 0}] },
         "all_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
