@@ -195,6 +195,15 @@ class TorrentClient:
         else:
             # --- 分支2: 通过磁力链接获取元数据 ---
             self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash)
+            # 在尝试通过 DHT 获取元数据之前，等待 DHT 网络准备就绪。
+            # 这是一个关键修复，可以防止因 DHT 未启动而立即超时的竞态条件。
+            self.log.info("[%s] 正在等待 DHT 网络准备就绪...", infohash)
+            try:
+                await asyncio.wait_for(self.dht_ready.wait(), timeout=60)
+                self.log.info("[%s] DHT 已准备就绪，继续执行。", infohash)
+            except asyncio.TimeoutError:
+                self.log.warning("[%s] 等待 DHT 超时，可能会导致元数据获取失败。", infohash)
+
             meta_future = self.loop.create_future()
             self.pending_metadata[infohash] = meta_future
 

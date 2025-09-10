@@ -29,3 +29,6 @@ pysqlite3-binary
 
 # For worker
 aiohttp
+
+# For http client
+httpx

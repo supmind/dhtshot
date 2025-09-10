@@ -96,3 +96,4 @@ venv.bak/
 # Test assets
 tests/Big_Buck_Bunny_720_10s_10MB.mp4
 screenshots_output/
+torrent_files/
