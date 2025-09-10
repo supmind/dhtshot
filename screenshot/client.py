@@ -95,6 +95,10 @@ class TorrentClient:
         self.piece_subscribers = defaultdict(list)
         self.subscribers_lock = threading.Lock()
 
+        # 用于在 infohash 和 handle 之间进行映射
+        self.active_handles = {}
+        self.handles_lock = threading.Lock()
+
     async def _execute_sync(self, func, *args, **kwargs):
         """
         在 libtorrent 线程上异步执行一个函数，并等待其结果。
@@ -151,10 +155,6 @@ class TorrentClient:
                 self.log.debug("[%s] 订阅者移除成功。", infohash)
             except ValueError:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
-
-        # 用于在 infohash 和 handle 之间进行映射
-        self.active_handles = {}
-        self.handles_lock = threading.Lock()
 
     def _extract_torrent_details(self, ti: lt.torrent_info) -> dict:
         """
@@ -352,7 +352,7 @@ class TorrentClient:
         futures_to_await, read_keys_to_await = [], []
         with self.pending_reads_lock:
             for piece_index in unique_indices:
-                read_key = (infohash, piece_index)
+                read_key = (infohash_hex, piece_index)
                 if read_key in self.pending_reads:
                     future = self.pending_reads[read_key]['future']
                 else:
