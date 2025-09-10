@@ -142,6 +142,8 @@ class TorrentClient:
             # 我们仍然禁用自动管理，以便在元数据下载后可以完全控制它。
             params.flags &= ~lt.torrent_flags.auto_managed
             handle = await self._execute_sync(self._ses.add_torrent, params)
+            # 我们需要恢复句柄，以便它开始连接到 peer 以获取元数据。
+            self._execute_sync_nowait(handle.resume)
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
                 handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
