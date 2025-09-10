@@ -409,8 +409,8 @@ class TorrentClient:
 
         # 通知所有订阅了此 infohash 的队列
         with self.subscribers_lock:
-            if infohash_hex in self.piece_subscribers:
-                for queue in self.piece_subscribers[infohash_hex]:
+            if infohash in self.piece_subscribers:
+                for queue in self.piece_subscribers[infohash]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, piece_index)
 
     def _handle_dht_bootstrap(self, alert):
