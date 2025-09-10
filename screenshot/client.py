@@ -132,13 +132,15 @@ class TorrentClient:
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_dir
 
-        # 强制将 torrent 设置为手动管理和暂停状态，以确保我们可以精确控制下载行为
-        params.flags &= ~lt.torrent_flags.auto_managed
-        params.flags |= lt.torrent_flags.paused
-
         if metadata:
+            # 对于已有元数据的 torrent，我们希望它在添加时是暂停的，并且由我们手动管理。
+            params.flags |= lt.torrent_flags.paused
+            params.flags &= ~lt.torrent_flags.auto_managed
             handle = await self._execute_sync(self._ses.add_torrent, params)
         else:
+            # 对于磁力链接，我们不能在添加时暂停它，否则它无法连接到 peer 来获取元数据。
+            # 我们仍然禁用自动管理，以便在元数据下载后可以完全控制它。
+            params.flags &= ~lt.torrent_flags.auto_managed
             handle = await self._execute_sync(self._ses.add_torrent, params)
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
