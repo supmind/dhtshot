@@ -95,10 +95,6 @@ class TorrentClient:
         self.piece_subscribers = defaultdict(list)
         self.subscribers_lock = threading.Lock()
 
-        # 用于在 infohash 和 handle 之间进行映射
-        self.active_handles = {}
-        self.handles_lock = threading.Lock()
-
     async def _execute_sync(self, func, *args, **kwargs):
         """
         在 libtorrent 线程上异步执行一个函数，并等待其结果。
@@ -156,6 +152,10 @@ class TorrentClient:
             except ValueError:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
 
+        # 用于在 infohash 和 handle 之间进行映射
+        self.active_handles = {}
+        self.handles_lock = threading.Lock()
+
     def _extract_torrent_details(self, ti: lt.torrent_info) -> dict:
         """
         一个在 libtorrent 线程上运行的辅助函数，用于从 torrent_info 对象中
@@ -183,6 +183,23 @@ class TorrentClient:
             "video_file_offset": video_file_offset,
             "video_filename": video_filename,
         }
+
+    def _sync_setup_and_extract(self, handle) -> dict:
+        """
+        一个在 libtorrent 线程上运行的同步辅助函数。
+        它获取 torrent_info，设置 piece 优先级，然后提取并返回一个包含详情的字典。
+        这是确保线程安全的关键。
+        """
+        ti = handle.get_torrent_info()
+        if not ti:
+            return None
+
+        # 设置 piece 优先级为0 (不下载)
+        priorities = [0] * ti.num_pieces()
+        handle.prioritize_pieces(priorities)
+
+        # 提取详情
+        return self._extract_torrent_details(ti)
 
     @asynccontextmanager
     async def get_torrent_details(self, infohash: str, metadata: bytes = None):
@@ -255,15 +272,11 @@ class TorrentClient:
             with self.handles_lock:
                 self.active_handles[infohash] = handle
 
-            # 对两种情况都设置 piece 优先级为0
-            ti = await self._execute_sync(handle.get_torrent_info)
-            if ti:
-                self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
-                priorities = [0] * ti.num_pieces()
-                await self._execute_sync(handle.prioritize_pieces, priorities)
+            # 在 libtorrent 线程上运行所有后续的设置和提取操作
+            details = await self._execute_sync(self._sync_setup_and_extract, handle)
 
-                # 在 libtorrent 线程上安全地提取所有需要的数据
-                details = await self._execute_sync(self._extract_torrent_details, ti)
+            if details:
+                self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
                 return details
 
         return None
