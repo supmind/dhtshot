@@ -81,27 +81,45 @@ class ScreenshotGenerator:
             if extradata:
                 codec.extradata = extradata
 
+            all_frames = []
+
             # 3. 将原始数据包装成 PyAV 的 Packet 对象并送入解码器
-            packet = av.Packet(packet_data)
-            frames = codec.decode(packet)
+            # 解码器可能会从一个包中返回多个帧
+            try:
+                frames_from_packet = codec.decode(av.Packet(packet_data))
+                if frames_from_packet:
+                    all_frames.extend(frames_from_packet)
+            except av.error.InvalidDataError as e:
+                # 如果数据包本身无效，记录错误并继续尝试冲刷
+                log.warning("解码数据包时遇到无效数据 (时间戳: %s, 编解码器: %s): %s。将尝试冲刷。", timestamp_str, codec_name, e)
+            except Exception as e:
+                # 捕获其他解码错误，但也尝试冲刷
+                log.warning("解码数据包时发生错误 (时间戳: %s): %s。将尝试冲刷。", timestamp_str, e)
 
-            # 4. 处理解码器延迟：某些解码器可能不会立即返回帧，需要发送一个空包来“冲刷”内部缓冲区。
-            if not frames:
-                log.warning("第一次解码未返回帧，尝试发送一个空的刷新包...")
-                try:
-                    frames = codec.decode(None)  # 发送刷新包
-                except av.EOFError:
-                    # 解码器在冲刷时可能会正常地抛出 EOFError
-                    pass
 
-            if not frames:
-                log.error("解码失败：解码器未能从时间戳 %s 的数据包中解码出任何帧。", timestamp_str)
+            # 4. 彻底冲刷解码器以获取所有缓冲的帧
+            # 这是一个更健壮的方法，而不是只在第一次解码失败时才冲刷一次。
+            log.debug("正在冲刷解码器以获取缓冲帧...")
+            try:
+                while True:
+                    flushed_frames = codec.decode(None)
+                    if not flushed_frames:
+                        break
+                    all_frames.extend(flushed_frames)
+            except av.EOFError:
+                # EOF 是冲刷完成时的正常信号
+                pass
+
+            if not all_frames:
+                log.error("解码失败：在解码和冲刷后，未能从时间戳 %s 的数据包中获得任何帧。", timestamp_str)
                 return
 
             # 5. 从解码后的第一帧生成 JPG 字节
-            self._generate_jpeg_from_frame(frames[0], infohash_hex, timestamp_str)
+            log.info("成功从数据包中解码出 %d 帧，将使用第一帧生成截图。", len(all_frames))
+            self._generate_jpeg_from_frame(all_frames[0], infohash_hex, timestamp_str)
 
         except av.error.InvalidDataError as e:
+            # 这个 catch 块现在主要处理创建解码器或冲刷循环本身的问题
             log.error("解码器报告无效数据 (时间戳: %s, 编解码器: %s): %s", timestamp_str, codec_name, e)
             raise
         except Exception:
