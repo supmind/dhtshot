@@ -348,6 +348,22 @@ class TorrentClient:
                 self.pending_fetches[fetch_id] = {
                     'future': request_future, 'remaining': set(pieces_to_download), 'infohash': infohash
                 }
+
+        if pieces_to_download:
+            # --- 阶段1: 等待所有需要的 piece 下载完成 ---
+            def _set_priorities_sync():
+                priorities = [(p, 7) for p in pieces_to_download]
+                handle.prioritize_pieces(priorities)
+                handle.resume()
+            await self._execute_sync(_set_priorities_sync)
+
+            request_future = self.loop.create_future()
+            with self.fetch_lock:
+                fetch_id = self.next_fetch_id
+                self.next_fetch_id += 1
+                self.pending_fetches[fetch_id] = {
+                    'future': request_future, 'remaining': set(pieces_to_download), 'infohash': infohash_hex
+                }
             try:
                 await asyncio.wait_for(request_future, timeout=timeout)
             except asyncio.TimeoutError:
@@ -359,13 +375,13 @@ class TorrentClient:
         futures_to_await, read_keys_to_await = [], []
         with self.pending_reads_lock:
             for piece_index in unique_indices:
-                read_key = (infohash_hex, piece_index)
+                read_key = (infohash, piece_index)
                 if read_key in self.pending_reads:
                     future = self.pending_reads[read_key]['future']
                 else:
                     future = self.loop.create_future()
-                    self.pending_reads[read_key] = {'future': future, 'retries': 0, 'handle': handle}
-                    self._execute_sync_nowait(handle.read_piece, piece_index)
+                    self.pending_reads[read_key] = {'future': future, 'retries': 0}
+                    self._execute_sync_nowait(self._sync_read_piece, infohash, piece_index)
                 futures_to_await.append(future)
                 read_keys_to_await.append(read_key)
         try:
@@ -386,19 +402,19 @@ class TorrentClient:
 
     def _handle_metadata_received(self, alert):
         """警报处理：元数据已收到。唤醒等待的 Future。"""
-        infohash_str = str(alert.handle.info_hash())
-        future = self.pending_metadata.get(infohash_str)
+        infohash = str(alert.handle.info_hash())
+        future = self.pending_metadata.get(infohash)
         if future and not future.done():
             self.loop.call_soon_threadsafe(future.set_result, alert.handle)
 
     def _handle_piece_finished(self, alert):
         """警报处理：一个 piece 已完成。通知 `fetch_pieces` 和订阅者。"""
-        piece_index, infohash_hex = alert.piece_index, str(alert.handle.info_hash())
+        piece_index, infohash = alert.piece_index, str(alert.handle.info_hash())
 
         # 检查是否有 `fetch_pieces` 请求在等待这个 piece
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
-                if request['infohash'] == infohash_hex and piece_index in request['remaining']:
+                if request['infohash'] == infohash and piece_index in request['remaining']:
                     request['remaining'].remove(piece_index)
                     if not request['remaining']:
                         future = request['future']
@@ -408,8 +424,8 @@ class TorrentClient:
 
         # 通知所有订阅了此 infohash 的队列
         with self.subscribers_lock:
-            if infohash_hex in self.piece_subscribers:
-                for queue in self.piece_subscribers[infohash_hex]:
+            if infohash in self.piece_subscribers:
+                for queue in self.piece_subscribers[infohash]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, piece_index)
 
     def _handle_dht_bootstrap(self, alert):
@@ -419,12 +435,12 @@ class TorrentClient:
 
     def _handle_torrent_finished(self, alert):
         """警报处理：整个 torrent 下载完成。"""
-        infohash_hex = str(alert.handle.info_hash())
+        infohash = str(alert.handle.info_hash())
 
         # 标记所有相关的 `fetch_pieces` 请求为完成
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
-                if request['infohash'] == infohash_hex:
+                if request['infohash'] == infohash:
                     future = request['future']
                     if not future.done():
                         self.loop.call_soon_threadsafe(future.set_result, True)
@@ -432,20 +448,19 @@ class TorrentClient:
 
         # 向订阅者发送完成信号 (None)
         with self.subscribers_lock:
-            if infohash_hex in self.piece_subscribers:
-                for queue in self.piece_subscribers[infohash_hex]:
+            if infohash in self.piece_subscribers:
+                for queue in self.piece_subscribers[infohash]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, None)
 
-    async def _retry_read_piece(self, read_key, handle):
+    async def _retry_read_piece(self, infohash: str, piece_index: int):
         """在一个短暂的延迟后重试读取 piece。"""
         await asyncio.sleep(0.2)
-        infohash_hex, piece_index = read_key
-        self._execute_sync_nowait(handle.read_piece, piece_index)
+        self._execute_sync_nowait(self._sync_read_piece, infohash, piece_index)
 
     def _handle_read_piece(self, alert):
         """警报处理：读取 piece 的操作已完成 (成功或失败)。"""
-        infohash_hex, piece_index = str(alert.handle.info_hash()), alert.piece
-        read_key = (infohash_hex, piece_index)
+        infohash, piece_index = str(alert.handle.info_hash()), alert.piece
+        read_key = (infohash, piece_index)
 
         with self.pending_reads_lock:
             pending_info = self.pending_reads.get(read_key)
@@ -458,7 +473,7 @@ class TorrentClient:
             # 对特定的、可能是暂时性的错误进行重试
             if "invalid piece index" in error_message and pending_info['retries'] < 5:
                 pending_info['retries'] += 1
-                self.loop.create_task(self._retry_read_piece(read_key, pending_info['handle']))
+                self.loop.create_task(self._retry_read_piece(infohash, piece_index))
                 return
             if "success" not in error_message.lower():
                 error = TorrentClientError(error_message)
