@@ -162,6 +162,9 @@ class TorrentClient:
             params.flags |= lt.torrent_flags.paused
             handle = await self._execute_sync(self._ses.add_torrent, params)
 
+            # 明确地恢复 torrent 以便它可以开始下载元数据
+            await self._execute_sync(handle.resume)
+
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
                 handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
