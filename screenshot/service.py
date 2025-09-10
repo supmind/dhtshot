@@ -549,7 +549,17 @@ class ScreenshotService:
         return bytes(annexb_data)
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data=None):
-        """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
+        """
+        处理为给定 torrent 生成截图的完整、复杂的业务逻辑。
+
+        未来重构建议:
+        此方法过长，承担了太多责任。可以将其分解为更小的、独立的辅助方法，
+        每个方法负责一个清晰的阶段，例如：
+        1. `_initialize_task_state(handle, infohash_hex, resume_data)`: 负责阶段1，返回初始化的 task_state。
+        2. `_request_and_process_pieces(handle, task_state)`: 负责阶段2和3，处理 piece 的请求和生成。
+        3. `_evaluate_task_result(task_state, results)`: 负责阶段4，评估结果并返回最终状态。
+        这种分解将极大地提高代码的可读性和可测试性。
+        """
         # --- 阶段 1: 恢复任务或开始新任务 ---
         task_state = {}
         if resume_data:
