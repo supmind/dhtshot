@@ -152,18 +152,46 @@ class TorrentClient:
             except ValueError:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
 
+    def _extract_torrent_details(self, ti: lt.torrent_info) -> dict:
+        """
+        一个在 libtorrent 线程上运行的辅助函数，用于从 torrent_info 对象中
+        安全地提取所有需要的数据到一�� Python 字典中。
+        """
+        if not ti or not ti.is_valid():
+            return None
+
+        # 查找最大的视频文件
+        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
+        fs = ti.files()
+        for i in range(fs.num_files()):
+            file_path = fs.file_path(i)
+            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+                video_file_size = fs.file_size(i)
+                video_file_index = i
+                video_file_offset = fs.file_offset(i)
+                video_filename = file_path
+
+        return {
+            "piece_length": ti.piece_length(),
+            "torrent_name": ti.name(),
+            "video_file_index": video_file_index,
+            "video_file_size": video_file_size,
+            "video_file_offset": video_file_offset,
+            "video_filename": video_filename,
+        }
+
     @asynccontextmanager
     async def get_handle(self, infohash: str, metadata: bytes = None):
         """
         一个异步上下文管理器，用于安全地获取和释放 torrent handle。
         推荐使用 `async with` 语句来调用此方法，以确保资源被正确清理。
         """
-        handle, ti = None, None
+        handle, details = None, None
         try:
-            handle, ti = await self.add_torrent(infohash, metadata=metadata)
-            if not handle or not handle.is_valid() or not ti:
-                raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle 或元数据。")
-            yield handle, ti
+            handle, details = await self.add_torrent(infohash, metadata=metadata)
+            if not handle or not handle.is_valid() or not details:
+                raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle 或元数据详情。")
+            yield handle, details
         finally:
             if handle and handle.is_valid():
                 await self.remove_torrent(handle)
@@ -226,7 +254,11 @@ class TorrentClient:
             priorities = [0] * ti.num_pieces()
             await self._execute_sync(handle.prioritize_pieces, priorities)
 
-        return handle, ti
+            # 在 libtorrent 线程上安全地提取所有需要的数据
+            details = await self._execute_sync(self._extract_torrent_details, ti)
+            return handle, details
+
+        return handle, None
 
     async def remove_torrent(self, handle):
         """从会话中移除一个 torrent 并删除其文件。"""

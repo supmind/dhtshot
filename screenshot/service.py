@@ -263,19 +263,6 @@ class ScreenshotService:
 
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
-    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str]]:
-        """在 torrent 中查找最大的视频文件（目前仅支持.mp4）并返回其信息。"""
-        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
-        fs = ti.files()
-        for i in range(fs.num_files()):
-            file_path = fs.file_path(i)
-            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
-                video_file_size = fs.file_size(i)
-                video_file_index = i
-                video_file_offset = fs.file_offset(i)
-                video_filename = file_path
-        return video_file_index, video_file_size, video_file_offset, video_filename
-
     def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
         """
         根据关键帧的显示时间戳 (PTS) 从所有关键帧中均匀地选择一个代表性子集。
@@ -439,7 +426,7 @@ class ScreenshotService:
 
         return processed_this_run, generation_tasks_map
 
-    async def _generate_screenshots_from_torrent(self, handle, ti, infohash_hex, resume_data=None):
+    async def _generate_screenshots_from_torrent(self, handle, details: dict, infohash_hex: str, resume_data=None):
         """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
         # --- 阶段 1: 恢复任务或开始新任务 ---
         task_state = {}
@@ -448,11 +435,13 @@ class ScreenshotService:
             except (KeyError, TypeError) as e: self.log.error("[%s] 加载恢复数据失败: %s", infohash_hex, e); resume_data = None
 
         if not resume_data:
-            if not ti:
-                raise NoVideoFileError("无法从 handle 中获取 torrent 元数据。", infohash_hex)
-            piece_length = ti.piece_length()
-            video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
+            piece_length = details['piece_length']
+            video_file_index = details['video_file_index']
             if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
+
+            video_file_offset = details['video_file_offset']
+            video_file_size = details['video_file_size']
+
             moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
             try:
                 extractor = KeyframeExtractor(moov_data)
@@ -461,12 +450,12 @@ class ScreenshotService:
 
             if self.details_callback:
                 duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
-                details = {
-                    "torrent_name": ti.name(),
-                    "video_filename": video_filename,
+                cb_details = {
+                    "torrent_name": details['torrent_name'],
+                    "video_filename": details['video_filename'],
                     "video_duration_seconds": int(duration_sec)
                 }
-                await self.details_callback(infohash_hex, details)
+                await self.details_callback(infohash_hex, cb_details)
 
             all_keyframes = extractor.keyframes
             selected_keyframes = self._select_keyframes(
@@ -536,8 +525,8 @@ class ScreenshotService:
         self.log.info(log_message, infohash_hex)
 
         try:
-            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as (handle, ti):
-                await self._generate_screenshots_from_torrent(handle, ti, infohash_hex, task_info.get('resume_data'))
+            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as (handle, details):
+                await self._generate_screenshots_from_torrent(handle, details, infohash_hex, task_info.get('resume_data'))
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:
