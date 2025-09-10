@@ -153,27 +153,19 @@ class TorrentClient:
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash_hex, self.metadata_timeout)
             try:
                 await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
-                self.log.info("为 %s 成功接收元数据。", infohash_hex)
-
-                def _pause_sync():
-                    handle = self._ses.find_torrent(lt.sha1_hash(infohash_hex))
-                    if handle and handle.is_valid():
-                        handle.pause()
-                await self._execute_sync(_pause_sync)
-
+                self.log.info("元数据接收的 future 已完成: %s", infohash_hex)
             except asyncio.TimeoutError:
                 raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash_hex)
             finally:
                 self.pending_metadata.pop(infohash_hex, None)
-
-        def set_piece_priorities_to_zero(h):
-            if h and h.is_valid() and h.has_metadata():
-                self.log.info("为 %s 设置所有 piece 优先级为 0。", str(h.info_hash()))
-                priorities = [0] * h.status().num_pieces
-                h.prioritize_pieces(priorities)
-
-        # We need to use the handle on the libtorrent thread
-        await self._execute_sync(lambda: set_piece_priorities_to_zero(self._ses.find_torrent(lt.sha1_hash(infohash_hex))))
+        else:
+            # For torrents added with metadata, we still need to set piece priorities.
+            def set_piece_priorities_to_zero(h):
+                if h and h.is_valid() and h.has_metadata():
+                    self.log.info("为 %s 设置所有 piece 优先级为 0。", str(h.info_hash()))
+                    priorities = [0] * h.status().num_pieces
+                    h.prioritize_pieces(priorities)
+            await self._execute_sync(lambda: set_piece_priorities_to_zero(self._ses.find_torrent(lt.sha1_hash(infohash_hex))))
 
         return infohash_hex
 
@@ -300,6 +292,22 @@ class TorrentClient:
         infohash_str = str(alert.handle.info_hash())
         future = self.pending_metadata.get(infohash_str)
         if future and not future.done():
+            # This handler runs entirely in the libtorrent thread.
+            # Perform all metadata-dependent setup here to avoid race conditions.
+            handle = alert.handle
+            if handle and handle.is_valid():
+                self.log.info("为 %s 成功接收元数据。正在暂停并设置 piece 优先级。", infohash_str)
+                # 1. Pause the torrent to harmonize its state.
+                handle.pause()
+
+                # 2. Set all piece priorities to 0.
+                if handle.has_metadata():
+                    priorities = [0] * handle.status().num_pieces
+                    handle.prioritize_pieces(priorities)
+                else:
+                    self.log.warning("收到元数据警报，但句柄的 has_metadata() 为 false: %s", infohash_str)
+
+            # 3. Notify the asyncio thread that all setup is complete.
             self.loop.call_soon_threadsafe(future.set_result, True)
 
     def _handle_piece_finished(self, alert):
