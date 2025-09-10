@@ -346,7 +346,7 @@ class TorrentClient:
                 fetch_id = self.next_fetch_id
                 self.next_fetch_id += 1
                 self.pending_fetches[fetch_id] = {
-                    'future': request_future, 'remaining': set(pieces_to_download), 'infohash': infohash
+                    'future': request_future, 'remaining': set(pieces_to_download), 'infohash': infohash_hex
                 }
             try:
                 await asyncio.wait_for(request_future, timeout=timeout)
@@ -359,7 +359,7 @@ class TorrentClient:
         futures_to_await, read_keys_to_await = [], []
         with self.pending_reads_lock:
             for piece_index in unique_indices:
-                read_key = (infohash, piece_index)
+                read_key = (infohash_hex, piece_index)
                 if read_key in self.pending_reads:
                     future = self.pending_reads[read_key]['future']
                 else:
@@ -399,7 +399,7 @@ class TorrentClient:
         # 检查是否有 `fetch_pieces` 请求在等待这个 piece
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
-                if request['infohash'] == infohash and piece_index in request['remaining']:
+                if request['infohash'] == infohash_hex and piece_index in request['remaining']:
                     request['remaining'].remove(piece_index)
                     if not request['remaining']:
                         future = request['future']
@@ -409,8 +409,8 @@ class TorrentClient:
 
         # 通知所有订阅了此 infohash 的队列
         with self.subscribers_lock:
-            if infohash in self.piece_subscribers:
-                for queue in self.piece_subscribers[infohash]:
+            if infohash_hex in self.piece_subscribers:
+                for queue in self.piece_subscribers[infohash_hex]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, piece_index)
 
     def _handle_dht_bootstrap(self, alert):
@@ -420,12 +420,12 @@ class TorrentClient:
 
     def _handle_torrent_finished(self, alert):
         """警报处理：整个 torrent 下载完成。"""
-        infohash = str(alert.handle.info_hash())
+        infohash_hex = str(alert.handle.info_hash())
 
         # 标记所有相关的 `fetch_pieces` 请求为完成
         with self.fetch_lock:
             for fetch_id, request in list(self.pending_fetches.items()):
-                if request['infohash'] == infohash:
+                if request['infohash'] == infohash_hex:
                     future = request['future']
                     if not future.done():
                         self.loop.call_soon_threadsafe(future.set_result, True)
@@ -433,8 +433,8 @@ class TorrentClient:
 
         # 向订阅者发送完成信号 (None)
         with self.subscribers_lock:
-            if infohash in self.piece_subscribers:
-                for queue in self.piece_subscribers[infohash]:
+            if infohash_hex in self.piece_subscribers:
+                for queue in self.piece_subscribers[infohash_hex]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, None)
 
     async def _retry_read_piece(self, infohash: str, piece_index: int):
