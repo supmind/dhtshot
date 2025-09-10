@@ -166,13 +166,13 @@ class TorrentClient:
                 h.prioritize_pieces(priorities)
 
         # We need to use the handle on the libtorrent thread
-        await self._execute_sync(lambda: set_piece_priorities_to_zero(self._ses.find_torrent(infohash_hex)))
+        await self._execute_sync(lambda: set_piece_priorities_to_zero(self._ses.find_torrent(lt.sha1_hash(infohash_hex))))
 
         return infohash_hex
 
     async def get_torrent_info(self, infohash: str):
         def _sync_get():
-            handle = self._ses.find_torrent(infohash)
+            handle = self._ses.find_torrent(lt.sha1_hash(infohash))
             if handle and handle.is_valid() and handle.has_metadata():
                 return handle.get_torrent_info()
             return None
@@ -199,14 +199,26 @@ class TorrentClient:
                     self.pending_reads.pop(read_key, None)
         with self.subscribers_lock:
             self.piece_subscribers.pop(infohash, None)
-        await self._execute_sync(self._ses.remove_torrent, handle, lt.session.delete_files)
+
+        def _remove_torrent_sync():
+            handle = self._ses.find_torrent(lt.sha1_hash(infohash))
+            if handle and handle.is_valid():
+                # There's a bug in some versions of libtorrent where remove_torrent
+                # with delete_files can cause a segfault if called on an invalid handle.
+                # We already checked is_valid, but we'll be extra careful.
+                try:
+                    self._ses.remove_torrent(handle, lt.session.delete_files)
+                except Exception as e:
+                    self.log.error(f"移除 torrent {infohash} 时发生错误: {e}")
+
+        await self._execute_sync(_remove_torrent_sync)
         self.log.info("已移除 torrent: %s", infohash)
 
     def request_pieces(self, infohash: str, piece_indices: list[int]):
         if not piece_indices: return
         unique_indices = sorted(list(set(piece_indices)))
         def _request_sync():
-            handle = self._ses.find_torrent(infohash)
+            handle = self._ses.find_torrent(lt.sha1_hash(infohash))
             if not handle or not handle.is_valid(): return
             pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
             if pieces_to_request:
@@ -220,14 +232,14 @@ class TorrentClient:
         unique_indices = sorted(list(set(piece_indices)))
 
         def get_pieces_to_download_sync():
-            handle = self._ses.find_torrent(infohash_hex)
+            handle = self._ses.find_torrent(lt.sha1_hash(infohash_hex))
             if not handle or not handle.is_valid(): return []
             return [p for p in unique_indices if not handle.have_piece(p)]
         pieces_to_download = await self._execute_sync(get_pieces_to_download_sync)
 
         if pieces_to_download:
             def _set_priorities_sync():
-                handle = self._ses.find_torrent(infohash_hex)
+                handle = self._ses.find_torrent(lt.sha1_hash(infohash_hex))
                 if not handle or not handle.is_valid(): return
                 priorities = [(p, 7) for p in pieces_to_download]
                 handle.prioritize_pieces(priorities)
@@ -255,7 +267,7 @@ class TorrentClient:
                     future = self.loop.create_future()
                     self.pending_reads[read_key] = {'future': future, 'retries': 0}
                     def _read_piece_sync(ih, pi):
-                        h = self._ses.find_torrent(ih)
+                        h = self._ses.find_torrent(lt.sha1_hash(ih))
                         if h and h.is_valid():
                             h.read_piece(pi)
                     self._execute_sync_nowait(lambda: _read_piece_sync(infohash_hex, piece_index))
@@ -316,7 +328,7 @@ class TorrentClient:
         await asyncio.sleep(0.2)
         infohash_hex, piece_index = read_key
         def _read_piece_sync():
-            handle = self._ses.find_torrent(infohash_hex)
+            handle = self._ses.find_torrent(lt.sha1_hash(infohash_hex))
             if handle and handle.is_valid():
                 handle.read_piece(piece_index)
         self._execute_sync_nowait(_read_piece_sync)
