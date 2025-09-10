@@ -159,11 +159,10 @@ class TorrentClient:
             magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_dir
-            params.flags |= lt.torrent_flags.paused
+            # REMOVED: params.flags |= lt.torrent_flags.paused
+            # The torrent should start un-paused to download metadata immediately.
+            # Piece priorities are set to 0 later, preventing unwanted data download.
             handle = await self._execute_sync(self._ses.add_torrent, params)
-
-            # 明确地恢复 torrent 以便它可以开始下载元数据
-            await self._execute_sync(handle.resume)
 
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
