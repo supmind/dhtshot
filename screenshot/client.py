@@ -36,7 +36,7 @@ class TorrentClient:
             'active_downloads': app_settings.lt_active_downloads, 'connections_limit': app_settings.lt_connections_limit,
             'upload_rate_limit': app_settings.lt_upload_rate_limit, 'download_rate_limit': app_settings.lt_download_rate_limit,
             'peer_connect_timeout': app_settings.lt_peer_connect_timeout, 'cache_size': app_settings.lt_cache_size,
-            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress | lt.alert_category.metadata),
+            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress),
         }
         self._ses = lt.session(settings_pack)
         self._cmd_queue = queue.Queue()
@@ -148,7 +148,6 @@ class TorrentClient:
             self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
             priorities = [0] * ti.num_pieces()
             await self._execute_sync(handle.prioritize_pieces, priorities)
-            # Attach the ti object to the handle for later use by the service
             handle.torrent_info_obj = ti
         return handle
 
@@ -246,7 +245,10 @@ class TorrentClient:
         future = self.pending_metadata.get(infohash_str)
         if future and not future.done():
             ti = alert.get_torrent_info()
-            self.loop.call_soon_threadsafe(future.set_result, (alert.handle, ti))
+            if ti:
+                self.loop.call_soon_threadsafe(future.set_result, (alert.handle, ti))
+            else:
+                self.loop.call_soon_threadsafe(future.set_exception, TorrentClientError("未能从警报中获取 torrent_info。"))
 
     def _handle_piece_finished(self, alert):
         if not alert.handle.is_valid(): return
