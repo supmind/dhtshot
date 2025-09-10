@@ -193,6 +193,11 @@ class ScreenshotService:
             box_content = stream_buffer[current_offset : current_offset + effective_box_size]
             yield box_type, bytes(box_content), current_offset, declared_size
 
+            # 如果 box 被截断，我们不能安全地继续解析，因为下一个 box 的起始位置是未知的。
+            # 因此，在 yield 完部分数据后，立即停止。
+            if effective_box_size < declared_size:
+                break
+
             current_offset += declared_size
 
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
