@@ -15,6 +15,7 @@ import argparse
 
 # --- 默认配置 ---
 OUTPUT_DIR = "tests/assets"
+TEST_MKV_PATH = os.path.join(OUTPUT_DIR, "test_video.mkv")
 WIDTH = 32
 HEIGHT = 32
 FPS = 5 # Use a lower FPS to keep file size down

@@ -263,6 +263,65 @@ async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
     assert pieces_to_fetch == [0, 1]
 
 @pytest.mark.asyncio
+async def test_get_mkv_metadata_fetches_correct_data(service):
+    """
+    测试 _get_mkv_metadata 是否能正确地分阶段下载 MKV 的元数据。
+    """
+    from ebmlite import loadSchema
+    from tests.utils.create_mkv_test_video import TEST_MKV_PATH # Assuming this is defined
+
+    # 1. 加载真实的 MKV 文件和 schema 以获取基准信息
+    schema = loadSchema('matroska.xml')
+    with open(TEST_MKV_PATH, "rb") as f:
+        mkv_data = f.read()
+
+    doc = schema.loads(mkv_data)
+    segment = next(el for el in doc if el.name == 'Segment')
+    cues = next(el for el in segment if el.name == 'Cues')
+    true_cues_offset = segment.offset + cues.offset
+
+    # 2. 模拟 TorrentClient 的 fetch_pieces 方法
+    service.client.fetch_pieces = AsyncMock()
+
+    async def mock_fetch(handle, pieces, timeout):
+        start_offset = pieces[0] * 16384
+        # A simplified mock that just slices the full file data
+        # Note: This is not a perfect simulation of piece-based download
+        # but is sufficient for testing the offset calculation.
+        end_offset = start_offset + len(pieces) * 16384
+        chunk = mkv_data[start_offset:end_offset]
+
+        # Return data structured as if it came from one piece
+        return {pieces[0]: chunk}
+
+    service.client.fetch_pieces.side_effect = mock_fetch
+
+    # 3. 调用被测方法
+    head_data, cues_data = await service._get_mkv_metadata(
+        handle=MagicMock(),
+        video_file_offset=0,
+        video_file_size=len(mkv_data),
+        piece_length=16384,
+        infohash_hex="mkv_metadata_test"
+    )
+
+    # 4. 断言
+    assert service.client.fetch_pieces.call_count == 2
+
+    # 验证第二次调用是去获取 Cues
+    second_call_args = service.client.fetch_pieces.call_args_list[1]
+    requested_pieces = second_call_args[0][1]
+    requested_offset = requested_pieces[0] * 16384
+    assert requested_offset <= true_cues_offset < requested_offset + 5 * 1024 * 1024
+
+    # 验证返回的数据块包含正确的内容
+    head_doc = schema.loads(head_data)
+    cues_doc = schema.loads(cues_data)
+    assert any(el.name == 'Tracks' for el in next(el for el in head_doc if el.name == 'Segment'))
+    assert any(el.name == 'Cues' for el in next(el for el in cues_doc if el.name == 'Segment'))
+
+
+@pytest.mark.asyncio
 async def test_get_queue_size(service):
     """测试 get_queue_size 方法是否能准确反映内部队列的大小。"""
     # 1. 初始状态下，队列应为空
