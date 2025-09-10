@@ -195,7 +195,7 @@ class ScreenshotService:
 
             current_offset += declared_size
 
-    async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
+    async def _get_moov_atom_data(self, infohash_hex: str, video_file_offset: int, video_file_size: int, piece_length: int) -> bytes:
         """
         智能地查找并获取 'moov' atom 数据。
         策略是：首先探测文件头部，如果找不到 'moov'，则探测文件尾部。
@@ -206,7 +206,7 @@ class ScreenshotService:
             head_size = min(256 * 1024, video_file_size)
             if head_size > 0:
                 head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-                head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
+                head_data_pieces = await self.client.fetch_pieces(infohash_hex, head_pieces, timeout=self.settings.moov_probe_timeout)
                 head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
                 stream = io.BytesIO(head_data)
 
@@ -222,7 +222,7 @@ class ScreenshotService:
                         self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                        moov_data_pieces = await self.client.fetch_pieces(infohash_hex, needed_pieces, timeout=self.settings.moov_probe_timeout)
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
 
                     if box_type == 'mdat':
@@ -241,7 +241,7 @@ class ScreenshotService:
             tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
             if tail_size > 0:
                 tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-                tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
+                tail_data_pieces = await self.client.fetch_pieces(infohash_hex, tail_pieces, timeout=self.settings.moov_probe_timeout)
                 tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
 
                 # 从后向前搜索 'moov' 标志，然后验证其是否为一个有效的 box
@@ -363,12 +363,12 @@ class ScreenshotService:
             "processed_keyframes": set(data['processed_keyframes']),
         }
 
-    async def _process_keyframe_pieces(self, handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes) -> Tuple[set, dict]:
+    async def _process_keyframe_pieces(self, infohash_hex: str, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes) -> Tuple[set, dict]:
         """
         监听已完成的 piece，当一个关键帧所需的所有 piece 都下载完毕时，为其创建截图生成任务。
         返回本次运行中成功生成截图任务的关键帧索引集合，以及 {关键帧索引: 截图任务} 的映射。
         """
-        infohash_hex, extractor = task_state['infohash'], task_state['extractor']
+        extractor = task_state['extractor']
         video_file_offset, piece_length = task_state['video_file_offset'], task_state['piece_length']
         processed_this_run, generation_tasks_map = set(), {}
 
@@ -377,7 +377,7 @@ class ScreenshotService:
             if not info: return None
             keyframe = info['keyframe']; sample = extractor.samples[keyframe.sample_index - 1]
             try:
-                keyframe_pieces_data = await self.client.fetch_pieces(handle, self._get_pieces_for_range(video_file_offset + sample.offset, sample.size, piece_length), timeout=self.settings.piece_fetch_timeout)
+                keyframe_pieces_data = await self.client.fetch_pieces(infohash_hex, self._get_pieces_for_range(video_file_offset + sample.offset, sample.size, piece_length), timeout=self.settings.piece_fetch_timeout)
                 packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length)
             except TorrentClientError as e:
                 self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。"); return None
@@ -426,7 +426,7 @@ class ScreenshotService:
 
         return processed_this_run, generation_tasks_map
 
-    async def _generate_screenshots_from_torrent(self, handle, details: dict, infohash_hex: str, resume_data=None):
+    async def _generate_screenshots_from_torrent(self, details: dict, infohash_hex: str, resume_data=None):
         """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
         # --- 阶段 1: 恢复任务或开始新任务 ---
         task_state = {}
@@ -442,7 +442,7 @@ class ScreenshotService:
             video_file_offset = details['video_file_offset']
             video_file_size = details['video_file_size']
 
-            moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+            moov_data = await self._get_moov_atom_data(infohash_hex, video_file_offset, video_file_size, piece_length)
             try:
                 extractor = KeyframeExtractor(moov_data)
                 if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
@@ -486,8 +486,8 @@ class ScreenshotService:
 
         # --- 阶段 3: 处理 piece 并生成截图 ---
         try:
-            self.client.request_pieces(handle, pieces_to_request)
-            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes)
+            self.client.request_pieces(infohash_hex, pieces_to_request)
+            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(infohash_hex, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes)
             if not generation_tasks_map and remaining_keyframes:
                  task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
                  raise FrameDownloadTimeoutError("没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
@@ -525,8 +525,8 @@ class ScreenshotService:
         self.log.info(log_message, infohash_hex)
 
         try:
-            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as (handle, details):
-                await self._generate_screenshots_from_torrent(handle, details, infohash_hex, task_info.get('resume_data'))
+            async with self.client.get_torrent_details(infohash_hex, metadata=task_info.get('metadata')) as details:
+                await self._generate_screenshots_from_torrent(details, infohash_hex, task_info.get('resume_data'))
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:
