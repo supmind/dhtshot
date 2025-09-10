@@ -57,8 +57,7 @@ class TorrentClient:
                 lt.alert_category.error |
                 lt.alert_category.status |
                 lt.alert_category.storage |
-                lt.alert_category.piece_progress |
-                lt.alert_category.metadata
+                lt.alert_category.piece_progress
             ),
         }
         self._ses = lt.session(settings_pack)
