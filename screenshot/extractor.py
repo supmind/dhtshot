@@ -155,7 +155,7 @@ class VideoMetadataExtractor:
 
                 log.info("完成视频流解析。共找到 %d 个样本，其中 %d 个是关键帧。", len(self.samples), len(self.keyframes))
 
-        except av.AVError as e:
+        except Exception as e:
             log.error("PyAV 在处理视频数据时遇到错误: %s", e)
             # 将其重新包装为更具体的异常，以便上层可以决定是否可恢复
             raise ValueError(f"PyAV error: {e}") from e
