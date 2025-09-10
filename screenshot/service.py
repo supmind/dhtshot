@@ -409,7 +409,7 @@ class ScreenshotService:
             if not ti:
                 raise MetadataTimeoutError(f"无法获取 torrent info，可能元数据尚未下载。", infohash_hex)
             piece_length = ti.piece_length()
-            video_file_index, video_file_size, video_file_offset, video_filename, video_file_ext = self._find_video_file(ti)
+            video_file_index, video_file_size, video_file_offset, video_filename, video_file_ext = self._find_video_file_from_info(ti)
             if video_file_index == -1:
                 raise NoVideoFileError("在 torrent 中没有找到 .mp4 或 .mkv 文件。", infohash_hex)
             self.log.info("[%s] DEBUG: 找到视频文件: %s", infohash_hex, video_filename)
