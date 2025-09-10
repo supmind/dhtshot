@@ -22,6 +22,15 @@ class MP4ParsingError(ScreenshotError):
     pass
 
 
+class MP4BoxNotFoundError(MP4ParsingError):
+    """当在 MP4 结构中找不到必需的 box（例如 'trak', 'stbl'）时引发。"""
+    def __init__(self, box_name: str, parent_box_name: str = "unknown"):
+        message = f"Required box '{box_name}' not found within '{parent_box_name}'"
+        super().__init__(message)
+        self.box_name = box_name
+        self.parent_box_name = parent_box_name
+
+
 class TaskError(ScreenshotError):
     """
     与单个截图任务相关的错误的基类。
@@ -83,6 +92,21 @@ class FrameDownloadTimeoutError(TaskError):
 class FrameDecodeError(TaskError):
     """当视频帧数据成功下载，但在使用底层解码库（PyAV）进行解码时失败，则引发此异常。
     这可能意味着视频帧数据本身已损坏。"""
+    pass
+
+
+class GeneratorError(ScreenshotError):
+    """与截图生成器 (`generator.py`) 相关的错误的基类。"""
+    pass
+
+
+class CodecNotFoundError(GeneratorError):
+    """当请求一个 PyAV 不支持的编解码器时引发。"""
+    pass
+
+
+class DecodingError(GeneratorError):
+    """在解码帧数据时发生不可恢复的错误时引发。"""
     pass
 
 

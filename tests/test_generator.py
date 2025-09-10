@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Tuple
 
 from screenshot.generator import ScreenshotGenerator
+from screenshot.errors import CodecNotFoundError, DecodingError
 
 # --- 配置 ---
 TEST_VIDEO_DIR = Path(__file__).parent / "videos"
@@ -238,3 +239,66 @@ async def test_decode_succeeds_for_various_formats(video_fixture, request):
     assert generated_image is not None
     assert len(generated_image) > 100
     log.info(f"测试成功：已为 {video_fixture} 生成有效截图。")
+
+
+# --- Generator 失败场景测试 ---
+
+# 未来测试策略说明:
+# 当前的失败场景测试是端到端的集成测试，它们真实地在线程池中运行解码代码，
+# 这对于验证线程交互和实际的异常传播至关重要。
+#
+# 为了实现更快的、更隔离的单元测试，可以采用 mock 技术。例如，使用
+# `unittest.mock.patch` 来模拟 `loop.run_in_executor`。可以设置
+# `run_in_executor` 的 `side_effect` 来模拟解码成功或立即抛出异常。
+# 这样就可以在不启动线程或执行实际解码的情况下，测试 `generate` 方法的调用逻辑。
+#
+# 示例 (伪代码):
+#
+# @patch("asyncio.get_event_loop.run_in_executor")
+# async def test_generate_logic_with_mock(mock_run_in_executor):
+#     mock_run_in_executor.side_effect = CodecNotFoundError("mocked error")
+#     generator = ScreenshotGenerator(...)
+#     with pytest.raises(CodecNotFoundError):
+#         await generator.generate(...)
+#     mock_run_in_executor.assert_called_once_with(...)
+
+@pytest.mark.asyncio
+async def test_generator_raises_codec_not_found(h264_flushing_issue_video):
+    """
+    测试当提供一个无效的编解码器名称时，生成器会引发 CodecNotFoundError。
+    """
+    _, extradata, packet_data = h264_flushing_issue_video
+    loop = asyncio.get_event_loop()
+    generator = ScreenshotGenerator(loop=loop)
+
+    with pytest.raises(CodecNotFoundError):
+        await generator.generate(
+            codec_name="invalid_codec_name_12345",
+            extradata=extradata,
+            packet_data=packet_data,
+            infohash_hex="test_invalid_codec",
+            timestamp_str="0"
+        )
+    log.info("测试成功：无效的编解码器名称正确地引发了 CodecNotFoundError。")
+
+
+@pytest.mark.asyncio
+async def test_generator_raises_decoding_error_on_corrupt_packet(h264_flushing_issue_video):
+    """
+    测试当提供一个损坏的数据包时，生成器会引发 DecodingError。
+    """
+    codec_name, extradata, _ = h264_flushing_issue_video
+    corrupt_packet_data = os.urandom(100) # 使用随机字节作为损坏的数据包
+
+    loop = asyncio.get_event_loop()
+    generator = ScreenshotGenerator(loop=loop)
+
+    with pytest.raises(DecodingError):
+        await generator.generate(
+            codec_name=codec_name,
+            extradata=extradata,
+            packet_data=corrupt_packet_data,
+            infohash_hex="test_corrupt_packet",
+            timestamp_str="0"
+        )
+    log.info("测试成功：损坏的数据包正确地引发了 DecodingError。")

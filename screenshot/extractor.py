@@ -9,6 +9,7 @@ from io import BytesIO
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from typing import BinaryIO, Generator, Tuple, Optional, List
+from screenshot.errors import MP4BoxNotFoundError, MP4ParsingError
 
 # --- 日志配置 ---
 log = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ class MP4Extractor(BaseExtractor):
                     hdlr_payload.seek(8)
                     if hdlr_payload.read(4) == b'vide':
                         trak_payload = t_payload_iter; break
-        if not trak_payload: raise ValueError("在 'moov' Box 中未找到有效的视频轨道。")
+        if not trak_payload: raise MP4BoxNotFoundError("trak", "moov")
 
         mdhd_payload = self._find_box_payload(trak_payload, ['mdia', 'mdhd'])
         if mdhd_payload:
@@ -156,7 +157,7 @@ class MP4Extractor(BaseExtractor):
         trak_payload.seek(0)
 
         stbl_payload = self._find_box_payload(trak_payload, ['mdia', 'minf', 'stbl'])
-        if not stbl_payload: raise ValueError("在视频轨道中未找到 'stbl' Box。")
+        if not stbl_payload: raise MP4BoxNotFoundError("stbl", "trak")
 
         tables = {b_type: b_payload for b_type, b_payload in self._parse_boxes(stbl_payload)}
         self._build_sample_map_and_config(tables)
@@ -166,7 +167,7 @@ class MP4Extractor(BaseExtractor):
         解析 stbl 内的各个表，以获取解码器配置 (extradata) 并构建完整的采样地图。
         """
         stsd_payload = tables.get('stsd')
-        if not stsd_payload: raise ValueError("在 'stbl' Box 中未找到 'stsd' Box。")
+        if not stsd_payload: raise MP4BoxNotFoundError("stsd", "stbl")
         stsd_payload.seek(8)
 
         codec_configs = {
@@ -203,7 +204,7 @@ class MP4Extractor(BaseExtractor):
                     self.mode = 'avc3'
 
                 found_codec = True; break
-        if not found_codec: raise ValueError("在 'stsd' Box 中未找到任何受支持的视频采样条目 (H.264, H.265, AV1)。")
+        if not found_codec: raise MP4ParsingError("在 'stsd' Box 中未找到任何受支持的视频采样条目 (H.264, H.265, AV1)。")
 
         stsz_payload = tables.get('stsz'); stsz_payload.seek(4)
         sample_size, sample_count = struct.unpack('>II', stsz_payload.read(8))
@@ -216,7 +217,7 @@ class MP4Extractor(BaseExtractor):
         else: keyframe_set = set(range(1, sample_count + 1))
 
         co_box = tables.get('stco') or tables.get('co64')
-        if not co_box: raise ValueError("未找到 'stco' 或 'co64' box。")
+        if not co_box: raise MP4BoxNotFoundError("'stco' or 'co64'", "stbl")
         co_payload = co_box; co_payload.seek(4)
         entry_count = struct.unpack('>I', co_payload.read(4))[0]
         unpack_char = '>I' if tables.get('stco') else '>Q'

@@ -12,6 +12,7 @@ import asyncio
 import io
 from typing import Optional, Callable, Awaitable
 import av  # PyAV 库，用于音视频处理
+from .errors import CodecNotFoundError, DecodingError, GeneratorError
 
 # --- 配置日志 ---
 log = logging.getLogger(__name__)
@@ -72,59 +73,57 @@ class ScreenshotGenerator:
         """
         if not codec_name:
             log.error("解码失败：未提供编解码器名称。")
-            return
+            raise ValueError("Codec name must be provided.")
+
         try:
-            # 1. 根据名称动态创建解码器上下文
-            codec = av.CodecContext.create(codec_name, 'r')  # 'r' 表示读取（解码）模式
+            codec = av.CodecContext.create(codec_name, 'r')
+        except ValueError as e:
+            # PyAV 在找不到编解码器时会引发 ValueError 或其子类 (如 UnknownCodecError)
+            log.error("无法创建编解码器 '%s'。它可能不受支持或名称无效。", codec_name)
+            raise CodecNotFoundError(f"Codec '{codec_name}' not found or supported.") from e
 
-            # 2. 如果提供了 extradata (带外模式)，则配置解码器
-            if extradata:
-                codec.extradata = extradata
+        if extradata:
+            codec.extradata = extradata
 
+        try:
             all_frames = []
-
-            # 3. 将原始数据包装成 PyAV 的 Packet 对象并送入解码器
-            # 解码器可能会从一个包中返回多个帧
+            # 1. 解码主数据包
             try:
                 frames_from_packet = codec.decode(av.Packet(packet_data))
                 if frames_from_packet:
                     all_frames.extend(frames_from_packet)
             except av.error.InvalidDataError as e:
-                # 如果数据包本身无效，记录错误并继续尝试冲刷
                 log.warning("解码数据包时遇到无效数据 (时间戳: %s, 编解码器: %s): %s。将尝试冲刷。", timestamp_str, codec_name, e)
-            except Exception as e:
-                # 捕获其他解码错误，但也尝试冲刷
-                log.warning("解码数据包时发生错误 (时间戳: %s): %s。将尝试冲刷。", timestamp_str, e)
 
-
-            # 4. 彻底冲刷解码器以获取所有缓冲的帧
-            # 这是一个更健壮的方法，而不是只在第一次解码失败时才冲刷一次。
-            log.debug("正在冲刷解码器以获取缓冲帧...")
+            # 2. 冲刷解码器以获取所有缓冲的帧
             try:
                 while True:
                     flushed_frames = codec.decode(None)
                     if not flushed_frames:
                         break
                     all_frames.extend(flushed_frames)
-            except av.EOFError:
-                # EOF 是冲刷完成时的正常信号
+            except (av.EOFError, av.error.InvalidDataError):
+                # EOF 是冲刷完成时的正常信号, InvalidDataError 也可能在冲刷时发生
                 pass
 
             if not all_frames:
                 log.error("解码失败：在解码和冲刷后，未能从时间戳 %s 的数据包中获得任何帧。", timestamp_str)
-                return
+                raise DecodingError(f"No frames could be decoded for timestamp {timestamp_str} with codec {codec_name}.")
 
-            # 5. 从解码后的第一帧生成 JPG 字节
+            # 3. 从解码后的第一帧生成 JPG
             log.info("成功从数据包中解码出 %d 帧，将使用第一帧生成截图。", len(all_frames))
             self._generate_jpeg_from_frame(all_frames[0], infohash_hex, timestamp_str)
 
         except av.error.InvalidDataError as e:
-            # 这个 catch 块现在主要处理创建解码器或冲刷循环本身的问题
             log.error("解码器报告无效数据 (时间戳: %s, 编解码器: %s): %s", timestamp_str, codec_name, e)
-            raise
-        except Exception:
+            raise DecodingError(f"Invalid data for codec {codec_name} at timestamp {timestamp_str}") from e
+        except Exception as e:
+            # 如果是我们自己定义的生成器错误，直接重新抛出，不做重复包装。
+            if isinstance(e, GeneratorError):
+                raise
+            # 对于其他未知异常，记录日志并包装为 GeneratorError。
             log.exception("为帧 %s (编解码器: %s) 进行同步解码/生成时发生未知错误", timestamp_str, codec_name)
-            raise
+            raise GeneratorError(f"An unexpected error occurred during generation for frame {timestamp_str}") from e
 
     async def generate(self, codec_name: str, extradata: Optional[bytes], packet_data: bytes, infohash_hex: str, timestamp_str: str):
         """
