@@ -389,7 +389,8 @@ class TorrentClient:
             alerts = self._ses.pop_alerts()
             for alert in alerts:
                 try:
-                    if not alert.handle.is_valid():
+                    # 仅对具有 handle 属性的警报进行有效性检查
+                    if hasattr(alert, 'handle') and not alert.handle.is_valid():
                         continue
 
                     if alert.category() & lt.alert_category.error:
