@@ -565,6 +565,12 @@ class ScreenshotService:
         3. `_evaluate_task_result(task_state, results)`: 负责阶段4，评估结果并返回最终状态。
         这种分解将极大地提高代码的可读性和可测试性。
         """
+        # --- 防御性检查 ---
+        # 在进行任何操作之前，确保我们确实拥有元数据。
+        # 客户端应该保证这一点，但在这里进行双重检查可以增加健壮性，防止段错误。
+        if not handle.has_metadata():
+            raise MetadataTimeoutError(f"句柄未能获取元数据，无法继续。", infohash_hex)
+
         # --- 阶段 1: 恢复任务或开始新任务 ---
         task_state = {}
         if resume_data:
