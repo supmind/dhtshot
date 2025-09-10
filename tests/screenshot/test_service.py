@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 from screenshot.service import ScreenshotService, StatusCallback
 from config import Settings
-from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
-from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
+from screenshot.errors import NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
+from screenshot.extractor import Keyframe, SampleInfo, VideoMetadataExtractor
 from screenshot.client import TorrentClient
 
 
@@ -63,13 +63,15 @@ class TestAssembleData:
 def test_serialize_task_state(service):
     """测试 _serialize_task_state 方法是否能正确地将一个复杂的任务状态对象转换为字典。"""
     # 1. 创建模拟的 extractor 和其他状态数据
-    mock_extractor = MagicMock(spec=KeyframeExtractor)
+    mock_extractor = MagicMock(spec=VideoMetadataExtractor)
     mock_extractor.extradata = b"some_bytes"
     mock_extractor.codec_name = "h264"
-    mock_extractor.mode = "avc1"
-    mock_extractor.nal_length_size = 4
+    mock_extractor.container_format = "mp4"
     mock_extractor.timescale = 90000
+    mock_extractor.duration_pts = 180000
+    mock_extractor.nal_length_size = 4
     mock_extractor.samples = [SampleInfo(1, 100, True, 1, 90000)]
+    mock_extractor.keyframes = [Keyframe(0, 1, 90000, 90000)]
 
     task_state = {
         'infohash': 'test_hash',
@@ -77,7 +79,7 @@ def test_serialize_task_state(service):
         'video_file_offset': 0,
         'video_file_size': 1000,
         'extractor': mock_extractor,
-        'all_keyframes': [Keyframe(0, 1, 90000, 90000)],
+        'all_keyframes': mock_extractor.keyframes,
         'selected_keyframes': [Keyframe(0, 1, 90000, 90000)],
         'completed_pieces': {0, 1, 2},
         'processed_keyframes': {0}
@@ -90,8 +92,11 @@ def test_serialize_task_state(service):
     assert serialized_data is not None
     assert serialized_data['infohash'] == 'test_hash'
     assert serialized_data['extractor_info']['extradata'] == b"some_bytes"
-    assert len(serialized_data['all_keyframes']) == 1
-    assert serialized_data['all_keyframes'][0]['sample_index'] == 1
+    assert serialized_data['extractor_info']['duration_pts'] == 180000
+    assert "mode" not in serialized_data['extractor_info'] # 验证旧字段已移除
+    assert len(serialized_data['extractor_info']['keyframes']) == 1
+    assert serialized_data['extractor_info']['keyframes'][0]['sample_index'] == 1
+    assert "all_keyframes" not in serialized_data # 验证 keyframes 已移入 extractor_info
     assert list(serialized_data['processed_keyframes']) == [0]
 
 
@@ -162,20 +167,43 @@ def test_select_keyframes_logic(service):
     expected_pts = [0, 88 * 90000, 95 * 90000]
     assert sorted(selected_pts) == sorted(expected_pts)
 
-@patch('screenshot.service.KeyframeExtractor')
-def test_load_state_from_resume_data(MockKeyframeExtractor, service):
+@patch('screenshot.service.VideoMetadataExtractor')
+def test_load_state_from_resume_data(MockVideoMetadataExtractor, service):
     """测试从 resume_data 恢复任务状态的逻辑。"""
-    mock_extractor_instance = MockKeyframeExtractor.return_value
+    # 1. 准备一个符合新格式的 resume_data
     resume_data = {
         "infohash": "r_hash", "piece_length": 2, "video_file_offset": 3, "video_file_size": 4,
-        "extractor_info": { "extradata": "AQIDBA==", "codec_name": "h264", "mode": "avc1", "nal_length_size": 4, "timescale": 90000,
-            "samples": [{"offset": 1, "size": 1, "is_keyframe": True, "index": 1, "pts": 0}] },
-        "all_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
+        "extractor_info": {
+            "extradata": "AQIDBA==",  # base64 for b'\x01\x02\x03\x04'
+            "codec_name": "h264",
+            "timescale": 90000,
+            "duration_pts": 180000,
+            "samples": [{"offset": 1, "size": 1, "is_keyframe": True, "index": 1, "pts": 0}],
+            "keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}]
+        },
         "selected_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
         "completed_pieces": [1, 2], "processed_keyframes": []
     }
+
+    # 模拟被 patch 的 VideoMetadataExtractor 的返回实例
+    mock_extractor_instance = MockVideoMetadataExtractor.return_value
+    # 让模拟实例返回 keyframes，就像真实实例会做的那样
+    mock_extractor_instance.keyframes = [Keyframe(index=0, sample_index=1, pts=0, timescale=90000)]
+
+    # 2. 调用被测方法
     state = service._load_state_from_resume_data(resume_data)
-    assert state["extractor"].extradata == b'\x01\x02\x03\x04'
+
+    # 3. 验证
+    # 验证 VideoMetadataExtractor 是否用正确的 resume_info 被调用
+    expected_resume_info = resume_data["extractor_info"].copy()
+    expected_resume_info["extradata"] = b'\x01\x02\x03\x04' # 解码后的 bytes
+    MockVideoMetadataExtractor.assert_called_once_with(video_data=None, resume_info=expected_resume_info)
+
+    # 验证返回的状态字典是否正确
+    assert state["infohash"] == "r_hash"
+    assert state["extractor"] == mock_extractor_instance
+    assert len(state["all_keyframes"]) == 1
+    assert state["all_keyframes"][0].sample_index == 1
 
 @pytest.mark.asyncio
 @patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
@@ -214,53 +242,6 @@ async def test_handle_task_successful_run(mock_generate, service, mock_callbacks
     assert result.get("status") == "success"
     mock_generate.assert_awaited_once()
 
-@pytest.mark.asyncio
-async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
-    """
-    测试当 _get_moov_atom_data 在头部探测中找到一个部分的 'moov' box 时，
-    它是否能正确地触发一次额外的下载来获取完整的 box。
-    """
-    # 1. 模拟 service 的依赖
-    mock_handle = MagicMock()
-    service.client.fetch_pieces = AsyncMock()
-
-    # 2. 设置场景数据
-    # 一个部分的 moov box，头部声明大小为 1000，但我们只有 50 字节
-    partial_moov_data = b'\x00\x00\x03\xe8moov' + b'\x01' * 42 # 头部(8) + 内容(42) = 50 字节
-    # 一个完整的 moov box，用于模拟第二次下载的结果
-    full_moov_data = b'\x00\x00\x03\xe8moov' + b'\xff' * (1000 - 8)
-
-    # 模拟 fetch_pieces 的行为:
-    # - 第一次调用（头部探测）返回部分数据
-    # - 第二次调用（为获取完整 moov）返回完整数据
-    service.client.fetch_pieces.side_effect = [
-        {0: partial_moov_data},
-        {1: full_moov_data}
-    ]
-
-    # 模拟 _assemble_data_from_pieces 的行为
-    def mock_assemble(pieces_data, *args):
-        if 0 in pieces_data:
-            return partial_moov_data
-        if 1 in pieces_data:
-            return full_moov_data
-        return b""
-
-    # 3. 使用 patch.object 来临时替换实例上的方法并执行
-    with patch.object(service, '_assemble_data_from_pieces', side_effect=mock_assemble):
-        result_moov_data = await service._get_moov_atom_data(mock_handle, 0, 2000, 512, "partial_moov_hash")
-
-    # 4. 断言
-    # 验证返回的是完整的 moov 数据
-    assert result_moov_data == full_moov_data
-    # 验证 fetch_pieces 被调用了两次
-    assert service.client.fetch_pieces.call_count == 2
-    # 验证第二次调用是去获取完整的 moov box (大小为 1000)
-    second_call_args = service.client.fetch_pieces.call_args_list[1]
-    # (handle, pieces_to_fetch, timeout=...)
-    pieces_to_fetch = second_call_args[0][1]
-    # 假设 box 在偏移量 0 处找到，piece_length=512。大小为1000的box会跨越 piece 0 和 1。
-    assert pieces_to_fetch == [0, 1]
 
 @pytest.mark.asyncio
 async def test_get_queue_size(service):

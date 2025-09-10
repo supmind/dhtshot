@@ -15,9 +15,9 @@ import av
 from .client import TorrentClient, TorrentClientError
 from .errors import (
     TaskError, NoVideoFileError, MoovNotFoundError, MoovFetchError,
-    MoovParsingError, MetadataTimeoutError, FrameDownloadTimeoutError, MP4ParsingError
+    MoovParsingError, MetadataTimeoutError, FrameDownloadTimeoutError, VideoParsingError
 )
-from .extractor import KeyframeExtractor, Keyframe, SampleInfo
+from .extractor import VideoMetadataExtractor, Keyframe, SampleInfo
 from .generator import ScreenshotGenerator
 from config import Settings
 
@@ -147,129 +147,40 @@ class ScreenshotService:
                 buffer_offset += bytes_to_copy
         return bytes(buffer)
 
-    def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
+    async def _get_video_header_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """
-        一个更健壮的 MP4 box 解析器。
-        如果一个 box 声明的大小超出了可用数据范围，它不会失败，而是会 yield
-        它所拥有的部分数据，同时仍然报告在头部声明的完整大小。
-        这允许调用者决定如何处理部分 box。
+        获取视频文件的头部数据。
+        我们下载文件的前 256KB，这对于 PyAV (FFmpeg) 识别容器格式
+        （如 MP4, MKV）并解析其头部信息通常是足够的。
         """
-        stream_buffer = stream.getbuffer()
-        buffer_size = len(stream_buffer)
-        current_offset = stream.tell()
-        while current_offset <= buffer_size - 8:
-            stream.seek(current_offset)
-            try:
-                header_data = stream.read(8)
-                if len(header_data) < 8: break
-                declared_size, box_type_bytes = struct.unpack('>I4s', header_data)
-                box_type = box_type_bytes.decode('ascii', 'ignore')
-            except struct.error:
-                self.log.warning("在偏移量 %d 处解析 MP4 box 头部时遇到 struct.error。", current_offset)
-                break
-
-            box_header_size = 8
-            if declared_size == 1: # 64-bit size
-                if current_offset + 16 > buffer_size:
-                    self.log.warning("Box '%s' 在偏移量 %d 处需要 64 位大小，但数据不足。", box_type, current_offset)
-                    break
-                declared_size = struct.unpack('>Q', stream.read(8))[0]
-                box_header_size = 16
-            elif declared_size == 0: # Extends to end of file
-                declared_size = buffer_size - current_offset
-
-            if declared_size < box_header_size:
-                self.log.warning("Box '%s' 在偏移量 %d 处声明了无效的大小 %d。", box_type, current_offset, declared_size)
-                break
-
-            # 关键改动：不再因为 box 超出范围而抛出异常。
-            # 我们计算在此缓冲区中实际可用的 box 大小。
-            effective_box_size = declared_size
-            if current_offset + declared_size > buffer_size:
-                self.log.debug("Box '%s' (大小: %d) 超出了缓冲区大小 %d。将 yield 部分数据。", box_type, declared_size, buffer_size)
-                effective_box_size = buffer_size - current_offset
-
-            # 我们 yield 我们拥有的数据（可能是部分的），但同时报告在头部声明的 *完整* 大小。
-            box_content = stream_buffer[current_offset : current_offset + effective_box_size]
-            yield box_type, bytes(box_content), current_offset, declared_size
-
-            current_offset += declared_size
-
-    async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
-        """
-        智能地查找并获取 'moov' atom 数据。
-        策略是：首先探测文件头部，如果找不到 'moov'，则探测文件尾部。
-        这是因为 'moov' atom 可能位于文件的开头或结尾。
-        """
-        # --- 阶段1: 探测文件头部 ---
         try:
-            head_size = min(256 * 1024, video_file_size)
-            if head_size > 0:
-                head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-                head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
-                head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
-                stream = io.BytesIO(head_data)
+            header_size = min(256 * 1024, video_file_size)
+            if header_size <= 0:
+                self.log.warning("[%s] 视频文件大小为 0 或负数，无法获取头部。", infohash_hex)
+                return b""
 
-                # 使用新的、更健壮的解析器
-                for box_type, partial_box_data, box_offset, declared_size in self._parse_mp4_boxes(stream):
-                    if box_type == 'moov':
-                        # 检查我们拥有的数据是否就是完整的 box
-                        if len(partial_box_data) >= declared_size:
-                            self.log.info("[%s] 在头部探测中找到了完整的 'moov' box。", infohash_hex)
-                            return partial_box_data
+            header_pieces = self._get_pieces_for_range(video_file_offset, header_size, piece_length)
+            header_data_pieces = await self.client.fetch_pieces(handle, header_pieces, timeout=self.settings.moov_probe_timeout)
+            header_data = self._assemble_data_from_pieces(header_data_pieces, video_file_offset, header_size, piece_length)
 
-                        # 如果数据不完整，说明 'moov' box 太大，需要专门下载它
-                        self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
-                        full_moov_offset_in_torrent = video_file_offset + box_offset
-                        needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
-                        return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
+            if not header_data:
+                raise MoovFetchError("无法组装视频头部数据，可能是缺少 piece。", infohash_hex)
 
-                    if box_type == 'mdat':
-                        # 如果先找到 'mdat'，说明 'moov' 很可能在尾部，停止头部探测
-                        self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
-                        break
+            self.log.info("[%s] 成功获取了 %d 字节的视频头部数据。", infohash_hex, len(header_data))
+            return header_data
+
         except TorrentClientError as e:
-            # 捕获 Torrent 客户端本身的错误（例如，超时）
-            raise MoovFetchError(f"在 moov 头部探测期间获取 piece 失败: {e}", infohash_hex) from e
-
-        # --- 阶段2: 探测文件尾部 ---
-        try:
-            tail_probe_size = 10 * 1024 * 1024
-            tail_file_offset = max(0, video_file_size - tail_probe_size)
-            tail_torrent_offset = video_file_offset + tail_file_offset
-            tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
-            if tail_size > 0:
-                tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-                tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
-                tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
-
-                # 从后向前搜索 'moov' 标志，然后验证其是否为一个有效的 box
-                search_pos = len(tail_data)
-                while (found_pos := tail_data.rfind(b'moov', 0, search_pos)) != -1:
-                    potential_start_pos = found_pos - 4
-                    if potential_start_pos < 0: search_pos = found_pos; continue
-                    stream = io.BytesIO(tail_data); stream.seek(potential_start_pos)
-                    try:
-                        box_size, box_type_bytes = struct.unpack('>I4s', stream.read(8))
-                        if box_type_bytes == b'moov' and box_size > 8 and (potential_start_pos + box_size <= len(tail_data)):
-                            stream.seek(potential_start_pos)
-                            _, full_box_data, _, parsed_box_size = next(self._parse_mp4_boxes(stream), (None, None, None, None))
-                            if full_box_data: return full_box_data
-                    except (struct.error, MP4ParsingError): pass
-                    search_pos = found_pos
-        except TorrentClientError as e:
-            raise MoovFetchError(f"在 moov 尾部探测期间失败: {e}", infohash_hex) from e
-
-        raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
+            # 将底层客户端错误包装成更具体的服务层异常
+            raise MoovFetchError(f"获取视频头部数据时发生 Torrent 客户端错误: {e}", infohash_hex) from e
 
     def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str]]:
-        """在 torrent 中查找最大的视频文件（目前仅支持.mp4）并返回其信息。"""
+        """在 torrent 中查找最大的视频文件（支持 .mp4 和 .mkv）并返回其信息。"""
         video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
+        supported_extensions = ('.mp4', '.mkv')
         fs = ti.files()
         for i in range(fs.num_files()):
             file_path = fs.file_path(i)
-            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+            if file_path.lower().endswith(supported_extensions) and fs.file_size(i) > video_file_size:
                 video_file_size = fs.file_size(i)
                 video_file_index = i
                 video_file_offset = fs.file_offset(i)
@@ -332,16 +243,23 @@ class ScreenshotService:
         """将一个实时的、包含复杂对象的任务状态，转换为一个 JSON 可序列化的字典，用于任务恢复。"""
         extractor = state.get('extractor')
         if not extractor: return None
-        # 注意：extradata 是 bytes 类型，在发送给调度器前需要由 worker 进行 base64 编码
+
+        # 将恢复所需的所有提取器信息捆绑到一个字典中
+        extractor_info = {
+            "extradata": extractor.extradata,
+            "codec_name": extractor.codec_name,
+            "container_format": extractor.container_format,
+            "timescale": extractor.timescale,
+            "duration_pts": extractor.duration_pts,
+            "nal_length_size": extractor.nal_length_size,
+            "samples": [s._asdict() for s in extractor.samples],
+            "keyframes": [k._asdict() for k in extractor.keyframes],
+        }
+
         return {
             "infohash": state['infohash'], "piece_length": state['piece_length'],
             "video_file_offset": state['video_file_offset'], "video_file_size": state['video_file_size'],
-            "extractor_info": {
-                "extradata": extractor.extradata, "codec_name": extractor.codec_name, "mode": extractor.mode,
-                "nal_length_size": extractor.nal_length_size, "timescale": extractor.timescale,
-                "samples": [s._asdict() for s in extractor.samples],
-            },
-            "all_keyframes": [k._asdict() for k in state['all_keyframes']],
+            "extractor_info": extractor_info,
             "selected_keyframes": [k._asdict() for k in state['selected_keyframes']],
             "completed_pieces": list(state.get('completed_pieces', [])),
             "processed_keyframes": list(state.get('processed_keyframes', [])),
@@ -349,24 +267,23 @@ class ScreenshotService:
 
     def _load_state_from_resume_data(self, data: dict) -> dict:
         """从 resume_data 字典中恢复任务状态，将纯数据结构重建为包含类的实例的对象。"""
-        extractor = KeyframeExtractor(moov_data=None)
         ext_info = data['extractor_info']
 
         # extradata 在 resume_data 中是 base64 编码的字符串，需要解码回 bytes
         extradata = ext_info.get('extradata')
         if extradata and isinstance(extradata, str):
-            try: extractor.extradata = base64.b64decode(extradata)
+            try:
+                ext_info['extradata'] = base64.b64decode(extradata)
             except (base64.binascii.Error, TypeError) as e:
-                self.log.error(f"解码 base64 extradata 失败: {e}"); extractor.extradata = None
-        else: extractor.extradata = extradata
+                self.log.error(f"解码 base64 extradata 失败: {e}")
+                ext_info['extradata'] = None
 
-        extractor.codec_name = ext_info.get('codec_name')
-        extractor.mode = ext_info['mode']
-        extractor.nal_length_size = ext_info['nal_length_size']
-        extractor.timescale = ext_info['timescale']
-        extractor.samples = [SampleInfo(**s) for s in ext_info['samples']]
-        all_keyframes = [Keyframe(**k) for k in data['all_keyframes']]
-        extractor.keyframes = all_keyframes
+        # 使用 resume_info 参数直接在构造函数中恢复提取器
+        extractor = VideoMetadataExtractor(video_data=None, resume_info=ext_info)
+
+        # 从恢复的提取器中获取关键帧列表
+        all_keyframes = extractor.keyframes
+
         return {
             "infohash": data['infohash'], "piece_length": data['piece_length'],
             "video_file_offset": data['video_file_offset'], "video_file_size": data['video_file_size'],
@@ -391,20 +308,29 @@ class ScreenshotService:
             keyframe = info['keyframe']; sample = extractor.samples[keyframe.sample_index - 1]
             try:
                 keyframe_pieces_data = await self.client.fetch_pieces(handle, self._get_pieces_for_range(video_file_offset + sample.offset, sample.size, piece_length), timeout=self.settings.piece_fetch_timeout)
-                packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length)
+                packet_data = self._assemble_data_from_pieces(keyframe_pieces_data, video_file_offset + sample.offset, sample.size, piece_length)
             except TorrentClientError as e:
                 self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。"); return None
-            if not packet_data_bytes or len(packet_data_bytes) != sample.size:
-                self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data_bytes)}/{sample.size})，跳过。"); return None
+            if not packet_data or len(packet_data) != sample.size:
+                self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data)}/{sample.size})，跳过。"); return None
 
-            # 为 H.264/HEVC 的 'avc1' 格式（NALU长度前缀）转换为 Annex B 格式（起始码）
-            if extractor.mode == 'avc1':
+            packet_data_bytes = packet_data
+            # MKV 容器中的 H.264 数据包前有一个4字节的 SimpleBlock 头，需要跳过
+            if 'matroska' in extractor.container_format and extractor.codec_name == 'h264':
+                packet_data_bytes = packet_data_bytes[4:]
+
+            # 对于某些编解码器（如H.264/HEVC），当以 AVCC 格式（长度前缀）存储时，
+            # 解码器需要 Annex B 格式（起始码前缀）。我们在这里执行这种转换。
+            if extractor.codec_name in ('h264', 'hevc') and extractor.nal_length_size > 0:
                 annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
+                nal_size = extractor.nal_length_size
                 while cursor < len(packet_data_bytes):
-                    nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + extractor.nal_length_size], 'big'); cursor += extractor.nal_length_size
-                    nal_data = packet_data_bytes[cursor : cursor + nal_length]; annexb_data.extend(start_code + nal_data); cursor += nal_length
+                    nal_length = int.from_bytes(packet_data_bytes[cursor : cursor + nal_size], 'big')
+                    cursor += nal_size
+                    nal_data = packet_data_bytes[cursor : cursor + nal_length]
+                    annexb_data.extend(start_code + nal_data)
+                    cursor += nal_length
                 packet_data = bytes(annexb_data)
-            else: packet_data = packet_data_bytes
 
             ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
             timestamp_str = str(int(ts_sec))
@@ -451,12 +377,12 @@ class ScreenshotService:
             ti = handle.get_torrent_info()
             piece_length = ti.piece_length()
             video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
-            if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
-            moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+            if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到支持的视频文件 (.mp4, .mkv)。", infohash_hex)
+            header_data = await self._get_video_header_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
             try:
-                extractor = KeyframeExtractor(moov_data)
-                if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
-            except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
+                extractor = VideoMetadataExtractor(video_data=header_data)
+                if not extractor.keyframes: raise VideoParsingError("无法从视频流中提取任何关键帧。", infohash_hex)
+            except Exception as e: raise VideoParsingError(f"解析视频数据时失败: {e}", infohash_hex) from e
 
             if self.details_callback:
                 duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0

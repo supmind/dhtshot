@@ -69,6 +69,14 @@ class MoovParsingError(TaskError):
     pass
 
 
+class VideoParsingError(TaskError):
+    """
+    在使用 PyAV 解析视频流时发生错误。
+    这通常表示视频文件的头部数据已损坏或格式不受支持。
+    """
+    pass
+
+
 class FrameDownloadTimeoutError(TaskError):
     """
     在下载生成截图所需的特定视频数据块（pieces）时发生超时，则引发此异常。
