@@ -142,14 +142,14 @@ class ScreenshotService:
                 break
             current_offset += declared_size
 
-    async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
+    async def _get_moov_atom_data(self, infohash_hex: str, video_file_offset, video_file_size, piece_length) -> bytes:
         self.log.info("[%s] DEBUG: 进入 _get_moov_atom_data", infohash_hex)
         try:
             head_size = min(256 * 1024, video_file_size)
             if head_size > 0:
                 self.log.info("[%s] DEBUG: 正在探测文件头部 (大小: %d)...", infohash_hex, head_size)
                 head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-                head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
+                head_data_pieces = await self.client.fetch_pieces(infohash_hex, head_pieces, timeout=self.settings.moov_probe_timeout)
                 head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
                 stream = io.BytesIO(head_data)
                 for box_type, partial_box_data, box_offset, declared_size in self._parse_mp4_boxes(stream):
@@ -160,7 +160,7 @@ class ScreenshotService:
                         self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
-                        moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
+                        moov_data_pieces = await self.client.fetch_pieces(infohash_hex, needed_pieces, timeout=self.settings.moov_probe_timeout)
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
                     if box_type == 'mdat':
                         self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
@@ -175,7 +175,7 @@ class ScreenshotService:
             if tail_size > 0:
                 self.log.info("[%s] DEBUG: 正在探测文件尾部 (大小: %d)...", infohash_hex, tail_size)
                 tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-                tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
+                tail_data_pieces = await self.client.fetch_pieces(infohash_hex, tail_pieces, timeout=self.settings.moov_probe_timeout)
                 tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
                 offset_in_buffer = len(tail_data)
                 while offset_in_buffer > 4:
@@ -199,14 +199,14 @@ class ScreenshotService:
             raise MoovFetchError(f"在 moov 尾部探测期间失败: {e}", infohash_hex) from e
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
-    async def _get_mkv_metadata(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> Tuple[bytes, bytes]:
+    async def _get_mkv_metadata(self, infohash_hex: str, video_file_offset: int, video_file_size: int, piece_length: int) -> Tuple[bytes, bytes]:
         from ebmlite import loadSchema
         schema = loadSchema('matroska.xml')
         head_size = min(4 * 1024, video_file_size)
         head_data = b''
         if head_size > 0:
             head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
-            head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.metadata_timeout)
+            head_data_pieces = await self.client.fetch_pieces(infohash_hex, head_pieces, timeout=self.settings.metadata_timeout)
             head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
         if not head_data:
             raise MoovFetchError("无法下载 MKV 文件头部。", infohash_hex)
@@ -232,13 +232,13 @@ class ScreenshotService:
         cues_fetch_size = 5 * 1024 * 1024
         cues_torrent_offset = video_file_offset + segment.offset + cues_offset
         cues_pieces = self._get_pieces_for_range(cues_torrent_offset, cues_fetch_size, piece_length)
-        cues_data_pieces = await self.client.fetch_pieces(handle, cues_pieces, timeout=self.settings.metadata_timeout)
+        cues_data_pieces = await self.client.fetch_pieces(infohash_hex, cues_pieces, timeout=self.settings.metadata_timeout)
         cues_data = self._assemble_data_from_pieces(cues_data_pieces, cues_torrent_offset, cues_fetch_size, piece_length)
         if not cues_data:
             raise MoovFetchError("无法下载 MKV Cues 数据。", infohash_hex)
         return head_data, cues_data
 
-    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str], Optional[str]]:
+    def _find_video_file_from_info(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str], Optional[str]]:
         video_file_index, video_file_size, video_file_offset, video_filename, video_file_ext = -1, -1, -1, None, None
         supported_exts = ('.mp4', '.mkv')
         fs = ti.files()
@@ -322,8 +322,8 @@ class ScreenshotService:
             "processed_keyframes": set(data['processed_keyframes']),
         }
 
-    async def _process_keyframe_pieces(self, handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes) -> Tuple[set, dict]:
-        infohash_hex, extractor = task_state['infohash'], task_state['extractor']
+    async def _process_keyframe_pieces(self, infohash_hex: str, local_queue: asyncio.Queue, task_state: dict, keyframe_info: dict, piece_to_keyframes: dict, remaining_keyframes: list) -> Tuple[set, dict]:
+        extractor = task_state['extractor']
         video_file_offset, piece_length = task_state['video_file_offset'], task_state['piece_length']
         processed_this_run, generation_tasks_map = set(), {}
         async def process_and_generate_task(keyframe_index):
@@ -332,7 +332,7 @@ class ScreenshotService:
             keyframe = info['keyframe']; sample = extractor.samples[keyframe.sample_index - 1]
             fetch_size = sample.size if sample.size > 0 else self.settings.mkv_default_fetch_size
             try:
-                keyframe_pieces_data = await self.client.fetch_pieces(handle, self._get_pieces_for_range(video_file_offset + sample.offset, fetch_size, piece_length), timeout=self.settings.piece_fetch_timeout)
+                keyframe_pieces_data = await self.client.fetch_pieces(infohash_hex, self._get_pieces_for_range(video_file_offset + sample.offset, fetch_size, piece_length), timeout=self.settings.piece_fetch_timeout)
                 packet_data_bytes = self._assemble_data_from_pieces(keyframe_pieces_data, video_file_offset + sample.offset, fetch_size, piece_length)
             except TorrentClientError as e:
                 self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。"); return None
@@ -395,10 +395,8 @@ class ScreenshotService:
                 return packet_data_bytes
         return bytes(annexb_data)
 
-    async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data=None):
+    async def _generate_screenshots_from_torrent(self, infohash_hex: str, resume_data=None):
         self.log.info("[%s] DEBUG: 进入 _generate_screenshots_from_torrent", infohash_hex)
-        if not handle.has_metadata():
-            raise MetadataTimeoutError(f"句柄未能获取元数据，无法继续。", infohash_hex)
         task_state = {}
         if resume_data:
             try:
@@ -407,7 +405,9 @@ class ScreenshotService:
             except (KeyError, TypeError) as e: self.log.error("[%s] 加载恢复数据失败: %s", infohash_hex, e); resume_data = None
         if not resume_data:
             self.log.info("[%s] DEBUG: 无恢复数据，正在开始新任务。", infohash_hex)
-            ti = handle.get_torrent_info()
+            ti = await self.client.get_torrent_info(infohash_hex)
+            if not ti:
+                raise MetadataTimeoutError(f"无法获取 torrent info，可能元数据尚未下载。", infohash_hex)
             piece_length = ti.piece_length()
             video_file_index, video_file_size, video_file_offset, video_filename, video_file_ext = self._find_video_file(ti)
             if video_file_index == -1:
@@ -415,14 +415,14 @@ class ScreenshotService:
             self.log.info("[%s] DEBUG: 找到视频文件: %s", infohash_hex, video_filename)
             extractor: Optional[BaseExtractor] = None
             if video_file_ext == 'mp4':
-                moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+                moov_data = await self._get_moov_atom_data(infohash_hex, video_file_offset, video_file_size, piece_length)
                 try:
                     extractor = MP4Extractor(moov_data)
                     if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
                 except (MP4ParsingError, Exception) as e:
                     raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
             elif video_file_ext == 'mkv':
-                head_data, cues_data = await self._get_mkv_metadata(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+                head_data, cues_data = await self._get_mkv_metadata(infohash_hex, video_file_offset, video_file_size, piece_length)
                 extractor = MKVExtractor(head_data, cues_data)
                 extractor.parse()
                 if not extractor.keyframes:
@@ -457,8 +457,8 @@ class ScreenshotService:
         self.client.subscribe_pieces(infohash_hex, local_queue)
         self.log.info("[%s] DEBUG: 共需请求 %d 个 pieces。", infohash_hex, len(pieces_to_request))
         try:
-            self.client.request_pieces(handle, pieces_to_request)
-            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes)
+            self.client.request_pieces(infohash_hex, pieces_to_request)
+            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(infohash_hex, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes)
             self.log.info("[%s] DEBUG: _process_keyframe_pieces 完成，创建了 %d 个生成任务。", infohash_hex, len(generation_tasks_map))
             if not generation_tasks_map and remaining_keyframes:
                  task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
@@ -490,8 +490,8 @@ class ScreenshotService:
         log_message = "正在处理任务: %s" + (" (正在恢复)" if task_info.get('resume_data') else "")
         self.log.info(log_message, infohash_hex)
         try:
-            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as handle:
-                await self._generate_screenshots_from_torrent(handle, infohash_hex, task_info.get('resume_data'))
+            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as infohash_hex_from_cm:
+                await self._generate_screenshots_from_torrent(infohash_hex_from_cm, task_info.get('resume_data'))
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:

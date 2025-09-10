@@ -93,79 +93,92 @@ class TorrentClient:
 
     @asynccontextmanager
     async def get_handle(self, infohash: str, metadata: bytes = None):
-        handle = None
+        infohash_hex = None
         try:
-            handle = await self.add_torrent(infohash, metadata=metadata)
-            if not handle or not handle.is_valid():
-                raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle。")
-            yield handle
+            infohash_hex = await self.add_torrent(infohash, metadata=metadata)
+            if not infohash_hex:
+                raise TorrentClientError(f"无法为 {infohash} 添加 torrent。")
+            yield infohash_hex
         finally:
-            if handle and handle.is_valid():
-                await self.remove_torrent(handle)
+            if infohash_hex:
+                await self.remove_torrent(infohash_hex)
 
-    async def add_torrent(self, infohash: str, metadata: bytes = None):
-        self.log.info("正在为 infohash 添加 torrent: %s", infohash)
-        save_dir = os.path.join(self.save_path, infohash)
+    async def add_torrent(self, infohash_hex: str, metadata: bytes = None) -> str:
+        self.log.info("正在为 infohash 添加 torrent: %s", infohash_hex)
+        save_dir = os.path.join(self.save_path, infohash_hex)
 
         if metadata:
-            self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash)
+            self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash_hex)
             try:
                 ti = lt.torrent_info(metadata)
-                if str(ti.info_hash()) != infohash:
-                    raise TorrentClientError(f"提供的元数据 infohash ({ti.info_hash()}) 与指定的 infohash ({infohash}) 不匹配。")
+                if str(ti.info_hash()) != infohash_hex:
+                    raise TorrentClientError(f"提供的元数据 infohash ({ti.info_hash()}) 与指定的 infohash ({infohash_hex}) 不匹配。")
             except RuntimeError as e:
                 raise TorrentClientError(f"无法解析元数据: {e}")
             params = lt.add_torrent_params()
             params.ti = ti
             params.save_path = save_dir
         else:
-            self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash)
+            self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash_hex)
             meta_future = self.loop.create_future()
-            self.pending_metadata[infohash] = meta_future
+            self.pending_metadata[infohash_hex] = meta_future
             trackers = [
                 "udp://tracker.opentrackr.org:1337/announce", "udp://open.demonii.com:1337/announce",
                 "udp://open.stealth.si:80/announce", "udp://exodus.desync.com:6969/announce",
                 "udp://tracker.bittor.pw:1337/announce", "http://sukebei.tracker.wf:8888/announce",
                 "udp://tracker.torrent.eu.org:451/announce",
             ]
-            magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
+            magnet_uri = f"magnet:?xt=urn:btih:{infohash_hex}&{'&'.join(['tr=' + t for t in trackers])}"
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_dir
 
-        if metadata:
-            # 对于已有元数据的 torrent，我们希望它在添加时是暂停的，并且由我们手动管理。
-            params.flags |= lt.torrent_flags.paused
-            params.flags &= ~lt.torrent_flags.auto_managed
-            handle = await self._execute_sync(self._ses.add_torrent, params)
-        else:
-            # 对于磁力链接，我们不能在添加时暂停它，否则它无法连接到 peer 来获取元数据。
-            # 我们仍然禁用自动管理，以便在元数据下载后可以完全控制它。
-            params.flags &= ~lt.torrent_flags.auto_managed
-            handle = await self._execute_sync(self._ses.add_torrent, params)
-            # 我们需要恢复句柄，以便它开始连接到 peer 以获取元数据。
-            self._execute_sync_nowait(handle.resume)
-            self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
+        def add_and_resume_if_needed():
+            # This function runs entirely in the libtorrent thread
+            if metadata:
+                params.flags |= lt.torrent_flags.paused
+                params.flags &= ~lt.torrent_flags.auto_managed
+                handle = self._ses.add_torrent(params)
+            else:
+                params.flags &= ~lt.torrent_flags.auto_managed
+                handle = self._ses.add_torrent(params)
+                if handle.is_valid():
+                    handle.resume()
+            return handle
+
+        handle = await self._execute_sync(add_and_resume_if_needed)
+        if not handle.is_valid():
+            raise TorrentClientError(f"为 {infohash_hex} 添加 torrent 后未能获取有效句柄。")
+
+        if not metadata:
+            self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash_hex, self.metadata_timeout)
             try:
-                handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
-                self.log.info("为 %s 成功接收元数据。", infohash)
+                await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
+                self.log.info("为 %s 成功接收元数据。", infohash_hex)
             except asyncio.TimeoutError:
-                raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
+                raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash_hex)
             finally:
-                self.pending_metadata.pop(infohash, None)
+                self.pending_metadata.pop(infohash_hex, None)
 
-        # After getting metadata, set all piece priorities to 0 to prevent unwanted data download.
-        # This is safer than pausing/resuming the torrent.
-        status = await self._execute_sync(handle.status)
-        if status.has_metadata:
-            self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
-            priorities = [0] * status.num_pieces
-            await self._execute_sync(handle.prioritize_pieces, priorities)
+        def set_piece_priorities_to_zero(h):
+            if h and h.is_valid() and h.has_metadata():
+                self.log.info("为 %s 设置所有 piece 优先级为 0。", str(h.info_hash()))
+                priorities = [0] * h.status().num_pieces
+                h.prioritize_pieces(priorities)
 
-        return handle
+        # We need to use the handle on the libtorrent thread
+        await self._execute_sync(lambda: set_piece_priorities_to_zero(self._ses.find_torrent(infohash_hex)))
 
-    async def remove_torrent(self, handle):
-        if not handle or not handle.is_valid(): return
-        infohash = str(await self._execute_sync(handle.info_hash))
+        return infohash_hex
+
+    async def get_torrent_info(self, infohash: str):
+        def _sync_get():
+            handle = self._ses.find_torrent(infohash)
+            if handle and handle.is_valid() and handle.has_metadata():
+                return handle.get_torrent_info()
+            return None
+        return await self._execute_sync(_sync_get)
+
+    async def remove_torrent(self, infohash: str):
         self.log.info("正在移除 torrent: %s", infohash)
         meta_future = self.pending_metadata.pop(infohash, None)
         if meta_future and not meta_future.done():
@@ -189,11 +202,12 @@ class TorrentClient:
         await self._execute_sync(self._ses.remove_torrent, handle, lt.session.delete_files)
         self.log.info("已移除 torrent: %s", infohash)
 
-    def request_pieces(self, handle, piece_indices: list[int]):
+    def request_pieces(self, infohash: str, piece_indices: list[int]):
         if not piece_indices: return
         unique_indices = sorted(list(set(piece_indices)))
         def _request_sync():
-            if not handle.is_valid(): return
+            handle = self._ses.find_torrent(infohash)
+            if not handle or not handle.is_valid(): return
             pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
             if pieces_to_request:
                 priorities = [(p, 7) for p in pieces_to_request]
@@ -201,14 +215,20 @@ class TorrentClient:
                 handle.resume()
         self._execute_sync_nowait(_request_sync)
 
-    async def fetch_pieces(self, handle, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
+    async def fetch_pieces(self, infohash_hex: str, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         if not piece_indices: return {}
-        infohash_hex = str(handle.info_hash())
         unique_indices = sorted(list(set(piece_indices)))
-        pieces_to_download = await self._execute_sync(lambda: [p for p in unique_indices if handle.is_valid() and not handle.have_piece(p)])
+
+        def get_pieces_to_download_sync():
+            handle = self._ses.find_torrent(infohash_hex)
+            if not handle or not handle.is_valid(): return []
+            return [p for p in unique_indices if not handle.have_piece(p)]
+        pieces_to_download = await self._execute_sync(get_pieces_to_download_sync)
+
         if pieces_to_download:
             def _set_priorities_sync():
-                if not handle.is_valid(): return
+                handle = self._ses.find_torrent(infohash_hex)
+                if not handle or not handle.is_valid(): return
                 priorities = [(p, 7) for p in pieces_to_download]
                 handle.prioritize_pieces(priorities)
                 handle.resume()
@@ -224,6 +244,7 @@ class TorrentClient:
                 raise TorrentClientError(f"下载 pieces {pieces_to_download} 超时。")
             finally:
                 with self.fetch_lock: self.pending_fetches.pop(fetch_id, None)
+
         futures_to_await, read_keys_to_await = [], []
         with self.pending_reads_lock:
             for piece_index in unique_indices:
@@ -232,8 +253,12 @@ class TorrentClient:
                     future = self.pending_reads[read_key]['future']
                 else:
                     future = self.loop.create_future()
-                    self.pending_reads[read_key] = {'future': future, 'retries': 0, 'handle': handle}
-                    self._execute_sync_nowait(lambda: handle.is_valid() and handle.read_piece(piece_index))
+                    self.pending_reads[read_key] = {'future': future, 'retries': 0}
+                    def _read_piece_sync(ih, pi):
+                        h = self._ses.find_torrent(ih)
+                        if h and h.is_valid():
+                            h.read_piece(pi)
+                    self._execute_sync_nowait(lambda: _read_piece_sync(infohash_hex, piece_index))
                 futures_to_await.append(future)
                 read_keys_to_await.append(read_key)
         try:
@@ -256,7 +281,7 @@ class TorrentClient:
         infohash_str = str(alert.handle.info_hash())
         future = self.pending_metadata.get(infohash_str)
         if future and not future.done():
-            self.loop.call_soon_threadsafe(future.set_result, alert.handle)
+            self.loop.call_soon_threadsafe(future.set_result, True)
 
     def _handle_piece_finished(self, alert):
         if not alert.handle.is_valid(): return
@@ -287,11 +312,14 @@ class TorrentClient:
                 for queue in self.piece_subscribers[infohash_hex]:
                     self.loop.call_soon_threadsafe(queue.put_nowait, None)
 
-    async def _retry_read_piece(self, read_key, handle):
+    async def _retry_read_piece(self, read_key):
         await asyncio.sleep(0.2)
-        if not handle.is_valid(): return
-        _, piece_index = read_key
-        self._execute_sync_nowait(handle.read_piece, piece_index)
+        infohash_hex, piece_index = read_key
+        def _read_piece_sync():
+            handle = self._ses.find_torrent(infohash_hex)
+            if handle and handle.is_valid():
+                handle.read_piece(piece_index)
+        self._execute_sync_nowait(_read_piece_sync)
 
     def _handle_read_piece(self, alert):
         if not alert.handle.is_valid(): return
@@ -305,7 +333,7 @@ class TorrentClient:
             error_message = alert.error.message()
             if "invalid piece index" in error_message and pending_info['retries'] < 5:
                 pending_info['retries'] += 1
-                self.loop.create_task(self._retry_read_piece(read_key, pending_info['handle']))
+                self.loop.create_task(self._retry_read_piece(read_key))
                 return
             if "success" not in error_message.lower():
                 error = TorrentClientError(error_message)
