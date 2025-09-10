@@ -118,8 +118,6 @@ class TorrentClient:
             params = lt.add_torrent_params()
             params.ti = ti
             params.save_path = save_dir
-            params.flags |= lt.torrent_flags.paused
-            handle = await self._execute_sync(self._ses.add_torrent, params)
         else:
             self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash)
             meta_future = self.loop.create_future()
@@ -133,6 +131,14 @@ class TorrentClient:
             magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_dir
+
+        # 强制将 torrent 设置为手动管理和暂停状态，以确保我们可以精确控制下载行为
+        params.flags &= ~lt.torrent_flags.auto_managed
+        params.flags |= lt.torrent_flags.paused
+
+        if metadata:
+            handle = await self._execute_sync(self._ses.add_torrent, params)
+        else:
             handle = await self._execute_sync(self._ses.add_torrent, params)
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
