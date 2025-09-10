@@ -439,7 +439,7 @@ class ScreenshotService:
 
         return processed_this_run, generation_tasks_map
 
-    async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data=None):
+    async def _generate_screenshots_from_torrent(self, handle, ti, infohash_hex, resume_data=None):
         """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
         # --- 阶段 1: 恢复任务或开始新任务 ---
         task_state = {}
@@ -448,7 +448,8 @@ class ScreenshotService:
             except (KeyError, TypeError) as e: self.log.error("[%s] 加载恢复数据失败: %s", infohash_hex, e); resume_data = None
 
         if not resume_data:
-            ti = handle.get_torrent_info()
+            if not ti:
+                raise NoVideoFileError("无法从 handle 中获取 torrent 元数据。", infohash_hex)
             piece_length = ti.piece_length()
             video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
             if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
@@ -535,8 +536,8 @@ class ScreenshotService:
         self.log.info(log_message, infohash_hex)
 
         try:
-            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as handle:
-                await self._generate_screenshots_from_torrent(handle, infohash_hex, task_info.get('resume_data'))
+            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as (handle, ti):
+                await self._generate_screenshots_from_torrent(handle, ti, infohash_hex, task_info.get('resume_data'))
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
         except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:

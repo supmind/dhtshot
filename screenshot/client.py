@@ -158,12 +158,12 @@ class TorrentClient:
         一个异步上下文管理器，用于安全地获取和释放 torrent handle。
         推荐使用 `async with` 语句来调用此方法，以确保资源被正确清理。
         """
-        handle = None
+        handle, ti = None, None
         try:
-            handle = await self.add_torrent(infohash, metadata=metadata)
-            if not handle or not handle.is_valid():
-                raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle。")
-            yield handle
+            handle, ti = await self.add_torrent(infohash, metadata=metadata)
+            if not handle or not handle.is_valid() or not ti:
+                raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle 或元数据。")
+            yield handle, ti
         finally:
             if handle and handle.is_valid():
                 await self.remove_torrent(handle)
@@ -226,7 +226,7 @@ class TorrentClient:
             priorities = [0] * ti.num_pieces()
             await self._execute_sync(handle.prioritize_pieces, priorities)
 
-        return handle
+        return handle, ti
 
     async def remove_torrent(self, handle):
         """从会话中移除一个 torrent 并删除其文件。"""
