@@ -282,13 +282,6 @@ class TorrentClient:
     def _handle_torrent_finished(self, alert):
         if not alert.handle.is_valid(): return
         infohash_hex = str(alert.handle.info_hash())
-        with self.fetch_lock:
-            for fetch_id, request in list(self.pending_fetches.items()):
-                if request['infohash'] == infohash_hex:
-                    future = request['future']
-                    if not future.done():
-                        self.loop.call_soon_threadsafe(future.set_result, True)
-                    self.pending_fetches.pop(fetch_id, None)
         with self.subscribers_lock:
             if infohash_hex in self.piece_subscribers:
                 for queue in self.piece_subscribers[infohash_hex]:
