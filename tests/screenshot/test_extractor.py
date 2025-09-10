@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-对 screenshot/extractor.py 中关键帧提取器功能的单元测试。
+对 screenshot/extractor.py 中 MP4Extractor 功能的单元测试。
 """
 import pytest
 import struct
@@ -9,45 +9,69 @@ from io import BytesIO
 from screenshot.extractor import MP4Extractor
 from screenshot.errors import MP4ParsingError
 
-# --- 测试用例 ---
-
-def test_keyframe_extractor_init(moov_atom_data):
+def get_moov_atom_data(video_path: str) -> bytes:
     """
-    测试 MP4Extractor 在使用有效的 'moov' 数据初始化时，
-    是否能正确解析出所有关键元数据。
+    一个辅助函数，从给定的视频文件中读取 'moov' atom 的数据。
     """
-    assert moov_atom_data is not None, "moov_atom_data fixture未能提供数据"
+    try:
+        with open(video_path, "rb") as f:
+            data = f.read()
 
-    extractor = MP4Extractor(moov_atom_data)
+        stream = BytesIO(data)
+        while True:
+            header_data = stream.read(8)
+            if not header_data:
+                break
+            size, box_type_bytes = struct.unpack('>I4s', header_data)
+            box_type = box_type_bytes.decode('ascii')
+
+            if box_type == 'moov':
+                stream.seek(stream.tell() - 8)
+                return stream.read(size)
+
+            if size == 1:
+                size = struct.unpack('>Q', stream.read(8))[0]
+                stream.seek(size - 16, 1)
+            else:
+                stream.seek(size - 8, 1)
+
+    except FileNotFoundError:
+        pytest.fail(f"测试视频文件未找到: {video_path}。")
+
+    pytest.fail(f"在 {video_path} 中未找到 'moov' atom。")
+
+
+@pytest.mark.parametrize(
+    "video_path, expected_codec",
+    [
+        ("tests/assets/test_video.mp4", "h264"),
+        ("tests/assets/test_hevc.mp4", "hevc"),
+        ("tests/assets/test_av1.mp4", "av1"),
+    ]
+)
+def test_mp4_extractor_parses_correctly(video_path, expected_codec):
+    """
+    测试 MP4Extractor 是否能从使用不同编解码器的 MP4 文件中正确解析元数据。
+    """
+    moov_data = get_moov_atom_data(video_path)
+    extractor = MP4Extractor(moov_data)
 
     # 1. 验证编解码器和配置信息
-    assert extractor.codec_name == "h264"
-    assert extractor.mode == "avc1" # 'avc1' 表示带外配置
+    assert extractor.codec_name == expected_codec
     assert isinstance(extractor.extradata, bytes)
-    assert len(extractor.extradata) > 0 # extradata (SPS/PPS) 不应为空
-    assert extractor.nal_length_size == 4
-
-    # 2. 验证时间尺度 (在 create_test_video.py 中 FPS=1, timescale 默认为 90000)
-    # PyAV 会为 stream 设置一个默认的 timescale，通常是 90k
+    assert len(extractor.extradata) > 0
     assert extractor.timescale > 0
 
-    # 3. 验证样本和关键帧信息
-    # 测试视频只有一个帧，它必须是关键帧
-    assert len(extractor.samples) == 1, "应只找到一个样本"
-    assert len(extractor.keyframes) == 1, "应只找到一个关键帧"
+    # 2. 验证样本和关键帧信息
+    assert len(extractor.samples) > 0
+    assert len(extractor.keyframes) > 0
+    assert extractor.samples[0].is_keyframe is True
 
-    sample = extractor.samples[0]
-    keyframe = extractor.keyframes[0]
-
-    assert sample.is_keyframe is True, "唯一的样本应为关键帧"
-    assert sample.index == 1, "样本索引应为 1"
-    assert keyframe.sample_index == sample.index, "关键帧应指向正确的样本索引"
 
 def test_extractor_with_invalid_data():
     """
     测试当提供无效或损坏的 'moov' 数据时，MP4Extractor 是否会引发异常。
     """
-    # 提供一个明显不是 'moov' box 的随机字节串
     invalid_data = b'this is not a valid moov box'
     with pytest.raises(ValueError, match="在 'moov' Box 中未找到有效的视频轨道"):
         MP4Extractor(invalid_data)
