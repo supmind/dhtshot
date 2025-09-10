@@ -99,6 +99,79 @@ class TorrentClient:
         self.active_handles = {}
         self.handles_lock = threading.Lock()
 
+    def _extract_torrent_details(self, ti: lt.torrent_info) -> dict:
+        """
+        一个在 libtorrent 线程上运行的辅助函数，用于从 torrent_info 对象中
+        安全地提取所有需要的数据到一�� Python 字典中。
+        """
+        if not ti or not ti.is_valid():
+            return None
+
+        # 查找最大的视频文件
+        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
+        fs = ti.files()
+        for i in range(fs.num_files()):
+            file_path = fs.file_path(i)
+            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+                video_file_size = fs.file_size(i)
+                video_file_index = i
+                video_file_offset = fs.file_offset(i)
+                video_filename = file_path
+
+        return {
+            "piece_length": ti.piece_length(),
+            "torrent_name": ti.name(),
+            "video_file_index": video_file_index,
+            "video_file_size": video_file_size,
+            "video_file_offset": video_file_offset,
+            "video_filename": video_filename,
+        }
+
+    def _sync_setup_and_extract(self, handle) -> dict:
+        """
+        一个在 libtorrent 线程上运行的同步辅助函数。
+        它获取 torrent_info，设置 piece 优先级，然后提取并返回一个包含详情的字典。
+        这是确保线程安全的关键。
+        """
+        ti = handle.get_torrent_info()
+        if not ti:
+            return None
+
+        # 设置 piece 优先级为0 (不下载)
+        priorities = [0] * ti.num_pieces()
+        handle.prioritize_pieces(priorities)
+
+        # 提取详情
+        return self._extract_torrent_details(ti)
+
+    def _sync_get_pieces_to_download(self, infohash: str, indices: list[int]) -> list[int]:
+        """在 libtorrent 线程上安全地检查哪些 piece 需要下载。"""
+        with self.handles_lock:
+            handle = self.active_handles.get(infohash)
+        if not handle or not handle.is_valid():
+            return []
+        return [p for p in indices if not handle.have_piece(p)]
+
+    def _sync_set_piece_priorities(self, infohash: str, indices: list[int], priority: int):
+        """在 libtorrent 线程上安全地设置 piece 优先级。"""
+        with self.handles_lock:
+            handle = self.active_handles.get(infohash)
+        if not handle or not handle.is_valid():
+            return
+
+        priorities = [(p, priority) for p in indices]
+        handle.prioritize_pieces(priorities)
+        if priority > 0:
+            handle.resume()
+
+    def _sync_read_piece(self, infohash: str, piece_index: int):
+        """在 libtorrent 线程上安全地请求读取一个 piece。"""
+        with self.handles_lock:
+            handle = self.active_handles.get(infohash)
+        if not handle or not handle.is_valid():
+            return
+        handle.read_piece(piece_index)
+
     async def _execute_sync(self, func, *args, **kwargs):
         """
         在 libtorrent 线程上异步执行一个函数，并等待其结果。
@@ -155,51 +228,6 @@ class TorrentClient:
                 self.log.debug("[%s] 订阅者移除成功。", infohash)
             except ValueError:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
-
-    def _extract_torrent_details(self, ti: lt.torrent_info) -> dict:
-        """
-        一个在 libtorrent 线程上运行的辅助函数，用于从 torrent_info 对象中
-        安全地提取所有需要的数据到一�� Python 字典中。
-        """
-        if not ti or not ti.is_valid():
-            return None
-
-        # 查找最大的视频文件
-        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
-        fs = ti.files()
-        for i in range(fs.num_files()):
-            file_path = fs.file_path(i)
-            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
-                video_file_size = fs.file_size(i)
-                video_file_index = i
-                video_file_offset = fs.file_offset(i)
-                video_filename = file_path
-
-        return {
-            "piece_length": ti.piece_length(),
-            "torrent_name": ti.name(),
-            "video_file_index": video_file_index,
-            "video_file_size": video_file_size,
-            "video_file_offset": video_file_offset,
-            "video_filename": video_filename,
-        }
-
-    def _sync_setup_and_extract(self, handle) -> dict:
-        """
-        一个在 libtorrent 线程上运行的同步辅助函数。
-        它获取 torrent_info，设置 piece 优先级，然后提取并返回一个包含详情的字典。
-        这是确保线程安全的关键。
-        """
-        ti = handle.get_torrent_info()
-        if not ti:
-            return None
-
-        # 设置 piece 优先级为0 (不下载)
-        priorities = [0] * ti.num_pieces()
-        handle.prioritize_pieces(priorities)
-
-        # 提取详情
-        return self._extract_torrent_details(ti)
 
     @asynccontextmanager
     async def get_torrent_details(self, infohash: str, metadata: bytes = None):
@@ -297,19 +325,7 @@ class TorrentClient:
         它通过提升 piece 的优先级来触发下载，但不等待其完成。
         """
         if not piece_indices: return
-
-        with self.handles_lock:
-            handle = self.active_handles.get(infohash)
-        if not handle or not handle.is_valid(): return
-
-        unique_indices = sorted(list(set(piece_indices)))
-        def _request_sync():
-            pieces_to_request = [p for p in unique_indices if not handle.have_piece(p)]
-            if pieces_to_request:
-                priorities = [(p, 7) for p in pieces_to_request]
-                handle.prioritize_pieces(priorities)
-                handle.resume()
-        self._execute_sync_nowait(_request_sync)
+        self._execute_sync_nowait(self._sync_set_piece_priorities, infohash, piece_indices, 7)
 
     async def fetch_pieces(self, infohash: str, piece_indices: list[int], timeout=300.0) -> dict[int, bytes]:
         """
@@ -318,21 +334,12 @@ class TorrentClient:
         """
         if not piece_indices: return {}
 
-        with self.handles_lock:
-            handle = self.active_handles.get(infohash)
-        if not handle or not handle.is_valid():
-            raise TorrentClientError(f"[{infohash}] 在 fetch_pieces 时找不到有效的 handle。")
-
         unique_indices = sorted(list(set(piece_indices)))
-        pieces_to_download = await self._execute_sync(lambda: [p for p in unique_indices if not handle.have_piece(p)])
+        pieces_to_download = await self._execute_sync(self._sync_get_pieces_to_download, infohash, unique_indices)
 
         if pieces_to_download:
             # --- 阶段1: 等待所有需要的 piece 下载完成 ---
-            def _set_priorities_sync():
-                priorities = [(p, 7) for p in pieces_to_download]
-                handle.prioritize_pieces(priorities)
-                handle.resume()
-            await self._execute_sync(_set_priorities_sync)
+            await self._execute_sync(self._sync_set_piece_priorities, infohash, pieces_to_download, 7)
 
             request_future = self.loop.create_future()
             with self.fetch_lock:
