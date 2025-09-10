@@ -36,7 +36,7 @@ class TorrentClient:
             'active_downloads': app_settings.lt_active_downloads, 'connections_limit': app_settings.lt_connections_limit,
             'upload_rate_limit': app_settings.lt_upload_rate_limit, 'download_rate_limit': app_settings.lt_download_rate_limit,
             'peer_connect_timeout': app_settings.lt_peer_connect_timeout, 'cache_size': app_settings.lt_cache_size,
-            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress | lt.alert_category.metadata),
+            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress),
         }
         self._ses = lt.session(settings_pack)
         self._cmd_queue = queue.Queue()
