@@ -154,6 +154,13 @@ class TorrentClient:
             try:
                 await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
                 self.log.info("为 %s 成功接收元数据。", infohash_hex)
+
+                def _pause_sync():
+                    handle = self._ses.find_torrent(lt.sha1_hash(infohash_hex))
+                    if handle and handle.is_valid():
+                        handle.pause()
+                await self._execute_sync(_pause_sync)
+
             except asyncio.TimeoutError:
                 raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash_hex)
             finally:
