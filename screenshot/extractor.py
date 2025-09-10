@@ -185,7 +185,8 @@ class MP4Extractor(BaseExtractor):
                     sample_entry_payload.seek(78)
                     config_box_payload = self._find_box_payload(sample_entry_payload, [config_box_name])
                     if config_box_payload and len(config_box_payload.getvalue()) > 5:
-                        self.mode = 'avc1'
+                        # 根据采样条目类型动态设置模式
+                        self.mode = 'hvc1' if self.codec_name == 'hevc' else 'avc1'
                         config_data = config_box_payload.getvalue()
 
                         if self.codec_name == 'h264':
@@ -334,7 +335,7 @@ class MKVExtractor(BaseExtractor):
 
                 private_data_el = children.get('CodecPrivate')
                 if private_data_el:
-                    self.extradata = private_data_el.value
+                    self.extradata = bytes(private_data_el.value)
 
                 return
 
@@ -388,5 +389,6 @@ class MKVExtractor(BaseExtractor):
             "V_MPEG4/ISO/AVC": "h264",
             "V_MPEGH/ISO/HEVC": "hevc",
             "V_AV1": "av1",
+            "V_VP9": "vp9",
         }
         return mapping.get(codec_id)
