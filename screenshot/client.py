@@ -36,7 +36,7 @@ class TorrentClient:
             'active_downloads': app_settings.lt_active_downloads, 'connections_limit': app_settings.lt_connections_limit,
             'upload_rate_limit': app_settings.lt_upload_rate_limit, 'download_rate_limit': app_settings.lt_download_rate_limit,
             'peer_connect_timeout': app_settings.lt_peer_connect_timeout, 'cache_size': app_settings.lt_cache_size,
-            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress),
+            'alert_mask': (lt.alert_category.error | lt.alert_category.status | lt.alert_category.storage | lt.alert_category.piece_progress | lt.alert_category.metadata),
         }
         self._ses = lt.session(settings_pack)
         self._cmd_queue = queue.Queue()
@@ -106,7 +106,6 @@ class TorrentClient:
     async def add_torrent(self, infohash: str, metadata: bytes = None):
         self.log.info("正在为 infohash 添加 torrent: %s", infohash)
         save_dir = os.path.join(self.save_path, infohash)
-        ti = None
 
         if metadata:
             self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash)
@@ -137,18 +136,21 @@ class TorrentClient:
             handle = await self._execute_sync(self._ses.add_torrent, params)
             self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
             try:
-                handle, ti = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
+                handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
                 self.log.info("为 %s 成功接收元数据。", infohash)
             except asyncio.TimeoutError:
                 raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
             finally:
                 self.pending_metadata.pop(infohash, None)
 
-        if ti:
+        # After getting metadata, set all piece priorities to 0 to prevent unwanted data download.
+        # This is safer than pausing/resuming the torrent.
+        status = await self._execute_sync(handle.status)
+        if status.has_metadata:
             self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
-            priorities = [0] * ti.num_pieces()
+            priorities = [0] * status.num_pieces
             await self._execute_sync(handle.prioritize_pieces, priorities)
-            handle.torrent_info_obj = ti
+
         return handle
 
     async def remove_torrent(self, handle):
@@ -244,11 +246,7 @@ class TorrentClient:
         infohash_str = str(alert.handle.info_hash())
         future = self.pending_metadata.get(infohash_str)
         if future and not future.done():
-            ti = alert.get_torrent_info()
-            if ti:
-                self.loop.call_soon_threadsafe(future.set_result, (alert.handle, ti))
-            else:
-                self.loop.call_soon_threadsafe(future.set_exception, TorrentClientError("未能从警报中获取 torrent_info。"))
+            self.loop.call_soon_threadsafe(future.set_result, alert.handle)
 
     def _handle_piece_finished(self, alert):
         if not alert.handle.is_valid(): return
