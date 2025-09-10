@@ -249,30 +249,41 @@ class ScreenshotService:
                 tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
                 tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
 
-                # 结合 rfind 和健壮的解析器来定位 'moov' box
-                search_pos = len(tail_data)
-                while (found_pos := tail_data.rfind(b'moov', 0, search_pos)) != -1:
-                    potential_start_pos = found_pos - 4
-                    if potential_start_pos < 0:
-                        search_pos = found_pos
-                        continue
-
-                    # 创建一个从潜在 box 开始的新 stream，并尝试解析
-                    box_stream = io.BytesIO(tail_data[potential_start_pos:])
+                # --- 新的、更安全的尾部解析逻辑 ---
+                # 不再使用 rfind，而是从尾部开始，逐个解析 box，直到找到 'moov'。
+                # 这更健壮，因为它遵循了 MP4 的文件结构。
+                offset_in_buffer = len(tail_data)
+                while offset_in_buffer > 4:
                     try:
-                        parsed_box = next(self._parse_mp4_boxes(box_stream), None)
-                        if parsed_box:
-                            box_type, box_content, _, declared_size = parsed_box
-                            # 验证我们解析出的确实是一个完整的 'moov' box
-                            if box_type == 'moov' and len(box_content) >= declared_size:
-                                self.log.info("[%s] 在尾部探测中通过 rfind 和解析器找到了有效的 'moov' box。", infohash_hex)
-                                return box_content
-                    except (struct.error, MP4ParsingError):
-                        # 如果解析失败，说明这不是一个真正的 box，继续搜索
-                        pass
+                        # 读取最后一个 box 的大小
+                        size_bytes = tail_data[offset_in_buffer - 4 : offset_in_buffer]
+                        box_size = struct.unpack('>I', size_bytes)[0]
 
-                    # 继续从找到的位置向前搜索
-                    search_pos = found_pos
+                        if box_size < 8: # box 至少要有8字节（大小+类型）
+                            offset_in_buffer -= 1 # 可能是垃圾数据，向前移动一个字节再试
+                            continue
+
+                        box_start_in_buffer = offset_in_buffer - box_size
+                        if box_start_in_buffer < 0:
+                            # Box 比我们已下载的尾部数据还要大，无法处理
+                            break
+
+                        # 读取 box 类型
+                        type_bytes = tail_data[box_start_in_buffer + 4 : box_start_in_buffer + 8]
+                        box_type = type_bytes.decode('ascii', 'ignore')
+
+                        if box_type == 'moov':
+                            self.log.info("[%s] 在尾部探测中通过结构化解析找到了有效的 'moov' box。", infohash_hex)
+                            # 返回完整的 box 数据
+                            return tail_data[box_start_in_buffer : box_start_in_buffer + box_size]
+
+                        # 如果不是 moov, 则移动到上一个 box 的起始位置继续查找
+                        offset_in_buffer = box_start_in_buffer
+
+                    except (struct.error, IndexError):
+                        # 如果解析失败，说明我们可能不在一个有效的 box 边界上
+                        # 向前移动一个字节，然后重试
+                        offset_in_buffer -= 1
         except TorrentClientError as e:
             raise MoovFetchError(f"在 moov 尾部探测期间失败: {e}", infohash_hex) from e
 
