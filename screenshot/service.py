@@ -291,6 +291,17 @@ class ScreenshotService:
         if not all_keyframes:
             return []
 
+        # 排除首尾 3% 的关键帧
+        total_keyframes = len(all_keyframes)
+        trim_count = int(total_keyframes * 0.03)
+
+        if trim_count > 0:
+            if total_keyframes > trim_count * 2:
+                all_keyframes = all_keyframes[trim_count:-trim_count]
+
+        if not all_keyframes:
+            return []
+
         # 如果从 'mdhd' box 中未能成功解析出时长，则回退到基于最后一个样本时间戳的估算
         if duration_pts == 0 and samples:
             self.log.warning("duration_pts 为 0，将使用最后一个样本的 PTS 作为估算时长。")

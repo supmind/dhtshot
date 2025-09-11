@@ -44,9 +44,25 @@ class ScreenshotGenerator:
         """
         try:
             # PyAV 的 to_image() 方法依赖 Pillow 库来创建图像对象。
+            img = frame.to_image()
+
+            # --- 自动缩放 ---
+            max_size = 512
+            width, height = img.size
+            if width > max_size or height > max_size:
+                if width > height:
+                    new_width = max_size
+                    new_height = int(max_size * height / width)
+                else:
+                    new_height = max_size
+                    new_width = int(max_size * width / height)
+
+                # 使用 ANTIALIAS 滤镜进行高质量缩放
+                img = img.resize((new_width, new_height), 1)
+
             # 我们将其保存到一个内存中的字节缓冲区，而不是磁盘文件。
             buffer = io.BytesIO()
-            frame.to_image().save(buffer, format="JPEG")
+            img.save(buffer, format="JPEG")
             image_bytes = buffer.getvalue()
             log.info("成功：为 infohash %s 在时间戳 %s 处生成了 %d 字节的截图。", infohash_hex, timestamp_str, len(image_bytes))
 
