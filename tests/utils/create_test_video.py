@@ -23,12 +23,13 @@ FPS = 1
 DURATION_SECONDS = 1
 DEFAULT_PIXEL_FORMAT = "yuv420p"  # H.264/H.265 编码器常用像素格式
 
-def generate_minimal_mp4(codec: str, output_filename: str):
+def generate_minimal_mp4(codec: str, output_filename: str, faststart: bool = False):
     """
     使用 PyAV 生成一个最小化的 MP4 文件。
 
     :param codec: 使用的 libav 编解码器名称 (例如, 'libx264', 'libx265', 'libaom-av1')。
     :param output_filename: 输出的视频文件名。
+    :param faststart: 如果为 True, 将 'moov' atom 移到文件开头。
     """
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     print(f"正在生成测试视频文件: {output_path} (编解码器: {codec})")
@@ -41,12 +42,17 @@ def generate_minimal_mp4(codec: str, output_filename: str):
         # AV1 对像素格式有更严格的要求
         pix_fmt = "yuv420p"
         options = {"crf": "50", "cpu-used": "8"}
-    else: # 默认为 H.264/H.265 的设置
+    else:  # 默认为 H.264/H.265 的设置
         pix_fmt = DEFAULT_PIXEL_FORMAT
         options = {"tune": "zerolatency", "preset": "ultrafast", "crf": "28"}
 
+    container_options = {}
+    if faststart:
+        container_options["movflags"] = "+faststart"
+        print("启用 faststart (moov at start)")
+
     # 使用 'mp4' 格式创建输出容器
-    with av.open(output_path, mode="w") as container:
+    with av.open(output_path, mode="w", options=container_options) as container:
         stream = container.add_stream(codec, rate=FPS)
         stream.width = WIDTH
         stream.height = HEIGHT
@@ -92,10 +98,15 @@ def main():
         required=True,
         help="输出的视频文件名。\n例如: 'test_h264.mp4'"
     )
+    parser.add_argument(
+        "--faststart",
+        action="store_true",
+        help="如果设置，则将 'moov' atom 移到文件开头"
+    )
     args = parser.parse_args()
 
     try:
-        generate_minimal_mp4(args.codec, args.output)
+        generate_minimal_mp4(args.codec, args.output, args.faststart)
     except Exception as e:
         print(f"生成测试视频时发生错误: {e}")
         import traceback

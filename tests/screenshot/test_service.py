@@ -263,6 +263,59 @@ async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
     assert pieces_to_fetch == [0, 1]
 
 @pytest.mark.asyncio
+async def test_get_moov_atom_from_tail(service):
+    """
+    测试当 'moov' atom 位于文件尾部时，_get_moov_atom_data 是否能正确地
+    先探测头部，再探测尾部，并最终找到 'moov' atom。
+    """
+    # 1. 准备测试数据
+    # 从我们之前生成的真实视频文件中读取 moov atom
+    from tests.screenshot.test_advanced_video_features import get_moov_atom, ASSETS_DIR
+    moov_at_end_file = ASSETS_DIR / "test_moov_at_end.mp4"
+    real_moov_atom = get_moov_atom(moov_at_end_file)
+
+    # 模拟一个文件头部，它只包含 ftyp 和 mdat，没有 moov
+    header_data = b'\x00\x00\x00\x18ftypiso5\x00\x00\x00\x08free\x00\x00\x00\x08mdat'
+    # 模拟一个文件尾部，它包含了真实的 moov atom
+    tail_data = b'\x01' * 100 + real_moov_atom # 在前面加一些填充数据
+
+    # 2. 模拟 service 的依赖
+    mock_handle = MagicMock()
+    service.client.fetch_pieces = AsyncMock()
+
+    # 模拟 fetch_pieces 的行为:
+    # - 第一次调用（头部探测）返回只含 mdat 的数据
+    # - 第二次调用（尾部探测）返回包含 moov 的数据
+    service.client.fetch_pieces.side_effect = [
+        {0: header_data},
+        {1: tail_data}
+    ]
+
+    # 模拟 _assemble_data_from_pieces 的行为
+    def mock_assemble(pieces_data, *args):
+        if 0 in pieces_data:
+            return header_data
+        if 1 in pieces_data:
+            return tail_data
+        return b""
+
+    # 3. 使用 patch.object 来临时替换实例上的方法并执行
+    with patch.object(service, '_assemble_data_from_pieces', side_effect=mock_assemble):
+        result_moov_data = await service._get_moov_atom_data(
+            mock_handle,
+            video_file_offset=0,
+            video_file_size=20000,
+            piece_length=16384,
+            infohash_hex="tail_moov_hash"
+        )
+
+    # 4. 断言
+    # 验证返回的是我们放在尾部的真实 moov atom
+    assert result_moov_data == real_moov_atom
+    # 验证 fetch_pieces 被调用了两次（一次头部，一次尾部）
+    assert service.client.fetch_pieces.call_count == 2
+
+@pytest.mark.asyncio
 async def test_get_queue_size(service):
     """测试 get_queue_size 方法是否能准确反映内部队列的大小。"""
     # 1. 初始状态下，队列应为空
