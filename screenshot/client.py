@@ -54,6 +54,7 @@ class TorrentClient:
             'active_limit': app_settings.lt_active_limit,
             'active_downloads': app_settings.lt_active_downloads,
             'connections_limit': app_settings.lt_connections_limit,
+            'half_open_limit': app_settings.lt_half_open_limit,
             'upload_rate_limit': app_settings.lt_upload_rate_limit,
             'download_rate_limit': app_settings.lt_download_rate_limit,
             'peer_connect_timeout': app_settings.lt_peer_connect_timeout,
