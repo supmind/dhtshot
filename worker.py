@@ -10,6 +10,7 @@ import logging
 import base64
 import os
 import signal
+import hashlib
 from functools import partial
 from typing import Optional, Any, Dict
 
@@ -20,27 +21,20 @@ from config import Settings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("Worker")
 
-ID_FILE = ".worker_id"
-
-def get_persistent_worker_id() -> str:
+def get_invariant_worker_id() -> str:
     """
-    获取持久化的 Worker ID。
-    如果 .worker_id 文件存在，则从中读取 ID。
-    如果不存在，则生成一个新的 UUID，保存到文件中，然后返回。
+    通过对机器的MAC地址进行哈希来生成一个固定不变的 Worker ID。
+    这确保了在同一台机器上ID总是不变的，而在不同机器上ID是不同的。
     """
-    if os.path.exists(ID_FILE):
-        with open(ID_FILE, "r") as f:
-            worker_uuid = f.read().strip()
-            log.info(f"从 {ID_FILE} 文件中加载到已存在的 Worker ID: {worker_uuid}")
-            return worker_uuid
-
-    worker_uuid = str(uuid.uuid4())
-    with open(ID_FILE, "w") as f:
-        f.write(worker_uuid)
-    log.info(f"生成了新的 Worker ID 并保存至 {ID_FILE}: {worker_uuid}")
+    # uuid.getnode() 获取 MAC 地址作为一个 48 位的整数
+    mac_address = uuid.getnode()
+    # 将 MAC 地址转换为十六进制字符串，并进行哈希
+    # 使用 SHA1 来创建一个简短但唯一的哈希值
+    worker_uuid = hashlib.sha1(str(mac_address).encode()).hexdigest()
+    log.info(f"根据机器硬件生成的不变 Worker ID: {worker_uuid}")
     return worker_uuid
 
-WORKER_ID = f"worker-{get_persistent_worker_id()}"
+WORKER_ID = f"worker-{get_invariant_worker_id()}"
 HEARTBEAT_INTERVAL = 30
 POLL_INTERVAL = 10
 
