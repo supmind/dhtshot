@@ -9,6 +9,7 @@ import struct
 import base64
 from typing import Generator, Tuple, Optional, Callable, Awaitable, Any
 from collections import defaultdict
+import psutil
 
 import av
 
@@ -556,8 +557,17 @@ class ScreenshotService:
 
     async def _worker(self):
         """一个工作协程，不断地从任务队列中获取并处理任务。"""
+        p = psutil.Process()
         while self._running:
             try:
+                # 资源使用检查
+                while p.num_fds() >= self.settings.MAX_FILE_DESCRIPTORS:
+                    self.log.warning(
+                        "文件描述符数量 (%d) 已达到阈值 (%d)。工作进程将暂停 2 秒。",
+                        p.num_fds(), self.settings.MAX_FILE_DESCRIPTORS
+                    )
+                    await asyncio.sleep(2)
+
                 task_info = await self.task_queue.get()
                 await self._handle_screenshot_task(task_info)
                 self.task_queue.task_done()

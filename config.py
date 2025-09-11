@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import psutil
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -17,6 +18,7 @@ class Settings(BaseSettings):
     num_workers: int = 50  # 单个 ScreenshotService 实例中用于处理任务的内部工作协程数量
     worker_idle_time: int = 30  # seconds
     worker_max_queue_size: int = 20  # 工作节点在暂停从调度器获取新任务前，其内部任务队列的最大长度
+    MAX_FILE_DESCRIPTORS: int = int(psutil.Process().rlimit(psutil.RLIMIT_NOFILE)[1] * 0.8) # 文件描述符数量的安全阈值
 
     # --- 截图服务设置 ---
     output_dir: str = "./screenshots_output"  # 存储最终截图的目录

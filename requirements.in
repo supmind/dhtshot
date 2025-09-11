@@ -32,3 +32,6 @@ aiohttp
 
 # For http client
 httpx
+
+# For resource monitoring
+psutil
