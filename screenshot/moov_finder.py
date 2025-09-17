@@ -27,42 +27,65 @@ class MoovFinder:
         self.log = logging.getLogger("MoovFinder")
 
     def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
-        """A robust MP4 box parser."""
+        """
+        A robust MP4 box parser that can skip garbage data.
+        """
         stream_buffer = stream.getbuffer()
         buffer_size = len(stream_buffer)
         current_offset = stream.tell()
+
         while current_offset <= buffer_size - 8:
             stream.seek(current_offset)
             try:
                 header_data = stream.read(8)
                 if len(header_data) < 8:
                     break
+
                 declared_size, box_type_bytes = struct.unpack('>I4s', header_data)
-                box_type = box_type_bytes.decode('ascii', 'ignore')
-            except struct.error:
-                self.log.warning("[%s] struct.error while parsing MP4 box header at offset %d.", self.infohash_hex, current_offset)
-                break
+
+                # --- Start of enhanced validation ---
+                # A box's declared size cannot be smaller than its header or larger than the remaining buffer.
+                if declared_size < 8 or declared_size > (buffer_size - current_offset):
+                    current_offset += 1
+                    continue
+
+                # The box type should be composed of printable ASCII characters.
+                if not all(32 <= c < 127 for c in box_type_bytes):
+                    current_offset += 1
+                    continue
+                # --- End of enhanced validation ---
+
+                box_type = box_type_bytes.decode('ascii')
+
+            except (struct.error, UnicodeDecodeError):
+                # If unpacking or decoding fails, it's not a valid box header.
+                current_offset += 1
+                continue
 
             box_header_size = 8
-            if declared_size == 1:
+            if declared_size == 1: # 64-bit size
                 if current_offset + 16 > buffer_size:
-                    break
+                    break # Not enough data for a full 64-bit header
                 declared_size = struct.unpack('>Q', stream.read(8))[0]
                 box_header_size = 16
-            elif declared_size == 0:
+            elif declared_size == 0: # Extends to end of file
                 declared_size = buffer_size - current_offset
 
             if declared_size < box_header_size:
-                self.log.warning("[%s] Invalid box size %d at offset %d.", self.infohash_hex, declared_size, current_offset)
-                break
+                # This check is somewhat redundant due to the validation above, but kept for safety.
+                current_offset += 1
+                continue
 
             effective_box_size = declared_size
             if current_offset + declared_size > buffer_size:
                 effective_box_size = buffer_size - current_offset
 
             box_content = stream_buffer[current_offset: current_offset + effective_box_size]
+
+            self.log.debug("Found box '%s' of size %d at offset %d", box_type, declared_size, current_offset)
             yield box_type, bytes(box_content), current_offset, declared_size
 
+            # Advance past the box we just processed
             current_offset += declared_size
 
     async def find_moov_atom(self) -> bytes:
