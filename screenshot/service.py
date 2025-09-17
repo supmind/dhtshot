@@ -516,22 +516,37 @@ class ScreenshotService:
         """处理单个截图任务的完整生命周期，包括错误处理和状态报告。"""
         infohash_hex = task_info['infohash']
         self.log.info("正在处理任务: %s", infohash_hex)
+        handle = None
+        should_delete_files = True
 
         try:
-            async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as handle:
-                await self._generate_screenshots_from_torrent(handle, infohash_hex)
+            handle = await self.client.add_torrent(infohash_hex, metadata=task_info.get('metadata'))
+            if not handle or not handle.is_valid():
+                raise TorrentClientError(f"无法为 {infohash_hex} 获取有效的 torrent handle。")
+
+            await self._generate_screenshots_from_torrent(handle, infohash_hex)
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
+
+        except (MetadataTimeoutError, MoovFetchError, FrameDownloadTimeoutError, TorrentClientError) as e:
+            self.log.warning("任务 %s 遇到可恢复的错误: %s", e.infohash, e)
+            await self._send_status_update(status='recoverable_failure', infohash=e.infohash, message=str(e), error=e)
+            should_delete_files = False  # 保留元数据以供重试
+            return
+
         except TaskError as e:
-            # 所有已知的、与任务相关的错误现在都应被视为永久性失败。
-            self.log.error("任务 %s 因错误而失败: %s", e.infohash, e, exc_info=True)
+            self.log.error("任务 %s 因永久性错误而失败: %s", e.infohash, e, exc_info=True)
             await self._send_status_update(status='permanent_failure', infohash=e.infohash, message=str(e), error=e)
             return
+
         except Exception as e:
             self.log.exception("处理 %s 时发生意外的严重错误。", infohash_hex)
             await self._send_status_update(status='permanent_failure', infohash=infohash_hex, message=f"发生意外错误: {e}", error=e)
             return
+
         finally:
+            if handle and handle.is_valid():
+                await self.client.remove_torrent(handle, delete_files=should_delete_files)
             self.active_tasks.discard(infohash_hex)
 
     async def _worker(self):

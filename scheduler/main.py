@@ -68,6 +68,30 @@ async def reset_stuck_tasks_periodically(db_session_factory, timeout: int, inter
         finally:
             db.close()
 
+
+async def retry_scheduler_loop(db_session_factory, interval: int):
+    """
+    一个后台任务，定期检查并重试可恢复的失败任务。
+    :param db_session_factory: 用于创建新的数据库会话的函数。
+    :param interval: 检查周期的秒数。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        db = db_session_factory()
+        try:
+            log.info("开始执行后台任务：重试失败的任务...")
+            retryable_tasks = crud.get_retryable_tasks(db, limit=100)
+            if retryable_tasks:
+                log.info(f"发现了 {len(retryable_tasks)} 个可重试的任务。")
+                for task in retryable_tasks:
+                    crud.reset_task_for_retry(db, task)
+                log.info("所有可重试任务已重置为 'pending'。")
+            else:
+                log.info("没有发现可重试的任务。")
+        finally:
+            db.close()
+
+
 # --- 应用生命周期事件 ---
 @app.on_event("startup")
 async def startup_event():
@@ -81,6 +105,9 @@ async def startup_event():
     task_timeout_seconds = 300  # 5 分钟
     check_interval_seconds = 60   # 1 分钟
     asyncio.create_task(reset_stuck_tasks_periodically(SessionLocal, task_timeout_seconds, check_interval_seconds))
+
+    retry_interval_seconds = 300  # 5 分钟
+    asyncio.create_task(retry_scheduler_loop(SessionLocal, retry_interval_seconds))
 
 @app.on_event("shutdown")
 async def shutdown_event():

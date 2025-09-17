@@ -18,6 +18,7 @@ class TaskCreate(TaskBase):
 class Task(TaskBase):
     id: int
     status: str = Field("pending", description="任务的当前状态 (e.g., pending, working, success, failure)。")
+    retry_count: int = Field(0, description="任务重试次数")
     torrent_name: Optional[str] = None
     video_filename: Optional[str] = None
     video_duration_seconds: Optional[int] = None

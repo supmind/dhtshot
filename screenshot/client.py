@@ -238,13 +238,21 @@ class TorrentClient:
 
         return handle
 
-    async def remove_torrent(self, handle):
-        """从会话中移除一个 torrent 并删除其文件。"""
+    async def remove_torrent(self, handle, delete_files: bool = True):
+        """从会话中移除一个 torrent，并可选择是否删除其文件。"""
         if handle and handle.is_valid():
             infohash = str(await self._execute_sync(handle.info_hash))
             self.pending_metadata.pop(infohash, None)
-            await self._execute_sync(self._ses.remove_torrent, handle, lt.session.delete_files)
-            self.log.info("已移除 torrent: %s", infohash)
+
+            options = lt.session.delete_files if delete_files else 0
+            await self._execute_sync(self._ses.remove_torrent, handle, options)
+
+            log_msg = f"已移除 torrent: {infohash}"
+            if delete_files:
+                log_msg += " (文件已删除)。"
+            else:
+                log_msg += " (文件已保留)。"
+            self.log.info(log_msg)
 
     def request_pieces(self, handle, piece_indices: list[int]):
         """

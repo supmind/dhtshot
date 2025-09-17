@@ -217,6 +217,36 @@ def update_task_status(
     return db_task
 
 
+def get_retryable_tasks(db: Session, limit: int = 100) -> list[models.Task]:
+    """
+    获取所有可重试的任务。
+    这些任务的状态是 'recoverable_failure'，并且重试次数小于3。
+
+    :param db: 数据库会话。
+    :param limit: 返回的最大任务数。
+    :return: 一个符合重试条件的任务对象列表。
+    """
+    return db.query(models.Task).filter(
+        models.Task.status == 'recoverable_failure',
+        models.Task.retry_count < 3
+    ).limit(limit).all()
+
+def reset_task_for_retry(db: Session, db_task: models.Task) -> models.Task:
+    """
+    重置一个任务以便重试。
+    将任务状态更新为 'pending'，并增加重试次数。
+
+    :param db: 数据库会话。
+    :param db_task: 要重置的 Task 对象。
+    :return: 更新后的 Task 对象。
+    """
+    db_task.status = 'pending'
+    db_task.retry_count += 1
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+
 def update_task_details(db: Session, infohash: str, details: schemas.TaskDetailsUpdate) -> Optional[models.Task]:
     """
     更新任务的详细信息，如 torrent 名称、视频文件名和时长。
