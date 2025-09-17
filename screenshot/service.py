@@ -208,27 +208,26 @@ class ScreenshotService:
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """
         智能地查找并获取 'moov' atom 数据。
-        策略是：首先探测文件头部，如果找不到 'moov'，则探测文件尾部。
-        这是因为 'moov' atom 可能位于文件的开头或结尾。
+        策略是：首先探测文件头部。如果找到 'moov' 则返回。如果找到 'mdat'，则利用其信息
+        精确定位文件尾部可能包含 'moov' 的区域，并仅探测该区域。
         """
+        mdat_info = None  # To store information about the mdat box if found
+
         # --- 阶段1: 探测文件头部 ---
         try:
-            head_size = min(256 * 1024, video_file_size)
+            head_size = min(256 * 1024, video_file_size) # TODO: Make configurable
             if head_size > 0:
                 head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
                 head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
                 head_data = self._assemble_data_from_pieces(head_data_pieces, video_file_offset, head_size, piece_length)
                 stream = io.BytesIO(head_data)
 
-                # 使用新的、更健壮的解析器
                 for box_type, partial_box_data, box_offset, declared_size in self._parse_mp4_boxes(stream):
                     if box_type == 'moov':
-                        # 检查我们拥有的数据是否就是完整的 box
                         if len(partial_box_data) >= declared_size:
                             self.log.info("[%s] 在头部探测中找到了完整的 'moov' box。", infohash_hex)
                             return partial_box_data
 
-                        # 如果数据不完整，说明 'moov' box 太大，需要专门下载它
                         self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
@@ -236,40 +235,40 @@ class ScreenshotService:
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
 
                     if box_type == 'mdat':
-                        # 如果先找到 'mdat'，说明 'moov' 很可能在尾部，停止头部探测
-                        self.log.info("[%s] 在文件头部探测到 'mdat'，将转而探测文件尾部。", infohash_hex)
-                        break
+                        self.log.info("[%s] 在文件头部探测到 'mdat' box (大小: %d)，记录其信息以备尾部探测。", infohash_hex, declared_size)
+                        mdat_info = {'offset': box_offset, 'size': declared_size}
+                        # Don't break here, moov could theoretically come after mdat even in the header
         except TorrentClientError as e:
-            # 捕获 Torrent 客户端本身的错误（例如，超时）
             raise MoovFetchError(f"在 moov 头部探测期间获取 piece 失败: {e}", infohash_hex) from e
 
-        # --- 阶段2: 探测文件尾部 ---
-        try:
-            tail_probe_size = 10 * 1024 * 1024
-            tail_file_offset = max(0, video_file_size - tail_probe_size)
-            tail_torrent_offset = video_file_offset + tail_file_offset
-            tail_size = min(tail_probe_size, video_file_size - tail_file_offset)
-            if tail_size > 0:
-                tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
-                tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
-                tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
+        # --- 阶段2: 基于 mdat 信息智能探测文件尾部 ---
+        if mdat_info:
+            try:
+                # Calculate the precise region to search after the mdat box
+                mdat_end_offset_in_file = mdat_info['offset'] + mdat_info['size']
 
-                # 从后向前搜索 'moov' 标志，然后验证其是否为一个有效的 box
-                search_pos = len(tail_data)
-                while (found_pos := tail_data.rfind(b'moov', 0, search_pos)) != -1:
-                    potential_start_pos = found_pos - 4
-                    if potential_start_pos < 0: search_pos = found_pos; continue
-                    stream = io.BytesIO(tail_data); stream.seek(potential_start_pos)
-                    try:
-                        box_size, box_type_bytes = struct.unpack('>I4s', stream.read(8))
-                        if box_type_bytes == b'moov' and box_size > 8 and (potential_start_pos + box_size <= len(tail_data)):
-                            stream.seek(potential_start_pos)
-                            _, full_box_data, _, parsed_box_size = next(self._parse_mp4_boxes(stream), (None, None, None, None))
-                            if full_box_data: return full_box_data
-                    except (struct.error, MP4ParsingError): pass
-                    search_pos = found_pos
-        except TorrentClientError as e:
-            raise MoovFetchError(f"在 moov 尾部探测期间失败: {e}", infohash_hex) from e
+                # Ensure we don't try to read past the end of the file
+                if mdat_end_offset_in_file >= video_file_size:
+                     raise MoovNotFoundError(f"mdat box (ends at {mdat_end_offset_in_file}) seems to extend to or past the end of the file (size {video_file_size}). No space for moov.", infohash_hex)
+
+                tail_torrent_offset = video_file_offset + mdat_end_offset_in_file
+                tail_size = video_file_size - mdat_end_offset_in_file
+
+                self.log.info(f"[{infohash_hex}] Mdat 结束于 {mdat_end_offset_in_file}。探测尾部大小为 {tail_size} 的区域。")
+
+                if tail_size > 0:
+                    tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
+                    tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
+                    tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
+
+                    # Search for moov from the beginning of the tail data
+                    stream = io.BytesIO(tail_data)
+                    for box_type, box_data, _, _ in self._parse_mp4_boxes(stream):
+                         if box_type == 'moov':
+                             self.log.info(f"[{infohash_hex}] 在智能尾部探测中找到了 'moov' box。")
+                             return box_data # The tail data should contain the full moov box
+            except TorrentClientError as e:
+                raise MoovFetchError(f"在智能 moov 尾部探测期间失败: {e}", infohash_hex) from e
 
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
