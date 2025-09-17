@@ -246,34 +246,3 @@ def update_task_details(db: Session, infohash: str, details: schemas.TaskDetails
         db.commit()
         db.refresh(db_task)
     return db_task
-
-def record_screenshot(db: Session, infohash: str, filename: str) -> Optional[models.Task]:
-    """
-    将一个成功生成的截图文件名附加到任务的 `successful_screenshots` JSON 数组中。
-    此操作是并发安全的。通过对任务行施加 `SELECT ... FOR UPDATE` 悲观锁，
-    保证了“读取-修改-写入”整个过程的原子性，能有效防止多个工作节点并发上传截图时
-    发生竞态条件导致的数据丢失。
-
-    :param db: 数据库会话。
-    :param infohash: 截图所属任务的 infohash。
-    :param filename: 要记录的截图文件名。
-    :return: 更新后的 Task 对象，如果任务不存在则返回 None。
-    """
-    # 使用 with_for_update() 对任务行施加悲观锁。
-    # 这确保了从读取 successful_screenshots 字段到更新它的整个过程是原子的，
-    # 可以防止多个并发请求同时修改该字段时导致的数据丢失问题。
-    db_task = db.query(models.Task).filter(models.Task.infohash == infohash).with_for_update().first()
-
-    if db_task:
-        # 如果字段为 None，则初始化为一个空列表
-        current_screenshots = list(db_task.successful_screenshots) if db_task.successful_screenshots else []
-
-        if filename not in current_screenshots:
-            current_screenshots.append(filename)
-            db_task.successful_screenshots = current_screenshots
-
-        # 提交事务后，锁会自动释放
-        db.commit()
-        db.refresh(db_task)
-
-    return db_task

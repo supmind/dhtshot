@@ -23,10 +23,6 @@ class Task(Base):
     # 任务状态: 'pending', 'working', 'success', 'recoverable_failure', 'permanent_failure'
     status = Column(String(50), nullable=False, default='pending', comment="任务的当前状态")
 
-    # 使用 JSON 类型存储成功生成的截图文件名列表。
-    # 在支持原生 JSON 的数据库（如 PostgreSQL）上性能更佳，在 SQLite 上会回退到 TEXT 类型。
-    successful_screenshots = Column(JSON, nullable=True, comment="已成功生成的截图文件名列表")
-
     result_message = Column(Text, nullable=True, comment="记录任务完成（成功或失败）时的最终消息")
     assigned_worker_id = Column(String(255), ForeignKey("workers.worker_id"), nullable=True, comment="当前正在处理此任务的工作节点的ID")
 

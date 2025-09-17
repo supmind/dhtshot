@@ -60,41 +60,6 @@ class TestAssembleData:
         assert result == b""
 
 
-def test_serialize_task_state(service):
-    """测试 _serialize_task_state 方法是否能正确地将一个复杂的任务状态对象转换为字典。"""
-    # 1. 创建模拟的 extractor 和其他状态数据
-    mock_extractor = MagicMock(spec=KeyframeExtractor)
-    mock_extractor.extradata = b"some_bytes"
-    mock_extractor.codec_name = "h264"
-    mock_extractor.mode = "avc1"
-    mock_extractor.nal_length_size = 4
-    mock_extractor.timescale = 90000
-    mock_extractor.samples = [SampleInfo(1, 100, True, 1, 90000)]
-
-    task_state = {
-        'infohash': 'test_hash',
-        'piece_length': 16384,
-        'video_file_offset': 0,
-        'video_file_size': 1000,
-        'extractor': mock_extractor,
-        'all_keyframes': [Keyframe(0, 1, 90000, 90000)],
-        'selected_keyframes': [Keyframe(0, 1, 90000, 90000)],
-        'completed_pieces': {0, 1, 2},
-        'processed_keyframes': {0}
-    }
-
-    # 2. 调用序列化方法
-    serialized_data = service._serialize_task_state(task_state)
-
-    # 3. 验证结果
-    assert serialized_data is not None
-    assert serialized_data['infohash'] == 'test_hash'
-    assert serialized_data['extractor_info']['extradata'] == b"some_bytes"
-    assert len(serialized_data['all_keyframes']) == 1
-    assert serialized_data['all_keyframes'][0]['sample_index'] == 1
-    assert list(serialized_data['processed_keyframes']) == [0]
-
-
 # --- 原有的测试 Fixtures 和 Cases ---
 
 @pytest.fixture
@@ -162,21 +127,6 @@ def test_select_keyframes_logic(service):
     expected_pts = [0, 88 * 90000, 95 * 90000]
     assert sorted(selected_pts) == sorted(expected_pts)
 
-@patch('screenshot.service.KeyframeExtractor')
-def test_load_state_from_resume_data(MockKeyframeExtractor, service):
-    """测试从 resume_data 恢复任务状态的逻辑。"""
-    mock_extractor_instance = MockKeyframeExtractor.return_value
-    resume_data = {
-        "infohash": "r_hash", "piece_length": 2, "video_file_offset": 3, "video_file_size": 4,
-        "extractor_info": { "extradata": "AQIDBA==", "codec_name": "h264", "mode": "avc1", "nal_length_size": 4, "timescale": 90000,
-            "samples": [{"offset": 1, "size": 1, "is_keyframe": True, "index": 1, "pts": 0}] },
-        "all_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
-        "selected_keyframes": [{"index": 0, "sample_index": 1, "pts": 0, "timescale": 90000}],
-        "completed_pieces": [1, 2], "processed_keyframes": []
-    }
-    state = service._load_state_from_resume_data(resume_data)
-    assert state["extractor"].extradata == b'\x01\x02\x03\x04'
-
 @pytest.mark.asyncio
 @patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
 async def test_handle_task_permanent_failure(mock_generate, service, mock_callbacks):
@@ -188,19 +138,6 @@ async def test_handle_task_permanent_failure(mock_generate, service, mock_callba
     result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
     assert result.get("status") == "permanent_failure"
     assert isinstance(result.get("error"), NoVideoFileError)
-
-@pytest.mark.asyncio
-@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
-async def test_handle_task_recoverable_failure(mock_generate, service, mock_callbacks):
-    """测试当子流程抛出可恢复错误时，任务是否被正确处理。"""
-    error = FrameDownloadTimeoutError("Timeout", "recoverable_hash", resume_data={"key": "value"})
-    mock_generate.side_effect = error
-
-    await service._handle_screenshot_task({"infohash": "recoverable_hash"})
-
-    result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
-    assert result.get("status") == "recoverable_failure"
-    assert result.get("resume_data") == {"key": "value"}
 
 @pytest.mark.asyncio
 @patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
@@ -331,3 +268,55 @@ async def test_get_queue_size(service):
     # 4. 取出一个任务后再次验证
     _ = await service.task_queue.get()
     assert service.get_queue_size() == 1
+
+@pytest.mark.asyncio
+async def test_generate_screenshots_filters_existing(service):
+    """测试当发现已存在的截图时，_generate_screenshots_from_torrent 是否能正确地过滤它们。"""
+    # 1. 设置
+    infohash = "filter_test_hash"
+    # 这个回调将被附加到本次测试的 service 实例上
+    service.screenshot_check_callback = AsyncMock(return_value=[
+        f"{infohash}_90.jpg"  # 对应于 PTS 为 90 * 90000 的关键帧
+    ])
+
+    # Mock 该方法的所有依赖
+    mock_handle = MagicMock()
+    mock_ti = MagicMock()
+    mock_handle.get_torrent_info.return_value = mock_ti
+    mock_ti.piece_length.return_value = 16384
+
+    # Mock 调用链
+    with patch.object(service, '_find_video_file', return_value=(0, 1000, 0, 'video.mp4')), \
+         patch.object(service, '_get_moov_atom_data', new_callable=AsyncMock, return_value=b'moovdata'), \
+         patch.object(service, '_process_keyframe_pieces', new_callable=AsyncMock, return_value=(set(), {})), \
+         patch('screenshot.service.KeyframeExtractor') as MockExtractor:
+
+        # 2. 配置 Mock
+        mock_extractor_instance = MockExtractor.return_value
+        # 创建 3 个关键帧，分别在 30s, 60s, 90s
+        all_kfs = [
+            Keyframe(0, 0, 30 * 90000, 90000),
+            Keyframe(1, 1, 60 * 90000, 90000),
+            Keyframe(2, 2, 90 * 90000, 90000)
+        ]
+        mock_extractor_instance.keyframes = all_kfs
+        mock_extractor_instance.timescale = 90000
+        mock_extractor_instance.duration_pts = 100 * 90000
+        mock_extractor_instance.samples = [MagicMock()] * 3
+
+        # _select_keyframes 的逻辑会返回所有这 3 个关键帧
+        with patch.object(service, '_select_keyframes', return_value=all_kfs):
+            # 3. 执行
+            await service._generate_screenshots_from_torrent(mock_handle, infohash)
+
+            # 4. 断言
+            # 最重要的断言：检查 _process_keyframe_pieces 是否是带着被过滤后的列表被调用的
+            call_args = service._process_keyframe_pieces.call_args[0]
+            remaining_keyframes_arg = call_args[5]  # 'remaining_keyframes' 参数
+
+            # 我们期望在 90s 的关键帧 (PTS=8100000) 被过滤掉
+            assert len(remaining_keyframes_arg) == 2
+            remaining_pts = {kf.pts for kf in remaining_keyframes_arg}
+            assert 90 * 90000 not in remaining_pts
+            assert 30 * 90000 in remaining_pts
+            assert 60 * 90000 in remaining_pts

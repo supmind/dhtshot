@@ -85,13 +85,12 @@ async def test_on_task_finished_callback():
     # --- 安排 ---
     mock_client = AsyncMock(spec=worker.SchedulerAPIClient)
     infohash, status, message = "test_hash", "success", "All good"
-    resume_data = {"key": "value"}
 
     # --- 执行 ---
-    await worker.on_task_finished(mock_client, status, infohash, message, resume_data=resume_data)
+    await worker.on_task_finished(mock_client, status, infohash, message)
 
     # --- 断言 ---
-    mock_client.update_task_status.assert_awaited_once_with(infohash, status, message, resume_data)
+    mock_client.update_task_status.assert_awaited_once_with(infohash, status, message)
 
 @pytest.mark.asyncio
 async def test_scheduler_api_client_send_heartbeat():
@@ -100,24 +99,25 @@ async def test_scheduler_api_client_send_heartbeat():
     """
     # --- 安排 ---
     mock_session = AsyncMock(spec=ClientSession)
-    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler")
+    # The API key is required now, let's provide a dummy one for the test
+    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler", "dummy-api-key")
 
     mock_service = MagicMock(spec=ScreenshotService)
     type(mock_service).active_tasks = PropertyMock(return_value={"t1", "t2", "t3"})
     mock_service.get_queue_size.return_value = 1
 
     # --- 执行 ---
-    await client.send_heartbeat("worker-id", mock_service, 50)
+    await client.send_heartbeat("worker-id", mock_service)
 
     # --- 断言 ---
     expected_payload = {
         "worker_id": "worker-id",
         "status": "busy",
         "active_tasks_count": 2, # 3 (total) - 1 (queued) = 2 (processing)
-        "queue_size": 1,
-        "processed_tasks_count": 50
+        "queue_size": 1
     }
     mock_session.post.assert_awaited_once_with(
         "http://fake-scheduler/workers/heartbeat",
-        json=expected_payload
+        json=expected_payload,
+        headers={"X-API-Key": "dummy-api-key"}
     )

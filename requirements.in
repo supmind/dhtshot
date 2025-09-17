@@ -30,6 +30,9 @@ pysqlite3-binary
 # For worker
 aiohttp
 
+# For caching
+redis==5.0.4
+
 # For http client
 httpx
 

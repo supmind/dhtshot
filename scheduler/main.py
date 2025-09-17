@@ -14,9 +14,11 @@ import logging
 import asyncio
 import json
 
+from redis import asyncio as aioredis
 from . import crud, models, schemas
 from .database import SessionLocal, engine
 from .security import get_api_key
+from .redis_client import init_redis_pool, close_redis_pool, get_redis_client
 
 # --- 日志配置 ---
 logging.basicConfig(level=logging.INFO)
@@ -66,17 +68,27 @@ async def reset_stuck_tasks_periodically(db_session_factory, timeout: int, inter
         finally:
             db.close()
 
-# --- 应用启动事件 ---
+# --- 应用生命周期事件 ---
 @app.on_event("startup")
 async def startup_event():
     """
-    在应用启动时，启动一个后台任务来处理卡死的任务。
+    在应用启动时，初始化 Redis 连接池并启动后台任务。
     """
-    log.info("应用启动，开始后台任务...")
-    # 从环境变量或配置中获取超时和间隔时间，这里为了简单直接硬编码
+    log.info("应用启动...")
+    await init_redis_pool()
+
+    log.info("启动后台任务...")
     task_timeout_seconds = 300  # 5 分钟
     check_interval_seconds = 60   # 1 分钟
     asyncio.create_task(reset_stuck_tasks_periodically(SessionLocal, task_timeout_seconds, check_interval_seconds))
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    在应用关闭时，关闭 Redis 连接池。
+    """
+    log.info("应用关闭...")
+    await close_redis_pool()
 
 # --- API 端点 ---
 
@@ -139,27 +151,13 @@ def get_next_task(worker_id: str = Query(..., description="请求任务的工作
 
     response_data = {"infohash": task.infohash}
 
-    # 优先检查并附加恢复数据（如果存在）
-    RESUME_DIR = "resume_data"
-    resume_file_path = os.path.join(RESUME_DIR, f"{task.infohash}.resume")
-    if os.path.exists(resume_file_path):
-        try:
-            with open(resume_file_path, "r") as f:
-                resume_data = json.load(f)
-            response_data["resume_data"] = resume_data
-            os.remove(resume_file_path) # 恢复数据是一次性的，使用后即删除
-            log.info("在任务 %s 中发现并加载了恢复数据文件。", task.infohash)
-        except (IOError, json.JSONDecodeError) as e:
-            log.error(f"为任务 {task.infohash} 读取或删除恢复数据文件时失败: {e}")
-
-    # 如果没有恢复数据，再检查并附加元数据（如果存在）
-    if "resume_data" not in response_data:
-        METADATA_DIR = "temp_metadata"
-        metadata_path = os.path.join(METADATA_DIR, f"{task.infohash}.torrent")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, "rb") as f:
-                metadata_bytes = f.read()
-                response_data["metadata"] = base64.b64encode(metadata_bytes).decode('ascii')
+    # 检查并附加元数据（如果存在）
+    METADATA_DIR = "temp_metadata"
+    metadata_path = os.path.join(METADATA_DIR, f"{task.infohash}.torrent")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "rb") as f:
+            metadata_bytes = f.read()
+            response_data["metadata"] = base64.b64encode(metadata_bytes).decode('ascii')
 
     return schemas.NextTaskResponse(**response_data)
 
@@ -226,38 +224,40 @@ def worker_heartbeat(heartbeat: schemas.WorkerHeartbeat, db: Session = Depends(g
     return db_worker
 
 
-@app.post("/tasks/{infohash}/screenshots", response_model=schemas.Task, tags=["任务管理"])
-async def record_screenshot_endpoint(infohash: str, record: schemas.ScreenshotRecord, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
+@app.get("/tasks/{infohash}/screenshots", response_model=list[str], tags=["任务管理"])
+async def get_recorded_screenshots_endpoint(
+    infohash: str,
+    redis: aioredis.Redis = Depends(get_redis_client),
+    api_key: str = Depends(get_api_key)
+):
     """
-    记录一个已成功上传到对象存储的截图文件名。
+    通过 Redis 获取指定任务已成功记录的所有截图文件名。
     """
-    db_task = crud.record_screenshot(db, infohash=infohash, filename=record.filename)
-    if db_task is None:
-        raise HTTPException(status_code=404, detail="未找到与此截图关联的任务。")
-    return db_task
+    redis_key = f"screenshots:{infohash}"
+    screenshots = await redis.smembers(redis_key)
+    return list(screenshots)
+
+
+@app.post("/tasks/{infohash}/screenshots", status_code=status.HTTP_200_OK, tags=["任务管理"])
+async def record_screenshot_endpoint(
+    infohash: str,
+    record: schemas.ScreenshotRecord,
+    redis: aioredis.Redis = Depends(get_redis_client),
+    api_key: str = Depends(get_api_key)
+):
+    """
+    通过 Redis 记录一个已成功生成的截图文件名。
+    """
+    redis_key = f"screenshots:{infohash}"
+    await redis.sadd(redis_key, record.filename)
+    return {"message": "Screenshot recorded successfully"}
 
 
 @app.post("/tasks/{infohash}/status", response_model=schemas.Task, tags=["任务管理"])
 async def update_task_status_endpoint(infohash: str, update: schemas.TaskStatusUpdate, db: Session = Depends(get_db), api_key: str = Depends(get_api_key)):
     """
     更新一个任务的最终状态。
-    如果提供了 resume_data，它将被保存为文件，用于未来的任务恢复。
     """
-    # 如果 worker 发送了 resume_data，则将其保存到文件系统
-    if update.resume_data:
-        RESUME_DIR = "resume_data"
-        os.makedirs(RESUME_DIR, exist_ok=True)
-        file_path = os.path.join(RESUME_DIR, f"{infohash}.resume")
-        try:
-            with open(file_path, "w") as f:
-                json.dump(update.resume_data, f)
-            log.info(f"已为任务 {infohash} 保存恢复数据到 {file_path}")
-        except (IOError, TypeError) as e:
-            log.error(f"为任务 {infohash} 保存恢复数据时失败: {e}")
-            # 即使保存失败，也继续更新任务状态，但不抛出500错误
-            # 因为状态更新更重要
-            pass
-
     # 如果任务成功完成，则清理相关的元数据文件
     if update.status == 'success':
         METADATA_DIR = "temp_metadata"

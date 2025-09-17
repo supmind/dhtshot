@@ -40,7 +40,16 @@ class ScreenshotService:
     7.  管理任务状态，支持从失败中恢复 (断点续传)。
     8.  通过回调函数向上层报告任务的最终状态和生成的截图。
     """
-    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None, details_callback: Optional[Callable] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        loop=None,
+        client=None,
+        status_callback: Optional[StatusCallback] = None,
+        screenshot_callback: Optional[Callable] = None,
+        details_callback: Optional[Callable] = None,
+        screenshot_check_callback: Optional[Callable] = None,
+    ):
         self.loop = loop or asyncio.get_event_loop()
         self.settings = settings
         self.log = logging.getLogger("ScreenshotService")
@@ -59,6 +68,7 @@ class ScreenshotService:
         )
         self.status_callback = status_callback
         self.details_callback = details_callback
+        self.screenshot_check_callback = screenshot_check_callback
         self.active_tasks = set()
         self._submit_lock = asyncio.Lock()
 
@@ -84,7 +94,7 @@ class ScreenshotService:
             worker.cancel()
         self.log.info("ScreenshotService 已停止。")
 
-    async def submit_task(self, infohash: str, metadata: bytes = None, resume_data: dict = None):
+    async def submit_task(self, infohash: str, metadata: bytes = None):
         """
         提交一个新的截图任务。
         使用锁来防止同一 infohash 的任务被重复提交。
@@ -95,9 +105,8 @@ class ScreenshotService:
                 return
             self.active_tasks.add(infohash)
 
-        await self.task_queue.put({'infohash': infohash, 'metadata': metadata, 'resume_data': resume_data})
-        log_msg = "为 infohash: %s 重新提交了任务" if resume_data else "为 infohash: %s 提交了新任务"
-        self.log.info(log_msg, infohash)
+        await self.task_queue.put({'infohash': infohash, 'metadata': metadata})
+        self.log.info("为 infohash: %s 提交了新任务", infohash)
 
     def _get_pieces_for_range(self, offset_in_torrent: int, size: int, piece_length: int) -> list[int]:
         """为 torrent 中的给定字节范围计算其覆盖的所有 piece 索引。"""
@@ -340,54 +349,6 @@ class ScreenshotService:
         selected_keyframes.sort(key=lambda kf: kf.pts)
         return selected_keyframes
 
-    def _serialize_task_state(self, state: dict) -> dict:
-        """将一个实时的、包含复杂对象的任务状态，转换为一个 JSON 可序列化的字典，用于任务恢复。"""
-        extractor = state.get('extractor')
-        if not extractor: return None
-        # 注意：extradata 是 bytes 类型，在发送给调度器前需要由 worker 进行 base64 编码
-        return {
-            "infohash": state['infohash'], "piece_length": state['piece_length'],
-            "video_file_offset": state['video_file_offset'], "video_file_size": state['video_file_size'],
-            "extractor_info": {
-                "extradata": extractor.extradata, "codec_name": extractor.codec_name, "mode": extractor.mode,
-                "nal_length_size": extractor.nal_length_size, "timescale": extractor.timescale,
-                "samples": [s._asdict() for s in extractor.samples],
-            },
-            "all_keyframes": [k._asdict() for k in state['all_keyframes']],
-            "selected_keyframes": [k._asdict() for k in state['selected_keyframes']],
-            "completed_pieces": list(state.get('completed_pieces', [])),
-            "processed_keyframes": list(state.get('processed_keyframes', [])),
-        }
-
-    def _load_state_from_resume_data(self, data: dict) -> dict:
-        """从 resume_data 字典中恢复任务状态，将纯数据结构重建为包含类的实例的对象。"""
-        extractor = KeyframeExtractor(moov_data=None)
-        ext_info = data['extractor_info']
-
-        # extradata 在 resume_data 中是 base64 编码的字符串，需要解码回 bytes
-        extradata = ext_info.get('extradata')
-        if extradata and isinstance(extradata, str):
-            try: extractor.extradata = base64.b64decode(extradata)
-            except (base64.binascii.Error, TypeError) as e:
-                self.log.error(f"解码 base64 extradata 失败: {e}"); extractor.extradata = None
-        else: extractor.extradata = extradata
-
-        extractor.codec_name = ext_info.get('codec_name')
-        extractor.mode = ext_info['mode']
-        extractor.nal_length_size = ext_info['nal_length_size']
-        extractor.timescale = ext_info['timescale']
-        extractor.samples = [SampleInfo(**s) for s in ext_info['samples']]
-        all_keyframes = [Keyframe(**k) for k in data['all_keyframes']]
-        extractor.keyframes = all_keyframes
-        return {
-            "infohash": data['infohash'], "piece_length": data['piece_length'],
-            "video_file_offset": data['video_file_offset'], "video_file_size": data['video_file_size'],
-            "extractor": extractor, "all_keyframes": all_keyframes,
-            "selected_keyframes": [Keyframe(**k) for k in data['selected_keyframes']],
-            "completed_pieces": set(data['completed_pieces']),
-            "processed_keyframes": set(data['processed_keyframes']),
-        }
-
     async def _process_keyframe_pieces(self, handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes) -> Tuple[set, dict]:
         """
         监听已完成的 piece，当一个关键帧所需的所有 piece 都下载完毕时，为其创建截图生成任务。
@@ -451,50 +412,65 @@ class ScreenshotService:
 
         return processed_this_run, generation_tasks_map
 
-    async def _generate_screenshots_from_torrent(self, handle, infohash_hex, resume_data=None):
+    async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
         """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
-        # --- 阶段 1: 恢复任务或开始新任务 ---
-        task_state = {}
-        if resume_data:
-            try: task_state = self._load_state_from_resume_data(resume_data)
-            except (KeyError, TypeError) as e: self.log.error("[%s] 加载恢复数据失败: %s", infohash_hex, e); resume_data = None
+        # --- 阶段 1: 开始新任务 ---
+        ti = handle.get_torrent_info()
+        piece_length = ti.piece_length()
+        video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
+        if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
+        moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+        try:
+            extractor = KeyframeExtractor(moov_data)
+            if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
+        except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
 
-        if not resume_data:
-            ti = handle.get_torrent_info()
-            piece_length = ti.piece_length()
-            video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
-            if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
-            moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
-            try:
-                extractor = KeyframeExtractor(moov_data)
-                if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
-            except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
-
-            if self.details_callback:
-                duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
-                details = {
-                    "torrent_name": ti.name(),
-                    "video_filename": video_filename,
-                    "video_duration_seconds": int(duration_sec)
-                }
-                await self.details_callback(infohash_hex, details)
-
-            all_keyframes = extractor.keyframes
-            selected_keyframes = self._select_keyframes(
-                all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples
-            )
-            task_state = {
-                "infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset,
-                "video_file_size": video_file_size, "extractor": extractor, "all_keyframes": all_keyframes,
-                "selected_keyframes": selected_keyframes, "completed_pieces": set(), "processed_keyframes": set()
+        if self.details_callback:
+            duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
+            details = {
+                "torrent_name": ti.name(),
+                "video_filename": video_filename,
+                "video_duration_seconds": int(duration_sec)
             }
+            await self.details_callback(infohash_hex, details)
+
+        all_keyframes = extractor.keyframes
+        selected_keyframes = self._select_keyframes(
+            all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples
+        )
+
+        # 增量更新逻辑：检查已有截图并从任务中排除它们
+        if self.screenshot_check_callback and selected_keyframes:
+            self.log.info("[%s] 正在检查已存在的截图...", infohash_hex)
+            existing_filenames = await self.screenshot_check_callback(infohash=infohash_hex)
+            if existing_filenames:
+                # 从文件名 `f"{infohash}_{timestamp_str}.jpg"` 中提取时间戳
+                existing_timestamps = {fn.split('_')[-1].split('.')[0] for fn in existing_filenames}
+
+                original_count = len(selected_keyframes)
+                selected_keyframes = [
+                    kf for kf in selected_keyframes
+                    if str(int(kf.pts / kf.timescale)) not in existing_timestamps
+                ]
+                filtered_count = original_count - len(selected_keyframes)
+                if filtered_count > 0:
+                    self.log.info(
+                        "[%s] 发现了 %d 个已存在的截图。将跳过它们，仅处理剩余的 %d 个。",
+                        infohash_hex, filtered_count, len(selected_keyframes)
+                    )
+
+        if not selected_keyframes:
+            self.log.info("[%s] 所有选定的关键帧都已处理或无需处理。", infohash_hex)
+            return
+
+        task_state = {
+            "infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset,
+            "video_file_size": video_file_size, "extractor": extractor
+        }
 
         # --- 阶段 2: 计算并请求所需的 piece ---
-        remaining_keyframes = [kf for kf in task_state['selected_keyframes'] if kf.index not in task_state.get('processed_keyframes', set())]
-        if not remaining_keyframes: self.log.info("[%s] 所有选定的关键帧都已处理。", infohash_hex); return
-
         keyframe_info, piece_to_keyframes, all_needed_pieces = {}, defaultdict(list), set()
-        for kf in remaining_keyframes:
+        for kf in selected_keyframes:
             sample = task_state['extractor'].samples[kf.sample_index - 1]
             offset = task_state['video_file_offset'] + sample.offset
             needed = self._get_pieces_for_range(offset, sample.size, task_state['piece_length'])
@@ -502,17 +478,16 @@ class ScreenshotService:
             for piece_idx in needed: piece_to_keyframes[piece_idx].append(kf.index)
             all_needed_pieces.update(needed)
 
-        pieces_to_request = list(all_needed_pieces - task_state.get('completed_pieces', set()))
+        pieces_to_request = list(all_needed_pieces)
         local_queue = asyncio.Queue()
         self.client.subscribe_pieces(infohash_hex, local_queue)
 
         # --- 阶段 3: 处理 piece 并生成截图 ---
         try:
             self.client.request_pieces(handle, pieces_to_request)
-            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes)
-            if not generation_tasks_map and remaining_keyframes:
-                 task_state.setdefault('processed_keyframes', set()).update(processed_this_run)
-                 raise FrameDownloadTimeoutError("没有成功下载任何关键帧的数据。", infohash_hex, resume_data=self._serialize_task_state(task_state))
+            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, selected_keyframes)
+            if not generation_tasks_map and selected_keyframes:
+                 raise FrameDownloadTimeoutError(f"没有成功下载任何关键帧的数据 ({len(selected_keyframes)} ailed)。", infohash_hex)
             results = await asyncio.gather(*generation_tasks_map.values(), return_exceptions=True)
         finally:
             self.client.unsubscribe_pieces(infohash_hex, local_queue)
@@ -525,13 +500,10 @@ class ScreenshotService:
                 self.log.error(f"生成截图时发生错误 (关键帧索引: {kf_indices[i]}): {result}", exc_info=result)
             else: successful_kf_indices.add(kf_indices[i])
 
-        task_state.setdefault('processed_keyframes', set()).update(successful_kf_indices)
-
-        if len(successful_kf_indices) < len(remaining_keyframes):
-            # 如果部分成功，也认为是可恢复的失败，以便可以重试失败的部分
+        if len(successful_kf_indices) < len(selected_keyframes):
             raise FrameDownloadTimeoutError(
-                f"未能为所有选定的关键帧生成截图 ({len(successful_kf_indices)}/{len(remaining_keyframes)} 成功)。",
-                infohash_hex, resume_data=self._serialize_task_state(task_state)
+                f"未能为所有选定的关键帧生成截图 ({len(successful_kf_indices)}/{len(selected_keyframes)} 成功)。",
+                infohash_hex
             )
         self.log.info("[%s] 截图任务成功完成。", infohash_hex)
 
@@ -543,20 +515,16 @@ class ScreenshotService:
     async def _handle_screenshot_task(self, task_info: dict):
         """处理单个截图任务的完整生命周期，包括错误处理和状态报告。"""
         infohash_hex = task_info['infohash']
-        log_message = "正在处理任务: %s" + (" (正在恢复)" if task_info.get('resume_data') else "")
-        self.log.info(log_message, infohash_hex)
+        self.log.info("正在处理任务: %s", infohash_hex)
 
         try:
             async with self.client.get_handle(infohash_hex, metadata=task_info.get('metadata')) as handle:
-                await self._generate_screenshots_from_torrent(handle, infohash_hex, task_info.get('resume_data'))
+                await self._generate_screenshots_from_torrent(handle, infohash_hex)
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
-        except (FrameDownloadTimeoutError, MetadataTimeoutError, MoovFetchError, asyncio.TimeoutError) as e:
-            self.log.warning("任务 %s 因可恢复的错误而失败: %s", infohash_hex, e)
-            await self._send_status_update(status='recoverable_failure', infohash=getattr(e, 'infohash', infohash_hex), message=str(e), error=e, resume_data=getattr(e, 'resume_data', None))
-            return
         except TaskError as e:
-            self.log.error("任务 %s 因永久性错误而失败: %s", e.infohash, e, exc_info=True)
+            # 所有已知的、与任务相关的错误现在都应被视为永久性失败。
+            self.log.error("任务 %s 因错误而失败: %s", e.infohash, e, exc_info=True)
             await self._send_status_update(status='permanent_failure', infohash=e.infohash, message=str(e), error=e)
             return
         except Exception as e:

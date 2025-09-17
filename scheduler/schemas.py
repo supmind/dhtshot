@@ -24,7 +24,6 @@ class Task(TaskBase):
     created_at: datetime.datetime
     assigned_worker_id: Optional[str] = None
     result_message: Optional[str] = None
-    successful_screenshots: Optional[List[str]] = Field([], description="成功生成的截图文件名列表。")
 
     class Config:
         orm_mode = True
@@ -36,12 +35,10 @@ class TaskList(BaseModel):
 class NextTaskResponse(BaseModel):
     infohash: str
     metadata: Optional[str] = None # Base64-encoded
-    resume_data: Optional[Dict[str, Any]] = None
 
 class TaskStatusUpdate(BaseModel):
     status: str
     message: Optional[str] = None
-    resume_data: Optional[Dict[str, Any]] = None
 
 
 class TaskDetailsUpdate(BaseModel):

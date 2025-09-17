@@ -82,6 +82,20 @@ class SchedulerAPIClient:
             log.error(f"连接调度器获取任务时出错: {e}")
         return None
 
+    async def get_recorded_screenshots(self, infohash: str) -> list[str]:
+        """从调度器获取指定任务已成功记录的截图列表。"""
+        url = f"{self._url}/tasks/{infohash}/screenshots"
+        try:
+            async with self._session.get(url, timeout=15, headers=self._get_headers()) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    log.error(f"[{infohash}] 获取已记录截图列表失败。状态码: {response.status}")
+                    return []
+        except aiohttp.ClientError as e:
+            log.error(f"[{infohash}] 获取已记录截图列表时发生连接错误: {e}")
+            return []
+
     async def record_screenshot(self, infohash: str, filename: str):
         """向调度器报告一个截图已成功生成并上传。"""
         log.info(f"[{infohash}] 正在向调度器报告截图: {filename}")
@@ -94,18 +108,11 @@ class SchedulerAPIClient:
         except aiohttp.ClientError as e:
             log.error(f"[{infohash}] 报告截图时发生连接错误: {e}")
 
-    async def update_task_status(self, infohash: str, status: str, message: str, resume_data: Optional[dict]):
+    async def update_task_status(self, infohash: str, status: str, message: str, **kwargs):
         """向调度器报告任务的最终状态。"""
         log.info(f"[{infohash}] 任务完成，状态: {status.upper()}。消息: {message}")
         url = f"{self._url}/tasks/{infohash}/status"
-
-        if resume_data:
-            if extractor_info := resume_data.get("extractor_info"):
-                if extradata := extractor_info.get("extradata"):
-                    if isinstance(extradata, bytes):
-                        extractor_info["extradata"] = base64.b64encode(extradata).decode('ascii')
-
-        payload = {"status": status, "message": str(message), "resume_data": resume_data}
+        payload = {"status": status, "message": str(message)}
         try:
             async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
                 if response.status != 200:
@@ -221,7 +228,7 @@ async def on_screenshot_generated(uploader: R2Uploader, client: SchedulerAPIClie
 
 async def on_task_finished(client: SchedulerAPIClient, status: str, infohash: str, message: str, **kwargs):
     """当 ScreenshotService 完成一个任务时被调用的回调函数。"""
-    await client.update_task_status(infohash, status, message, kwargs.get("resume_data"))
+    await client.update_task_status(infohash, status, message)
 
 
 async def on_task_details_extracted(client: SchedulerAPIClient, infohash: str, details: dict):
@@ -298,7 +305,8 @@ async def run_worker(session: aiohttp.ClientSession):
         loop=loop,
         status_callback=partial(on_task_finished, client),
         screenshot_callback=partial(on_screenshot_generated, uploader, client),
-        details_callback=partial(on_task_details_extracted, client)
+        details_callback=partial(on_task_details_extracted, client),
+        screenshot_check_callback=partial(client.get_recorded_screenshots)
     )
     await service.run()
     log.info("ScreenshotService 已在后台运行。")

@@ -5,13 +5,14 @@
 import pytest
 import os
 import json
+from unittest.mock import AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from io import BytesIO
 
-from scheduler.main import app, get_db
+from scheduler.main import app, get_db, get_redis_client
 from scheduler.database import Base
 from scheduler import crud, schemas
 from config import Settings
@@ -28,9 +29,17 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 # --- Fixtures ---
 
 @pytest.fixture(scope="function")
-def client():
+def mock_redis_client():
+    """提供一个 mock 的异步 Redis 客户端。"""
+    mock_redis = AsyncMock()
+    mock_redis.sadd = AsyncMock()
+    mock_redis.smembers = AsyncMock()
+    return mock_redis
+
+@pytest.fixture(scope="function")
+def client(mock_redis_client):
     """
-    一个 Pytest fixture，为每个测试函数提供一个配置好测试数据库的 TestClient。
+    一个 Pytest fixture，为每个测试函数提供一个配置好测试数据库和 mock Redis 的 TestClient。
     """
     def override_get_db():
         db = TestingSessionLocal()
@@ -39,7 +48,11 @@ def client():
         finally:
             db.close()
 
+    def override_get_redis_client():
+        return mock_redis_client
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_redis_client] = override_get_redis_client
     Base.metadata.create_all(bind=engine)
     yield TestClient(app)
     Base.metadata.drop_all(bind=engine)
@@ -195,13 +208,24 @@ def test_worker_heartbeat(client, api_key_headers):
     data = response.json()
     assert data["status"] == "busy"
 
-def test_record_screenshot_endpoint(client, api_key_headers):
+def test_record_screenshot_endpoint(client, api_key_headers, mock_redis_client):
     infohash = "record_screenshot_hash"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    # The task doesn't need to exist in the DB anymore for this endpoint
     payload = {"filename": "screenshot_01.jpg"}
     response = client.post(f"/tasks/{infohash}/screenshots", json=payload, headers=api_key_headers)
     assert response.status_code == 200
-    assert "screenshot_01.jpg" in response.json()["successful_screenshots"]
+    assert response.json() == {"message": "Screenshot recorded successfully"}
+    mock_redis_client.sadd.assert_called_once_with(f"screenshots:{infohash}", "screenshot_01.jpg")
+
+def test_get_recorded_screenshots_endpoint(client, api_key_headers, mock_redis_client):
+    infohash = "get_screenshots_hash"
+    expected_screenshots = ["shot1.jpg", "shot2.jpg"]
+    mock_redis_client.smembers.return_value = set(expected_screenshots)
+    response = client.get(f"/tasks/{infohash}/screenshots", headers=api_key_headers)
+    assert response.status_code == 200
+    # Compare sets to ignore order differences from Redis smembers
+    assert set(response.json()) == set(expected_screenshots)
+    mock_redis_client.smembers.assert_called_once_with(f"screenshots:{infohash}")
 
 def test_update_status_success_deletes_metadata(client, api_key_headers):
     infohash = "success_deletes_metadata"
@@ -233,39 +257,6 @@ def test_update_status_failure_preserves_metadata(client, api_key_headers):
     os.remove(metadata_file)
     os.rmdir(metadata_dir)
 
-def test_update_status_with_resume_data_creates_file(client, api_key_headers):
-    infohash = "status_with_resume"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
-    resume_data = {"key": "value"}
-    payload = {"status": "recoverable_failure", "message": "Error with resume data", "resume_data": resume_data}
-    resume_dir = "resume_data"
-    resume_file = os.path.join(resume_dir, f"{infohash}.resume")
-    if os.path.exists(resume_file): os.remove(resume_file)
-    if os.path.exists(resume_dir) and not os.listdir(resume_dir): os.rmdir(resume_dir)
-    response = client.post(f"/tasks/{infohash}/status", json=payload, headers=api_key_headers)
-    assert response.status_code == 200
-    assert os.path.exists(resume_file)
-    with open(resume_file, "r") as f:
-        saved_data = json.load(f)
-    assert saved_data == resume_data
-    os.remove(resume_file)
-    os.rmdir(resume_dir)
-
-def test_get_next_task_with_resume_file(client, api_key_headers):
-    infohash = "next_with_resume_file"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
-    resume_dir = "resume_data"
-    os.makedirs(resume_dir, exist_ok=True)
-    resume_file = os.path.join(resume_dir, f"{infohash}.resume")
-    resume_data = {"state": "halfway"}
-    with open(resume_file, "w") as f:
-        json.dump(resume_data, f)
-    response = client.get("/tasks/next", params={"worker_id": "worker-1"}, headers=api_key_headers)
-    assert response.status_code == 200
-    assert response.json()["resume_data"] == resume_data
-    assert not os.path.exists(resume_file)
-    if not os.listdir(resume_dir):
-        os.rmdir(resume_dir)
 
 def test_list_all_tasks_with_filtering_and_pagination(client, api_key_headers):
     db = TestingSessionLocal()

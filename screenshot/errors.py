@@ -73,11 +73,8 @@ class FrameDownloadTimeoutError(TaskError):
     """
     在下载生成截图所需的特定视频数据块（pieces）时发生超时，则引发此异常。
     这通常是由于网络问题或缺少 peer 造成的。
-    它包含 `resume_data`，理论上允许任务从断点处恢复。
     """
-    def __init__(self, message: str, infohash: str, resume_data=None):
-        super().__init__(message, infohash)
-        self.resume_data = resume_data
+    pass
 
 
 class FrameDecodeError(TaskError):

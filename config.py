@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     piece_fetch_timeout: int = 60  # 1 minute
     piece_queue_timeout: int = 300  # 5 minutes
 
+    # --- Redis 设置 ---
+    redis_url: str = "redis://localhost:6379/0"
+
     # --- R2 存储设置 ---
     # 请在 .env 文件中配置这些值
     r2_endpoint_url: str = ""
