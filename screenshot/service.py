@@ -119,38 +119,22 @@ class ScreenshotService:
         """
         从多个 piece 数据块中，根据偏移量和大小，精确地拼接出所需的数据段。
         在拼接前会检查所有需要的 piece 是否都已存在。
-
-        :param pieces_data: 一个字典，键是 piece 索引，值是该 piece 的 bytes 数据。
-        :param offset_in_torrent: 所需数据段在整个 torrent 文件中的起始偏移量。
-        :param size: 所需数据段的大小。
-        :param piece_length: torrent 的标准 piece 大小。
-        :return: 拼接好的 bytes 数据，如果缺少任何一个必需的 piece，则返回空 bytes。
         """
         start_piece = offset_in_torrent // piece_length
         end_piece = (offset_in_torrent + size - 1) // piece_length
 
-        # 1. 前置检查：确保所有需要的 piece 都已下载。
         for piece_index in range(start_piece, end_piece + 1):
             if piece_index not in pieces_data:
                 self.log.warning("组装数据时缺少 piece #%d，操作中止。", piece_index)
                 return b""
 
-        # 2. 核心逻辑：遍历所有相关的 piece，并从中拷贝出需要的部分。
         buffer = bytearray(size)
         buffer_offset = 0
         for piece_index in range(start_piece, end_piece + 1):
             piece_data = pieces_data[piece_index]
-
-            # 计算在此 piece 内需要拷贝的起始和结束位置
-            # 对于起始 piece，需要从特定偏移量开始拷贝
             copy_from_start = offset_in_torrent % piece_length if piece_index == start_piece else 0
-            # 对于结束 piece，只拷贝到所需数据的末尾
             copy_to_end = (offset_in_torrent + size - 1) % piece_length + 1 if piece_index == end_piece else piece_length
-
-            # 从当前 piece 中提取出相关的部分
             chunk = piece_data[copy_from_start:copy_to_end]
-
-            # 计算实际要拷贝到最终 buffer 的字节数，防止越界
             bytes_to_copy = min(len(chunk), size - buffer_offset)
             if bytes_to_copy > 0:
                 buffer[buffer_offset : buffer_offset + bytes_to_copy] = chunk[:bytes_to_copy]
@@ -160,9 +144,6 @@ class ScreenshotService:
     def _parse_mp4_boxes(self, stream: io.BytesIO) -> Generator[Tuple[str, bytes, int, int], None, None]:
         """
         一个更健壮的 MP4 box 解析器。
-        如果一个 box 声明的大小超出了可用数据范围，它不会失败，而是会 yield
-        它所拥有的部分数据，同时仍然报告在头部声明的完整大小。
-        这允许调用者决定如何处理部分 box。
         """
         stream_buffer = stream.getbuffer()
         buffer_size = len(stream_buffer)
@@ -179,27 +160,21 @@ class ScreenshotService:
                 break
 
             box_header_size = 8
-            if declared_size == 1: # 64-bit size
+            if declared_size == 1:
                 if current_offset + 16 > buffer_size:
-                    self.log.warning("Box '%s' 在偏移量 %d 处需要 64 位大小，但数据不足。", box_type, current_offset)
                     break
                 declared_size = struct.unpack('>Q', stream.read(8))[0]
                 box_header_size = 16
-            elif declared_size == 0: # Extends to end of file
+            elif declared_size == 0:
                 declared_size = buffer_size - current_offset
 
             if declared_size < box_header_size:
-                self.log.warning("Box '%s' 在偏移量 %d 处声明了无效的大小 %d。", box_type, current_offset, declared_size)
                 break
 
-            # 关键改动：不再因为 box 超出范围而抛出异常。
-            # 我们计算在此缓冲区中实际可用的 box 大小。
             effective_box_size = declared_size
             if current_offset + declared_size > buffer_size:
-                self.log.debug("Box '%s' (大小: %d) 超出了缓冲区大小 %d。将 yield 部分数据。", box_type, declared_size, buffer_size)
                 effective_box_size = buffer_size - current_offset
 
-            # 我们 yield 我们拥有的数据（可能是部分的），但同时报告在头部声明的 *完整* 大小。
             box_content = stream_buffer[current_offset : current_offset + effective_box_size]
             yield box_type, bytes(box_content), current_offset, declared_size
 
@@ -208,14 +183,11 @@ class ScreenshotService:
     async def _get_moov_atom_data(self, handle, video_file_offset, video_file_size, piece_length, infohash_hex) -> bytes:
         """
         智能地查找并获取 'moov' atom 数据。
-        策略是：首先探测文件头部。如果找到 'moov' 则返回。如果找到 'mdat'，则利用其信息
-        精确定位文件尾部可能包含 'moov' 的区域，并仅探测该区域。
         """
-        mdat_info = None  # To store information about the mdat box if found
+        mdat_info = None
 
-        # --- 阶段1: 探测文件头部 ---
         try:
-            head_size = min(256 * 1024, video_file_size) # TODO: Make configurable
+            head_size = min(self.settings.moov_head_probe_size, video_file_size)
             if head_size > 0:
                 head_pieces = self._get_pieces_for_range(video_file_offset, head_size, piece_length)
                 head_data_pieces = await self.client.fetch_pieces(handle, head_pieces, timeout=self.settings.moov_probe_timeout)
@@ -225,55 +197,41 @@ class ScreenshotService:
                 for box_type, partial_box_data, box_offset, declared_size in self._parse_mp4_boxes(stream):
                     if box_type == 'moov':
                         if len(partial_box_data) >= declared_size:
-                            self.log.info("[%s] 在头部探测中找到了完整的 'moov' box。", infohash_hex)
                             return partial_box_data
 
-                        self.log.info("[%s] 在头部探测中找到了一个大小为 %d 的部分 'moov' box。现在将获取完整的 box。", infohash_hex, declared_size)
                         full_moov_offset_in_torrent = video_file_offset + box_offset
                         needed_pieces = self._get_pieces_for_range(full_moov_offset_in_torrent, declared_size, piece_length)
                         moov_data_pieces = await self.client.fetch_pieces(handle, needed_pieces, timeout=self.settings.moov_probe_timeout)
                         return self._assemble_data_from_pieces(moov_data_pieces, full_moov_offset_in_torrent, declared_size, piece_length)
 
                     if box_type == 'mdat':
-                        self.log.info("[%s] 在文件头部探测到 'mdat' box (大小: %d)，记录其信息以备尾部探测。", infohash_hex, declared_size)
                         mdat_info = {'offset': box_offset, 'size': declared_size}
-                        # Don't break here, moov could theoretically come after mdat even in the header
         except TorrentClientError as e:
             raise MoovFetchError(f"在 moov 头部探测期间获取 piece 失败: {e}", infohash_hex) from e
 
-        # --- 阶段2: 基于 mdat 信息智能探测文件尾部 ---
         if mdat_info:
             try:
-                # Calculate the precise region to search after the mdat box
                 mdat_end_offset_in_file = mdat_info['offset'] + mdat_info['size']
-
-                # Ensure we don't try to read past the end of the file
                 if mdat_end_offset_in_file >= video_file_size:
-                     raise MoovNotFoundError(f"mdat box (ends at {mdat_end_offset_in_file}) seems to extend to or past the end of the file (size {video_file_size}). No space for moov.", infohash_hex)
+                     raise MoovNotFoundError(f"mdat box seems to extend to or past the end of the file.", infohash_hex)
 
                 tail_torrent_offset = video_file_offset + mdat_end_offset_in_file
                 tail_size = video_file_size - mdat_end_offset_in_file
-
-                self.log.info(f"[{infohash_hex}] Mdat 结束于 {mdat_end_offset_in_file}。探测尾部大小为 {tail_size} 的区域。")
 
                 if tail_size > 0:
                     tail_pieces = self._get_pieces_for_range(tail_torrent_offset, tail_size, piece_length)
                     tail_data_pieces = await self.client.fetch_pieces(handle, tail_pieces, timeout=self.settings.moov_probe_timeout)
                     tail_data = self._assemble_data_from_pieces(tail_data_pieces, tail_torrent_offset, tail_size, piece_length)
-
-                    # Search for moov from the beginning of the tail data
                     stream = io.BytesIO(tail_data)
                     for box_type, box_data, _, _ in self._parse_mp4_boxes(stream):
                          if box_type == 'moov':
-                             self.log.info(f"[{infohash_hex}] 在智能尾部探测中找到了 'moov' box。")
-                             return box_data # The tail data should contain the full moov box
+                             return box_data
             except TorrentClientError as e:
                 raise MoovFetchError(f"在智能 moov 尾部探测期间失败: {e}", infohash_hex) from e
 
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
     def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str]]:
-        """在 torrent 中查找最大的视频文件（目前仅支持.mp4）并返回其信息。"""
         video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
         fs = ti.files()
         for i in range(fs.num_files()):
@@ -288,15 +246,20 @@ class ScreenshotService:
     def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
         if not all_keyframes:
             return []
-        total_keyframes = len(all_keyframes)
-        trim_count = int(total_keyframes * 0.03)
-        if trim_count > 0 and total_keyframes > trim_count * 2:
-            all_keyframes = all_keyframes[trim_count:-trim_count]
+
+        trim_percentage = self.settings.keyframe_trim_percentage
+        if 0 < trim_percentage < 0.5:
+            total_keyframes = len(all_keyframes)
+            trim_count = int(total_keyframes * trim_percentage)
+            if trim_count > 0 and total_keyframes > trim_count * 2:
+                all_keyframes = all_keyframes[trim_count:-trim_count]
+
         if not all_keyframes:
             return []
+
         if duration_pts == 0 and samples:
-            self.log.warning("duration_pts 为 0，将使用最后一个样本的 PTS 作为估算时长。")
             duration_pts = samples[-1].pts
+
         duration_sec = duration_pts / timescale if timescale > 0 else 0
         num_screenshots = self.settings.default_screenshots
         if duration_sec > 0:
@@ -304,14 +267,18 @@ class ScreenshotService:
                 self.settings.min_screenshots,
                 min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots)
             )
+
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
+
         target_timestamps_pts = [int(i * duration_pts / num_screenshots) for i in range(num_screenshots)]
+
         selected_keyframes = []
         for target_pts in target_timestamps_pts:
             closest_keyframe = min(all_keyframes, key=lambda kf: abs(kf.pts - target_pts))
             if closest_keyframe not in selected_keyframes:
                 selected_keyframes.append(closest_keyframe)
+
         selected_keyframes.sort(key=lambda kf: kf.pts)
         return selected_keyframes
 
@@ -330,7 +297,7 @@ class ScreenshotService:
             except TorrentClientError as e:
                 self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。"); return None
             if not packet_data_bytes or len(packet_data_bytes) != sample.size:
-                self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data_bytes)}/{sample.size})，跳过。"); return None
+                return None
             if extractor.mode == 'avc1':
                 annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
                 while cursor < len(packet_data_bytes):
@@ -347,12 +314,12 @@ class ScreenshotService:
             try:
                 finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.settings.piece_queue_timeout)
                 if finished_piece is None: torrent_is_complete = True; break
-            except asyncio.TimeoutError: self.log.warning(f"[{infohash_hex}] 等待 piece 超时。"); break
+            except asyncio.TimeoutError: break
             task_state.setdefault('completed_pieces', set()).add(finished_piece)
             if finished_piece not in piece_to_keyframes: continue
             for kf_index in piece_to_keyframes[finished_piece]:
                 if kf_index in processed_this_run: continue
-                info = keyframe_info.get(kf_index);
+                info = keyframe_info.get(kf_index)
                 if not info: continue
                 info['needed_pieces'].remove(finished_piece)
                 if not info['needed_pieces']:
@@ -368,13 +335,13 @@ class ScreenshotService:
         return processed_this_run, generation_tasks_map
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
-        """处理为给定 torrent 生成截图的完整、复杂的业务逻辑。"""
-        # --- 阶段 1: 开始新任务 ---
         ti = handle.get_torrent_info()
         piece_length = ti.piece_length()
         video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
         if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
+
         moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
+
         try:
             extractor = KeyframeExtractor(moov_data)
             if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
@@ -382,48 +349,25 @@ class ScreenshotService:
 
         if self.details_callback:
             duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
-            details = {
-                "torrent_name": ti.name(),
-                "video_filename": video_filename,
-                "video_duration_seconds": int(duration_sec)
-            }
+            details = {"torrent_name": ti.name(), "video_filename": video_filename, "video_duration_seconds": int(duration_sec)}
             await self.details_callback(infohash_hex, details)
 
         all_keyframes = extractor.keyframes
-        selected_keyframes = self._select_keyframes(
-            all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples
-        )
+        selected_keyframes = self._select_keyframes(all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples)
 
-        # 增量更新逻辑：检查已有截图并从任务中排除它们
         if self.screenshot_check_callback and selected_keyframes:
-            self.log.info("[%s] 正在检查已存在的截图...", infohash_hex)
             existing_filenames = await self.screenshot_check_callback(infohash=infohash_hex)
             if existing_filenames:
-                # 从文件名 `f"{infohash}_{timestamp_str}.jpg"` 中提取时间戳
                 existing_timestamps = {fn.split('_')[-1].split('.')[0] for fn in existing_filenames}
-
                 original_count = len(selected_keyframes)
-                selected_keyframes = [
-                    kf for kf in selected_keyframes
-                    if str(int(kf.pts / kf.timescale)) not in existing_timestamps
-                ]
-                filtered_count = original_count - len(selected_keyframes)
-                if filtered_count > 0:
-                    self.log.info(
-                        "[%s] 发现了 %d 个已存在的截图。将跳过它们，仅处理剩余的 %d 个。",
-                        infohash_hex, filtered_count, len(selected_keyframes)
-                    )
+                selected_keyframes = [kf for kf in selected_keyframes if str(int(kf.pts / kf.timescale)) not in existing_timestamps]
+                if (filtered_count := original_count - len(selected_keyframes)) > 0:
+                    self.log.info("[%s] 发现了 %d 个已存在的截图。将跳过它们，仅处理剩余的 %d 个。", infohash_hex, filtered_count, len(selected_keyframes))
 
         if not selected_keyframes:
-            self.log.info("[%s] 所有选定的关键帧都已处理或无需处理。", infohash_hex)
             return
 
-        task_state = {
-            "infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset,
-            "video_file_size": video_file_size, "extractor": extractor
-        }
-
-        # --- 阶段 2: 计算并请求所需的 piece ---
+        task_state = {"infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset, "video_file_size": video_file_size, "extractor": extractor}
         keyframe_info, piece_to_keyframes, all_needed_pieces = {}, defaultdict(list), set()
         for kf in selected_keyframes:
             sample = task_state['extractor'].samples[kf.sample_index - 1]
@@ -433,42 +377,27 @@ class ScreenshotService:
             for piece_idx in needed: piece_to_keyframes[piece_idx].append(kf.index)
             all_needed_pieces.update(needed)
 
-        pieces_to_request = list(all_needed_pieces)
         local_queue = asyncio.Queue()
         self.client.subscribe_pieces(infohash_hex, local_queue)
-
-        # --- 阶段 3: 处理 piece 并生成截图 ---
         try:
-            self.client.request_pieces(handle, pieces_to_request)
-            processed_this_run, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, selected_keyframes)
+            self.client.request_pieces(handle, list(all_needed_pieces))
+            _, generation_tasks_map = await self._process_keyframe_pieces(handle, local_queue, task_state, keyframe_info, piece_to_keyframes, selected_keyframes)
             if not generation_tasks_map and selected_keyframes:
                  raise FrameDownloadTimeoutError(f"没有成功下载任何关键帧的数据 ({len(selected_keyframes)} ailed)。", infohash_hex)
             results = await asyncio.gather(*generation_tasks_map.values(), return_exceptions=True)
         finally:
             self.client.unsubscribe_pieces(infohash_hex, local_queue)
 
-        # --- 阶段 4: 收集结果并判断最终状态 ---
-        successful_kf_indices = set()
-        kf_indices = list(generation_tasks_map.keys())
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                self.log.error(f"生成截图时发生错误 (关键帧索引: {kf_indices[i]}): {result}", exc_info=result)
-            else: successful_kf_indices.add(kf_indices[i])
-
+        successful_kf_indices = {kf_idx for i, kf_idx in enumerate(generation_tasks_map.keys()) if not isinstance(results[i], Exception)}
         if len(successful_kf_indices) < len(selected_keyframes):
-            raise FrameDownloadTimeoutError(
-                f"未能为所有选定的关键帧生成截图 ({len(successful_kf_indices)}/{len(selected_keyframes)} 成功)。",
-                infohash_hex
-            )
+            raise FrameDownloadTimeoutError(f"未能为所有选定的关键帧生成截图 ({len(successful_kf_indices)}/{len(selected_keyframes)} 成功)。", infohash_hex)
         self.log.info("[%s] 截图任务成功完成。", infohash_hex)
 
     async def _send_status_update(self, **kwargs: Any) -> None:
-        """一个辅助函数，用于安全地调用状态更新回调。"""
         if self.status_callback:
             await self.status_callback(**kwargs)
 
     async def _handle_screenshot_task(self, task_info: dict):
-        """处理单个截图任务的完整生命周期，包括错误处理和状态报告。"""
         infohash_hex = task_info['infohash']
         self.log.info("正在处理任务: %s", infohash_hex)
         handle = None
@@ -500,7 +429,6 @@ class ScreenshotService:
         while self._running:
             try:
                 while p.num_fds() >= self.settings.MAX_FILE_DESCRIPTORS:
-                    self.log.warning("文件描述符数量 (%d) 已达到阈值 (%d)。工作进程将暂停 2 秒。", p.num_fds(), self.settings.MAX_FILE_DESCRIPTORS)
                     await asyncio.sleep(2)
                 task_info = await self.task_queue.get()
                 await self._handle_screenshot_task(task_info)
