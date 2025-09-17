@@ -154,14 +154,14 @@ class TorrentClient:
                 self.log.warning("[%s] 尝试移除一个不存在的订阅者。", infohash)
 
     @asynccontextmanager
-    async def get_handle(self, infohash: str, metadata: bytes = None):
+    async def get_handle(self, infohash: str, metadata: bytes):
         """
         一个异步上下文管理器，用于安全地获取和释放 torrent handle。
         推荐使用 `async with` 语句来调用此方法，以确保资源被正确清理。
         """
         handle = None
         try:
-            handle = await self.add_torrent(infohash, metadata=metadata)
+            handle = await self.add_torrent(infohash, metadata)
             if not handle or not handle.is_valid():
                 raise TorrentClientError(f"无法为 {infohash} 获取有效的 torrent handle。")
             yield handle
@@ -169,72 +169,31 @@ class TorrentClient:
             if handle and handle.is_valid():
                 await self.remove_torrent(handle)
 
-    async def add_torrent(self, infohash: str, metadata: bytes = None):
+    async def add_torrent(self, infohash: str, metadata: bytes):
         """
-        通过 infohash 或元数据添加 torrent。如果提供了元数据，则直接使用它。
-        否则，通过磁力链接异步下载元数据。所有 piece 的优先级初始设为0（不下载）。
+        通过元数据添加 torrent。
+        元数据必须由调用方提供。所有 piece 的优先级初始设为0（不下载）。
         """
-        self.log.info("正在为 infohash 添加 torrent: %s", infohash)
+        self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash)
         save_dir = os.path.join(self.save_path, infohash)
 
-        if metadata:
-            # --- 分支1: 直接使用提供的元数据 ---
-            self.log.info("正在使用提供的元数据为 %s 添加 torrent。", infohash)
-            try:
-                ti = lt.torrent_info(metadata)
-                if str(ti.info_hash()) != infohash:
-                    raise TorrentClientError(f"提供的元数据 infohash ({ti.info_hash()}) 与指定的 infohash ({infohash}) 不匹配。")
-            except RuntimeError as e:
-                raise TorrentClientError(f"无法解析元数据: {e}")
+        try:
+            ti = lt.torrent_info(metadata)
+            if str(ti.info_hash()) != infohash:
+                raise TorrentClientError(f"提供的元数据 infohash ({ti.info_hash()}) 与指定的 infohash ({infohash}) 不匹配。")
+        except RuntimeError as e:
+            raise TorrentClientError(f"无法解析元数据: {e}")
 
-            params = lt.add_torrent_params()
-            params.ti = ti
-            params.save_path = save_dir
-            params.flags |= lt.torrent_flags.paused
-            handle = await self._execute_sync(self._ses.add_torrent, params)
+        params = lt.add_torrent_params()
+        params.ti = ti
+        params.save_path = save_dir
+        params.flags |= lt.torrent_flags.paused
+        handle = await self._execute_sync(self._ses.add_torrent, params)
 
-        else:
-            # --- 分支2: 通过磁力链接获取元数据 ---
-            self.log.info("没有提供元数据。正在为 %s 使用磁力链接。", infohash)
-            # 在尝试通过 DHT 获取元数据之前，等待 DHT 网络准备就绪。
-            # 这是一个关键修复，可以防止因 DHT 未启动而立即超时的竞态条件。
-            self.log.info("[%s] 正在等待 DHT 网络准备就绪...", infohash)
-            try:
-                await asyncio.wait_for(self.dht_ready.wait(), timeout=60)
-                self.log.info("[%s] DHT 已准备就绪，继续执行。", infohash)
-            except asyncio.TimeoutError:
-                self.log.warning("[%s] 等待 DHT 超时，可能会导致元数据获取失败。", infohash)
-
-            meta_future = self.loop.create_future()
-            self.pending_metadata[infohash] = meta_future
-
-            trackers = [
-                "udp://tracker.opentrackr.org:1337/announce", "udp://open.demonii.com:1337/announce",
-                "udp://open.stealth.si:80/announce", "udp://exodus.desync.com:6969/announce",
-                "udp://tracker.bittor.pw:1337/announce", "http://sukebei.tracker.wf:8888/announce",
-                "udp://tracker.torrent.eu.org:451/announce",
-            ]
-            magnet_uri = f"magnet:?xt=urn:btih:{infohash}&{'&'.join(['tr=' + t for t in trackers])}"
-
-            params = lt.parse_magnet_uri(magnet_uri)
-            params.save_path = save_dir
-            params.flags |= lt.torrent_flags.paused  # 以暂停状态开始，以便我们可以手动控制 piece 的下载
-            handle = await self._execute_sync(self._ses.add_torrent, params)
-
-            self.log.debug("正在等待 %s 的元数据... (超时: %ss)", infohash, self.metadata_timeout)
-            try:
-                handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
-            except asyncio.TimeoutError:
-                raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
-            finally:
-                self.pending_metadata.pop(infohash, None)
-
-        # 对两种情况都设置 piece 优先级为0
-        ti = await self._execute_sync(handle.get_torrent_info)
-        if ti:
-            self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
-            priorities = [0] * ti.num_pieces()
-            await self._execute_sync(handle.prioritize_pieces, priorities)
+        # 设置 piece 优先级为0
+        self.log.info("为 %s 设置所有 piece 优先级为 0。", infohash)
+        priorities = [0] * ti.num_pieces()
+        await self._execute_sync(handle.prioritize_pieces, priorities)
 
         return handle
 
