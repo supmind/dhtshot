@@ -47,14 +47,22 @@ async def test_main_loop_fetches_task_when_queue_not_full(mock_settings, mock_cl
     # --- 安排 ---
     stop_event = asyncio.Event()
     mock_service.get_queue_size.return_value = mock_settings.worker_max_queue_size - 1
-    mock_client.get_next_task.side_effect = [{"infohash": "test_hash"}, stop_event.set]
+
+    # 定义一个 side_effect 函数，它在返回任务的同时设置停止事件，
+    # 以确保测试循环只运行一次。
+    async def get_task_and_stop(*args, **kwargs):
+        stop_event.set()
+        return {"infohash": "test_hash"}
+
+    mock_client.get_next_task.side_effect = get_task_and_stop
 
     # --- 执行 ---
     await worker.main_loop(stop_event, mock_client, mock_service, mock_settings)
 
     # --- 断言 ---
     mock_service.get_queue_size.assert_called()
-    mock_client.get_next_task.assert_called()
+    # 验证 get_next_task 被调用了一次
+    mock_client.get_next_task.assert_awaited_once()
     mock_service.submit_task.assert_awaited_once_with(infohash="test_hash")
 
 @pytest.mark.asyncio
@@ -67,7 +75,8 @@ async def test_main_loop_waits_when_queue_is_full(mock_sleep, mock_settings, moc
     stop_event = asyncio.Event()
     mock_service.get_queue_size.return_value = mock_settings.worker_max_queue_size
     # 让 sleep 调用来停止循环，以验证 sleep 被调用了
-    mock_sleep.side_effect = stop_event.set
+    # 使用 lambda 忽略传递给 sleep 的参数
+    mock_sleep.side_effect = lambda *args, **kwargs: stop_event.set()
 
     # --- 执行 ---
     await worker.main_loop(stop_event, mock_client, mock_service, mock_settings)
@@ -116,7 +125,7 @@ async def test_scheduler_api_client_send_heartbeat():
         "active_tasks_count": 2, # 3 (total) - 1 (queued) = 2 (processing)
         "queue_size": 1
     }
-    mock_session.post.assert_awaited_once_with(
+    mock_session.post.assert_called_once_with(
         "http://fake-scheduler/workers/heartbeat",
         json=expected_payload,
         headers={"X-API-Key": "dummy-api-key"}

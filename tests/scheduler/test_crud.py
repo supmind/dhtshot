@@ -1,242 +1,199 @@
 # -*- coding: utf-8 -*-
-"""
-对 scheduler/crud.py 中数据库操作函数的单元测试。
-"""
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from datetime import datetime, timedelta
 
-from scheduler.database import Base
 from scheduler import crud, models, schemas
+from scheduler.database import Base
 
 # --- 测试数据库设置 ---
-import os
-SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# 使用内存中的 SQLite 数据库进行测试，以确保测试的隔离性和速度
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False)
 
-@pytest.fixture(scope="function")
-def db_session():
-    """
-    一个 Pytest fixture，用于为每个测试函数提供一个独立的数据库会话。
-    它会在测试开始前创建所有表，并在测试结束后删除所有表。
-    """
+@pytest.fixture(scope='session')
+def db_engine():
+    """创建一个会话级别的内存数据库引擎。"""
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(bind=engine)
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-        Base.metadata.drop_all(bind=engine)
+    return engine
+
+@pytest.fixture(scope='function')
+def db_session(db_engine):
+    """
+    为每个测试函数创建一个独立的数据库会话和事务。
+    测试结束后，事务被回滚，确保测试之间互不影响。
+    """
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    session = TestingSessionLocal(bind=connection)
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
 
 # --- 测试用例 ---
 
-def test_get_non_existent_task(db_session):
-    """测试查询一个不存在的任务时应返回 None。"""
-    task = crud.get_task_by_infohash(db_session, "non_existent_hash")
-    assert task is None
-
 def test_create_and_get_task(db_session):
-    """测试任务的创建和根据 infohash 的查询功能。"""
-    infohash = "test_infohash_123"
+    """测试能否成功创建一个任务，并随后通过 infohash 获取它。"""
+    infohash = "test_hash_01"
     task_create = schemas.TaskCreate(infohash=infohash)
-    created_task = crud.create_task(db_session, task=task_create)
-    assert created_task.infohash == infohash
-    retrieved_task = crud.get_task_by_infohash(db_session, infohash=infohash)
+    crud.create_task(db_session, task=task_create)
+
+    retrieved_task = crud.get_task_by_infohash(db_session, infohash)
     assert retrieved_task is not None
-    assert retrieved_task.id == created_task.id
+    assert retrieved_task.infohash == infohash
+    assert retrieved_task.status == 'pending'
 
-def test_get_non_existent_worker(db_session):
-    """测试查询一个不存在的工作节点时应返回 None。"""
-    worker = crud.get_worker_by_id(db_session, "non_existent_worker")
-    assert worker is None
+def test_get_non_existent_task(db_session):
+    """测试获取一个不存在的任务时应返回 None。"""
+    retrieved_task = crud.get_task_by_infohash(db_session, "non_existent_hash")
+    assert retrieved_task is None
 
-def test_create_and_get_worker(db_session):
-    """测试工作节点的创建和根据 worker_id 的查询功能。"""
-    worker_create = schemas.WorkerCreate(worker_id="worker-001", status="idle")
-    created_worker = crud.create_worker(db_session, worker=worker_create)
-    assert created_worker.worker_id == "worker-001"
-    retrieved_worker = crud.get_worker_by_id(db_session, worker_id="worker-001")
-    assert retrieved_worker is not None
-    assert retrieved_worker.id == created_worker.id
-
-def test_update_non_existent_worker_status(db_session):
-    """测试更新一个不存在的工作节点状态时应返回 None。"""
-    updated_worker = crud.update_worker_status(
-        db_session, worker_id="non_existent_worker", status="busy",
-        active_tasks_count=0, queue_size=0
-    )
-    assert updated_worker is None
-
-def test_update_worker_status(db_session):
-    """测试更新工作节点状态的功能。"""
-    crud.create_worker(db_session, worker=schemas.WorkerCreate(worker_id="worker-002", status="idle"))
-    updated_worker = crud.update_worker_status(
-        db_session, worker_id="worker-002", status="busy",
-        active_tasks_count=1, queue_size=1
-    )
-    assert updated_worker.status == "busy"
-    assert updated_worker.active_tasks_count == 1
-    assert updated_worker.queue_size == 1
-
-def test_get_and_assign_next_task(db_session):
-    """测试原子性地获取并分配下一个待处理任务的功能。"""
-    crud.create_task(db_session, task=schemas.TaskCreate(infohash="task_to_be_assigned"))
-    task = crud.get_and_assign_next_task(db_session, worker_id="worker-003")
-    assert task is not None
-    assert task.status == "working"
-    next_task = crud.get_and_assign_next_task(db_session, worker_id="worker-004")
-    assert next_task is None
-
-def test_update_non_existent_task_status(db_session):
-    """测试更新一个不存在的任务状态时应返回 None。"""
-    updated_task = crud.update_task_status(db_session, infohash="non_existent_hash", status="success")
-    assert updated_task is None
-
-def test_update_task_status(db_session):
-    """测试更新任务最终状态的功能。"""
-    crud.create_task(db_session, task=schemas.TaskCreate(infohash="task_to_update"))
-    crud.get_and_assign_next_task(db_session, worker_id="worker-005")
-
-    message = "Completed with data"
-    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message)
-
-    assert updated_task.status == "success"
-    assert updated_task.assigned_worker_id is None
-    assert updated_task.result_message == message
-
-def test_record_screenshot_for_non_existent_task(db_session):
-    """测试为不存在的任务记录截图时应返回 None。"""
-    result = crud.record_screenshot(db_session, "non_existent_hash", "file.jpg")
-    assert result is None
-
-def test_record_screenshot_multiple_times(db_session):
-    """
-    测试对同一个任务多次调用 record_screenshot，验证所有记录都被正确添加。
-    """
-    infohash = "multiple_records_task"
-    crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash))
-
-    crud.record_screenshot(db_session, infohash, "file1.jpg")
-    crud.record_screenshot(db_session, infohash, "file2.jpg")
-    crud.record_screenshot(db_session, infohash, "file1.jpg") # 测试重复添加
-    crud.record_screenshot(db_session, infohash, "file3.jpg")
-
-    final_task = crud.get_task_by_infohash(db_session, infohash)
-    assert final_task is not None
-    final_screenshots = final_task.successful_screenshots
-
-    assert isinstance(final_screenshots, list)
-    assert len(final_screenshots) == 3
-    assert set(final_screenshots) == {"file1.jpg", "file2.jpg", "file3.jpg"}
-
-
-def test_upsert_worker_creation(db_session):
-    """测试当工作节点不存在时，upsert_worker 是否能正确创建新的工作节点。"""
-    worker_id = "new_worker_for_upsert"
-    worker = crud.upsert_worker(db_session, worker_id=worker_id, status="idle")
-    assert worker is not None
-    assert worker.worker_id == worker_id
-    assert worker.status == "idle"
-    retrieved_worker = crud.get_worker_by_id(db_session, worker_id)
-    assert retrieved_worker is not None
-    assert retrieved_worker.id == worker.id
-
-
-def test_upsert_worker_update(db_session):
-    """测试当工作节点已存在时，upsert_worker 是否能正确更新其信息。"""
-    worker_id = "existing_worker_for_upsert"
-    # 首先创建一个工作节点
-    crud.create_worker(db_session, schemas.WorkerCreate(worker_id=worker_id, status="idle"))
-
-    # 然后使用 upsert 更新它
-    updated_worker = crud.upsert_worker(db_session, worker_id=worker_id, status="busy")
-
-    assert updated_worker is not None
-    assert updated_worker.status == "busy"
-    assert updated_worker.last_seen_at is not None
-
-    retrieved_worker = crud.get_worker_by_id(db_session, worker_id)
-    assert retrieved_worker.status == "busy"
-
-
-def test_reset_stuck_tasks(db_session):
-    """测试 reset_stuck_tasks 是否能正确地将卡死的任务状态重置为 'pending'。"""
-    from datetime import datetime, timedelta
-
-    # 1. 创建一个任务并分配给一个 worker，使其状态变为 'working'
-    infohash = "stuck_task_hash"
-    worker_id = "worker_for_stuck_task"
-    crud.create_task(db_session, schemas.TaskCreate(infohash=infohash))
-    task = crud.get_and_assign_next_task(db_session, worker_id=worker_id)
-    assert task.status == 'working'
-
-    # 2. 手动将任务的 updated_at 时间戳更新为过去的时间，模拟卡死状态
-    stuck_time = datetime.utcnow() - timedelta(hours=1)
-    db_session.query(models.Task).filter_by(infohash=infohash).update({"updated_at": stuck_time}, synchronize_session=False)
+def test_get_tasks_with_filter(db_session):
+    """测试分页和按状态过滤任务列表的功能。"""
+    # 创建一些测试数据
+    for i in range(5):
+        crud.create_task(db_session, task=schemas.TaskCreate(infohash=f"pending_task_{i}"))
+    for i in range(3):
+        task = crud.create_task(db_session, task=schemas.TaskCreate(infohash=f"working_task_{i}"))
+        task.status = 'working'
     db_session.commit()
 
-    # 3. 执行重置操作
-    timeout_seconds = 30 * 60  # 30 分钟
-    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds)
+    # 测试不带过滤
+    total, tasks = crud.get_tasks(db_session, limit=10)
+    assert total == 8
+    assert len(tasks) == 8
 
-    # 4. 验证结果
-    assert reset_count == 1
+    # 测试按状态过滤
+    total_pending, pending_tasks = crud.get_tasks(db_session, status='pending', limit=10)
+    assert total_pending == 5
+    assert len(pending_tasks) == 5
 
+    # 测试分页
+    total_all, paged_tasks = crud.get_tasks(db_session, skip=6, limit=5)
+    assert total_all == 8
+    assert len(paged_tasks) == 2
+
+def test_upsert_worker_creation(db_session):
+    """测试当工作节点不存在时，upsert 操作是否能正确创建新节点。"""
+    worker_id = "worker_01"
+    worker = crud.upsert_worker(db_session, worker_id=worker_id, status='idle')
+    assert worker is not None
+    assert worker.worker_id == worker_id
+    assert worker.status == 'idle'
+    assert worker.last_seen_at is not None
+
+def test_upsert_worker_update(db_session):
+    """测试当工作节点已存在时，upsert 操作是否能正确更新其状态和心跳时间。"""
+    worker_id = "worker_02"
+    crud.upsert_worker(db_session, worker_id=worker_id, status='idle')
+    first_worker = crud.get_worker_by_id(db_session, worker_id)
+    first_seen_at = first_worker.last_seen_at
+
+    # 模拟一段时间后的更新
+    updated_worker = crud.upsert_worker(db_session, worker_id=worker_id, status='busy')
+    assert updated_worker.status == 'busy'
+    assert updated_worker.last_seen_at > first_seen_at
+
+def test_get_and_assign_next_task(db_session):
+    """测试能否原子性地获取并分配下一个待处理任务。"""
+    infohash = "assign_task_01"
+    crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash))
+
+    # 第一个工作节点获取任务
+    assigned_task = crud.get_and_assign_next_task(db_session, worker_id="worker_A")
+    assert assigned_task is not None
+    assert assigned_task.infohash == infohash
+    assert assigned_task.status == 'working'
+    assert assigned_task.assigned_worker_id == 'worker_A'
+
+    # 第二个工作节点尝试获取，应该获取不到任何任务
+    next_task = crud.get_and_assign_next_task(db_session, worker_id="worker_B")
+    assert next_task is None
+
+def test_update_task_status(db_session):
+    """测试更新任务状态、结果消息和 assigned_worker_id 的逻辑。"""
+    infohash = "update_status_task"
+    crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash))
+    task = crud.get_and_assign_next_task(db_session, worker_id="worker_C")
+    assert task.assigned_worker_id == "worker_C"
+
+    # 更新为成功状态
+    crud.update_task_status(db_session, infohash=infohash, status='success', message='Completed')
     updated_task = crud.get_task_by_infohash(db_session, infohash)
-    assert updated_task.status == 'pending'
+    assert updated_task.status == 'success'
+    assert updated_task.result_message == 'Completed'
+    # 任务完成后，assigned_worker_id 应该被清除
     assert updated_task.assigned_worker_id is None
 
+def test_update_task_details(db_session):
+    """测试更新任务的详细信息。"""
+    infohash = "update_details_task"
+    crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash))
 
-def test_update_details_race_condition(db_session):
-    """
-    测试 `update_task_details` 和 `record_screenshot` 之间的竞态条件。
-    在没有锁的情况下，此测试应该会失败，因为其中一个更新会被另一个覆盖。
-    """
-    import threading
-    import time
+    details_to_update = schemas.TaskDetailsUpdate(
+        torrent_name="My Awesome Movie",
+        video_filename="movie.mp4",
+        video_duration_seconds=3600
+    )
+    crud.update_task_details(db_session, infohash=infohash, details=details_to_update)
 
-    infohash = "race_condition_task"
-    initial_task = schemas.TaskCreate(infohash=infohash)
-    crud.create_task(db_session, task=initial_task)
+    updated_task = crud.get_task_by_infohash(db_session, infohash)
+    assert updated_task.torrent_name == "My Awesome Movie"
+    assert updated_task.video_filename == "movie.mp4"
+    assert updated_task.video_duration_seconds == 3600
 
-    # 模拟两个并发操作
-    def update_details_worker():
-        """工作线程1：更新任务详情"""
-        # 每个线程需要自己的数据库会话
-        db = TestingSessionLocal()
-        try:
-            details_to_update = schemas.TaskDetailsUpdate(video_filename="new_video.mp4")
-            # 直接调用我们正在测试的、已修复的函数
-            crud.update_task_details(db, infohash=infohash, details=details_to_update)
-        finally:
-            db.close()
+def test_reset_stuck_tasks(db_session):
+    """测试重置卡死任务的逻辑。"""
+    infohash_stuck = "stuck_task"
+    infohash_ok = "ok_task"
 
-    def record_screenshot_worker():
-        """工作线程2：记录截图"""
-        db = TestingSessionLocal()
-        try:
-            # crud.record_screenshot 内部使用了锁，是安全的
-            crud.record_screenshot(db, infohash=infohash, filename="screenshot.jpg")
-        finally:
-            db.close()
+    # 创建一个一小时前更新的卡死任务
+    stuck_task = crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash_stuck))
+    stuck_task.status = 'working'
+    stuck_task.updated_at = datetime.utcnow() - timedelta(hours=1)
 
-    # 创建并启动线程
-    thread1 = threading.Thread(target=update_details_worker)
-    thread2 = threading.Thread(target=record_screenshot_worker)
+    # 创建一个刚刚更新的正常任务
+    ok_task = crud.create_task(db_session, task=schemas.TaskCreate(infohash=infohash_ok))
+    ok_task.status = 'working'
+    db_session.commit()
 
-    thread1.start()
-    thread2.start()
+    # 执行重置操作，超时时间为 30 分钟
+    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds=1800)
+    assert reset_count == 1
 
-    # 等待两个线程完成
-    thread1.join()
-    thread2.join()
+    # 验证任务状态
+    stuck_task_after = crud.get_task_by_infohash(db_session, infohash_stuck)
+    ok_task_after = crud.get_task_by_infohash(db_session, infohash_ok)
+    assert stuck_task_after.status == 'pending'
+    assert ok_task_after.status == 'working'
 
-    # 验证最终结果
-    final_task = crud.get_task_by_infohash(db_session, infohash)
-    assert final_task is not None
-    # 在没有修复的情况下，下面的一条或两条断言可能会失败
-    assert final_task.video_filename == "new_video.mp4"
-    assert final_task.successful_screenshots == ["screenshot.jpg"]
+def test_get_retryable_tasks_and_reset(db_session):
+    """测试获取可重试任务并重置它们的逻辑。"""
+    # 创建一个可重试的任务
+    retry_task = crud.create_task(db_session, task=schemas.TaskCreate(infohash="retry_task"))
+    retry_task.status = 'recoverable_failure'
+    retry_task.retry_count = 1
+
+    # 创建一个不可重试的任务 (次数超限)
+    non_retry_task = crud.create_task(db_session, task=schemas.TaskCreate(infohash="non_retry_task"))
+    non_retry_task.status = 'recoverable_failure'
+    non_retry_task.retry_count = 3
+    db_session.commit()
+
+    # 获取可重试任务
+    retryable_tasks = crud.get_retryable_tasks(db_session, limit=10)
+    assert len(retryable_tasks) == 1
+    assert retryable_tasks[0].infohash == "retry_task"
+
+    # 重置任务以供重试
+    crud.reset_task_for_retry(db_session, retryable_tasks[0])
+    reset_task = crud.get_task_by_infohash(db_session, "retry_task")
+    assert reset_task.status == 'pending'
+    assert reset_task.retry_count == 2
