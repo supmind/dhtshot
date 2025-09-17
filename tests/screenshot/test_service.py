@@ -3,47 +3,13 @@
 对 screenshot/service.py 核心服务逻辑的单元测试。
 """
 import pytest
-import io
-import struct
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from screenshot.service import ScreenshotService, StatusCallback
+from screenshot.service import ScreenshotService
 from config import Settings
-from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
-from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
+from screenshot.errors import NoVideoFileError
 from screenshot.client import TorrentClient
-
-
-class TestAssembleData:
-    @pytest.fixture
-    def service(self, settings):
-        return ScreenshotService(settings=settings, loop=None)
-
-    def test_assemble_from_single_piece(self, service):
-        pieces_data = {0: b"0123456789"}
-        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=2, size=5, piece_length=10)
-        assert result == b"23456"
-
-    def test_assemble_spanning_two_pieces(self, service):
-        pieces_data = {0: b"0123456789", 1: b"abcdefghij"}
-        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=4, piece_length=10)
-        assert result == b"89ab"
-
-    def test_assemble_spanning_multiple_pieces(self, service):
-        pieces_data = {0: b"0123456789", 1: b"abcdefghij", 2: b"KLMNOPQRST"}
-        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=15, piece_length=10)
-        assert result == b"89abcdefghijKLM"
-
-    def test_assemble_at_piece_boundary(self, service):
-        pieces_data = {0: b"0123456789", 1: b"abcdefghij"}
-        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=10, size=5, piece_length=10)
-        assert result == b"abcde"
-
-    def test_assemble_with_missing_piece(self, service):
-        pieces_data = {0: b"0123456789", 2: b"KLMNOPQRST"}
-        result = service._assemble_data_from_pieces(pieces_data, offset_in_torrent=8, size=15, piece_length=10)
-        assert result == b""
 
 
 @pytest.fixture
@@ -67,70 +33,59 @@ def service(settings, mock_callbacks):
     mock_client = AsyncMock(spec=TorrentClient)
     mock_client.add_torrent = AsyncMock()
     mock_client.remove_torrent = AsyncMock()
-    mock_client.fetch_pieces = AsyncMock()
-    mock_client.subscribe_pieces = MagicMock()
-    mock_client.unsubscribe_pieces = MagicMock()
-    mock_client.request_pieces = MagicMock()
     service_instance.client = mock_client
     service_instance.generator = AsyncMock()
+    # Keep a reference to the mock for easy access in tests
     service_instance.mock_client = mock_client
     yield service_instance
 
-def test_select_keyframes_logic(service):
-    all_keyframes = [
-        Keyframe(0, 0, 0, 90000), Keyframe(1, 1, 10 * 90000, 90000),
-        Keyframe(2, 2, 20 * 90000, 90000), Keyframe(3, 3, 88 * 90000, 90000),
-        Keyframe(4, 4, 95 * 90000, 90000), Keyframe(5, 5, 170 * 90000, 90000)
-    ]
-    duration_pts = 180 * 90000
-    selected = service._select_keyframes(all_keyframes, 90000, duration_pts, None)
-    assert len(selected) == 3
-    selected_pts = {kf.pts for kf in selected}
-    expected_pts = {0, 88 * 90000, 95 * 90000}
-    assert selected_pts == expected_pts
 
 @pytest.mark.asyncio
-@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
-async def test_handle_task_permanent_failure(mock_generate, service, mock_callbacks):
-    mock_generate.side_effect = NoVideoFileError("Not found", "no_video_hash")
+@patch('screenshot.service.VideoProcessor', autospec=True)
+async def test_handle_task_permanent_failure(MockVideoProcessor, service, mock_callbacks):
+    # The processor's process method raises a permanent error
+    mock_processor_instance = MockVideoProcessor.return_value
+    mock_processor_instance.process.side_effect = NoVideoFileError("Not found", "no_video_hash")
+
     service.mock_client.add_torrent.return_value = MagicMock()
 
     await service._handle_screenshot_task({"infohash": "no_video_hash", "metadata": b"somemetadata"})
 
+    # Check that the processor was created and called
+    MockVideoProcessor.assert_called_once()
+    mock_processor_instance.process.assert_awaited_once()
+
+    # Check that the correct status was reported
     result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
     assert result.get("status") == "permanent_failure"
     assert isinstance(result.get("error"), NoVideoFileError)
+
+    # Check that resources were cleaned up
     service.mock_client.remove_torrent.assert_awaited_once_with(service.mock_client.add_torrent.return_value, delete_files=True)
 
+
 @pytest.mark.asyncio
-@patch.object(ScreenshotService, '_generate_screenshots_from_torrent', new_callable=AsyncMock)
-async def test_handle_task_successful_run(mock_generate, service, mock_callbacks):
+@patch('screenshot.service.VideoProcessor', autospec=True)
+async def test_handle_task_successful_run(MockVideoProcessor, service, mock_callbacks):
     infohash = "success_hash"
     service.mock_client.add_torrent.return_value = MagicMock()
 
+    mock_processor_instance = MockVideoProcessor.return_value
+    mock_processor_instance.process = AsyncMock()
+
     await service._handle_screenshot_task({"infohash": infohash, "metadata": b"somemetadata"})
 
+    # Check that the processor was created and its process method called
+    MockVideoProcessor.assert_called_once()
+    mock_processor_instance.process.assert_awaited_once()
+
+    # Check that the success status was reported
     result = await asyncio.wait_for(mock_callbacks["future"], timeout=1)
     assert result.get("status") == "success"
-    mock_generate.assert_awaited_once()
+
+    # Check that cleanup happened correctly
     service.mock_client.remove_torrent.assert_awaited_once()
 
-@pytest.mark.asyncio
-async def test_get_moov_atom_fetches_full_box_on_partial_find(service):
-    mock_handle = MagicMock()
-    partial_moov_data = b'\x00\x00\x03\xe8moov' + b'\x01' * 42
-    full_moov_data = b'\x00\x00\x03\xe8moov' + b'\xff' * (1000 - 8)
-
-    service.mock_client.fetch_pieces.side_effect = [
-        {0: partial_moov_data},
-        {0: full_moov_data[:512], 1: full_moov_data[512:]}
-    ]
-    with patch.object(service, '_assemble_data_from_pieces', new_callable=MagicMock) as mock_assemble:
-        mock_assemble.side_effect = [partial_moov_data, full_moov_data]
-        result_moov_data = await service._get_moov_atom_data(mock_handle, 0, 2000, 512, "partial_moov_hash")
-
-    assert result_moov_data == full_moov_data
-    assert service.mock_client.fetch_pieces.call_count == 2
 
 @pytest.mark.skip(reason="Needs update for new intelligent probing mock logic")
 @pytest.mark.asyncio
