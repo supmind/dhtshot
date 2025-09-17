@@ -146,19 +146,28 @@ async def create_or_reactivate_task(
         elif db_task.status == "permanent_failure":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="任务已永久失败，无法重新提交。")
         elif db_task.status == "recoverable_failure":
+            if db_task.retry_count >= 3:
+                db_task.retry_count = 0
             db_task.status = "pending"
             db.commit()
             db.refresh(db_task)
             return db_task
 
+    # 如果是新任务，必须提供元数据文件
+    if not torrent_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A .torrent metadata file is required when creating a new task.",
+        )
+
     # 如果是新任务，设置响应状态码为 201 Created
     response.status_code = status.HTTP_201_CREATED
-    if torrent_file:
-        METADATA_DIR = "temp_metadata"
-        os.makedirs(METADATA_DIR, exist_ok=True)
-        file_path = os.path.join(METADATA_DIR, f"{infohash}.torrent")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(torrent_file.file, buffer)
+
+    METADATA_DIR = "temp_metadata"
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    file_path = os.path.join(METADATA_DIR, f"{infohash}.torrent")
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(torrent_file.file, buffer)
 
     new_task = crud.create_task(db=db, task=schemas.TaskCreate(infohash=infohash))
     return new_task

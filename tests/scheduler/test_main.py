@@ -94,11 +94,24 @@ def test_endpoint_wrong_api_key(client):
 
 def test_create_task_new(client, api_key_headers):
     infohash = "new_task_hash"
-    response = client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    response = client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     assert response.status_code == 201
     data = response.json()
     assert data["infohash"] == infohash
     assert data["status"] == "pending"
+
+def test_create_task_new_without_metadata_fails(client, api_key_headers):
+    """测试在没有提供元数据文件时创建新任务会失败。"""
+    infohash = "no_metadata_hash"
+    response = client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    assert response.status_code == 400
+    assert "required" in response.json()["detail"]
 
 def test_create_task_with_torrent_file(client, api_key_headers):
     infohash = "task_with_file"
@@ -122,7 +135,15 @@ def test_create_task_with_torrent_file(client, api_key_headers):
 
 def test_create_task_existing_pending(client, api_key_headers):
     infohash = "existing_pending_hash"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    # First call creates the task
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
+    # Second call should find the existing task (no file needed)
     response = client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
     assert response.status_code == 200
     assert response.json()["infohash"] == infohash
@@ -130,7 +151,13 @@ def test_create_task_existing_pending(client, api_key_headers):
 def test_create_task_permanent_failure(client, api_key_headers):
     infohash = "permanent_failure_hash"
     db = TestingSessionLocal()
-    crud.create_task(db, schemas.TaskCreate(infohash=infohash))
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     crud.update_task_status(db, infohash, "permanent_failure")
     db.close()
 
@@ -141,7 +168,13 @@ def test_create_task_permanent_failure(client, api_key_headers):
 def test_create_task_recoverable_failure(client, api_key_headers):
     infohash = "recoverable_failure_hash"
     db = TestingSessionLocal()
-    crud.create_task(db, schemas.TaskCreate(infohash=infohash))
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     crud.update_task_status(db, infohash, "recoverable_failure")
     db.close()
 
@@ -150,9 +183,38 @@ def test_create_task_recoverable_failure(client, api_key_headers):
     data = response.json()
     assert data["status"] == "pending"
 
+def test_reactivate_task_resets_retry_count(client, api_key_headers):
+    """测试重新激活一个失败次数过多的可恢复任务会重置其重试次数。"""
+    infohash = "reset_retries_hash"
+    db = TestingSessionLocal()
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
+    task = crud.get_task_by_infohash(db, infohash)
+    task.status = "recoverable_failure"
+    task.retry_count = 3
+    db.commit()
+    db.close()
+
+    response = client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "pending"
+    assert data["retry_count"] == 0
+
 def test_get_task_by_infohash(client, api_key_headers):
     infohash = "get_by_hash"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     response = client.get(f"/tasks/{infohash}", headers=api_key_headers)
     assert response.status_code == 200
     assert response.json()["infohash"] == infohash
@@ -163,7 +225,13 @@ def test_get_nonexistent_task(client, api_key_headers):
 
 def test_get_next_task(client, api_key_headers):
     infohash = "next_task_hash"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     response = client.get("/tasks/next", params={"worker_id": "worker-1"}, headers=api_key_headers)
     assert response.status_code == 200
     assert response.json()["infohash"] == infohash
@@ -181,7 +249,13 @@ def test_get_next_task_with_metadata_file(client, api_key_headers):
     with open(metadata_file, "wb") as f:
         f.write(b"test content")
 
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     response = client.get("/tasks/next", params={"worker_id": "worker-1"}, headers=api_key_headers)
     assert response.status_code == 200
     assert os.path.exists(metadata_file)
@@ -232,9 +306,15 @@ def test_update_status_success_deletes_metadata(client, api_key_headers):
     metadata_dir = "temp_metadata"
     os.makedirs(metadata_dir, exist_ok=True)
     metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
     with open(metadata_file, "wb") as f:
-        f.write(b"test content")
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+        f.write(torrent_content)
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     payload = {"status": "success", "message": "All done!"}
     response = client.post(f"/tasks/{infohash}/status", json=payload, headers=api_key_headers)
     assert response.status_code == 200
@@ -245,26 +325,48 @@ def test_update_status_success_deletes_metadata(client, api_key_headers):
 def test_update_status_failure_preserves_metadata(client, api_key_headers):
     infohash = "failure_preserves_metadata"
     metadata_dir = "temp_metadata"
-    os.makedirs(metadata_dir, exist_ok=True)
-    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
-    with open(metadata_file, "wb") as f:
-        f.write(b"test content")
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    # The endpoint will create the directory
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
+
     payload = {"status": "recoverable_failure", "message": "An error"}
     response = client.post(f"/tasks/{infohash}/status", json=payload, headers=api_key_headers)
     assert response.status_code == 200
+
+    metadata_file = os.path.join(metadata_dir, f"{infohash}.torrent")
     assert os.path.exists(metadata_file)
+
+    # Cleanup
     os.remove(metadata_file)
-    os.rmdir(metadata_dir)
+    if not os.listdir(metadata_dir):
+        os.rmdir(metadata_dir)
 
 
 def test_list_all_tasks_with_filtering_and_pagination(client, api_key_headers):
     db = TestingSessionLocal()
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
     for i in range(5):
-        crud.create_task(db, schemas.TaskCreate(infohash=f"pending_{i:02d}"))
+        client.post(
+            "/tasks/",
+            data={"infohash": f"pending_{i:02d}"},
+            files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+            headers=api_key_headers
+        )
     for i in range(3):
-        task = crud.create_task(db, schemas.TaskCreate(infohash=f"success_{i:02d}"))
-        crud.update_task_status(db, task.infohash, "success")
+        infohash = f"success_{i:02d}"
+        client.post(
+            "/tasks/",
+            data={"infohash": infohash},
+            files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+            headers=api_key_headers
+        )
+        crud.update_task_status(db, infohash, "success")
     db.close()
     response_all = client.get("/tasks/all/", headers=api_key_headers)
     assert response_all.json()["total"] == 8
@@ -275,7 +377,13 @@ def test_list_all_tasks_with_filtering_and_pagination(client, api_key_headers):
 
 def test_update_task_details_endpoint(client, api_key_headers):
     infohash = "details_update_hash"
-    client.post("/tasks/", data={"infohash": infohash}, headers=api_key_headers)
+    torrent_content = b"d8:announce4:test4:infod6:lengthi1e4:name4:testee"
+    client.post(
+        "/tasks/",
+        data={"infohash": infohash},
+        files={"torrent_file": ("test.torrent", BytesIO(torrent_content), "application/x-bittorrent")},
+        headers=api_key_headers
+    )
     details_payload = {"torrent_name": "My Test Torrent", "video_filename": "movie.mp4", "video_duration_seconds": 3600}
     response = client.post(f"/tasks/{infohash}/details", json=details_payload, headers=api_key_headers)
     assert response.status_code == 200
