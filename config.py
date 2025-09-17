@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     max_screenshots: int = 60
     default_screenshots: int = 20
     target_interval_sec: int = 180
+    keyframe_trim_percentage: float = 0.03 # 截图时从视频首尾排除的关键帧百分比
 
     # --- Libtorrent 性能调优设置 ---
     # 这些设置直接影响 libtorrent 会话的性能，对于高负载环境至关重要。
@@ -44,6 +45,7 @@ class Settings(BaseSettings):
     # Timeouts for various operations
     metadata_timeout: int = 180  # 3 minutes
     moov_probe_timeout: int = 120  # 2 minutes
+    moov_head_probe_size: int = 256 * 1024 # 256 KB
     piece_fetch_timeout: int = 60  # 1 minute
     piece_queue_timeout: int = 300  # 5 minutes
 

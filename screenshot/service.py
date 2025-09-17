@@ -286,73 +286,36 @@ class ScreenshotService:
         return video_file_index, video_file_size, video_file_offset, video_filename
 
     def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
-        """
-        根据关键帧的显示时间戳 (PTS) 从所有关键帧中均匀地选择一个代表性子集。
-        这种方法确保了截图在视频的时间线上是均匀分布的，而不是基于关键帧在列表中的索引。
-
-        :param all_keyframes: 包含所有关键帧的列表。
-        :param timescale: 视频的 timescale，用于将 PTS 转换为秒。
-        :param duration_pts: 视频的总时长 (以 PTS 为单位)。
-        :param samples: 视频的样本列表，用于在 duration_pts 不可用时作为备用。
-        :return: 一个代表性的关键帧子集。
-        """
         if not all_keyframes:
             return []
-
-        # 排除首尾 3% 的关键帧
         total_keyframes = len(all_keyframes)
         trim_count = int(total_keyframes * 0.03)
-
-        if trim_count > 0:
-            if total_keyframes > trim_count * 2:
-                all_keyframes = all_keyframes[trim_count:-trim_count]
-
+        if trim_count > 0 and total_keyframes > trim_count * 2:
+            all_keyframes = all_keyframes[trim_count:-trim_count]
         if not all_keyframes:
             return []
-
-        # 如果从 'mdhd' box 中未能成功解析出时长，则回退到基于最后一个样本时间戳的估算
         if duration_pts == 0 and samples:
             self.log.warning("duration_pts 为 0，将使用最后一个样本的 PTS 作为估算时长。")
             duration_pts = samples[-1].pts
-
         duration_sec = duration_pts / timescale if timescale > 0 else 0
-
-        # 根据视频时长和配置计算目标截图数量
         num_screenshots = self.settings.default_screenshots
         if duration_sec > 0:
             num_screenshots = max(
                 self.settings.min_screenshots,
                 min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots)
             )
-
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
-
-        # 计算目标时间点
-        target_timestamps_pts = [
-            int(i * duration_pts / num_screenshots) for i in range(num_screenshots)
-        ]
-
+        target_timestamps_pts = [int(i * duration_pts / num_screenshots) for i in range(num_screenshots)]
         selected_keyframes = []
-        # 对于每个目标时间点，找到 PTS 最接近它的关键帧
         for target_pts in target_timestamps_pts:
-            # 使用 min 函数和一个 lambda 来找到差值最小的关键帧
-            closest_keyframe = min(
-                all_keyframes,
-                key=lambda kf: abs(kf.pts - target_pts)
-            )
+            closest_keyframe = min(all_keyframes, key=lambda kf: abs(kf.pts - target_pts))
             if closest_keyframe not in selected_keyframes:
                 selected_keyframes.append(closest_keyframe)
-
-        # 按 PTS 排序，以确保截图顺序与视频播放顺序一致
         selected_keyframes.sort(key=lambda kf: kf.pts)
         return selected_keyframes
 
     async def _process_keyframe_pieces(self, handle, local_queue, task_state, keyframe_info, piece_to_keyframes, remaining_keyframes) -> Tuple[set, dict]:
-        """
-        监听已完成的 piece，当一个关键帧所需的所有 piece 都下载完毕时，为其创建截图生成任务。
-        返回本次运行中成功生成截图任务的关键帧索引集合，以及 {关键帧索引: 截图任务} 的映射。
-        """
         infohash_hex, extractor = task_state['infohash'], task_state['extractor']
         video_file_offset, piece_length = task_state['video_file_offset'], task_state['piece_length']
         processed_this_run, generation_tasks_map = set(), {}
@@ -368,8 +331,6 @@ class ScreenshotService:
                 self.log.warning(f"获取关键帧 {keyframe.index} 数据失败: {e}，跳过。"); return None
             if not packet_data_bytes or len(packet_data_bytes) != sample.size:
                 self.log.warning(f"关键帧 {keyframe.index} 的数据不完整 ({len(packet_data_bytes)}/{sample.size})，跳过。"); return None
-
-            # 为 H.264/HEVC 的 'avc1' 格式（NALU长度前缀）转换为 Annex B 格式（起始码）
             if extractor.mode == 'avc1':
                 annexb_data, start_code, cursor = bytearray(), b'\x00\x00\x00\x01', 0
                 while cursor < len(packet_data_bytes):
@@ -377,7 +338,6 @@ class ScreenshotService:
                     nal_data = packet_data_bytes[cursor : cursor + nal_length]; annexb_data.extend(start_code + nal_data); cursor += nal_length
                 packet_data = bytes(annexb_data)
             else: packet_data = packet_data_bytes
-
             ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
             timestamp_str = str(int(ts_sec))
             return self.loop.create_task(self.generator.generate(extractor.codec_name, extractor.extradata, packet_data, infohash_hex, timestamp_str))
@@ -388,7 +348,6 @@ class ScreenshotService:
                 finished_piece = await asyncio.wait_for(local_queue.get(), timeout=self.settings.piece_queue_timeout)
                 if finished_piece is None: torrent_is_complete = True; break
             except asyncio.TimeoutError: self.log.warning(f"[{infohash_hex}] 等待 piece 超时。"); break
-
             task_state.setdefault('completed_pieces', set()).add(finished_piece)
             if finished_piece not in piece_to_keyframes: continue
             for kf_index in piece_to_keyframes[finished_piece]:
@@ -400,15 +359,12 @@ class ScreenshotService:
                     task = await process_and_generate_task(kf_index)
                     if task: generation_tasks_map[kf_index] = task
                     processed_this_run.add(kf_index)
-
-        # 如果整个 torrent 都下载完了，最后尝试一次处理所有剩余的关键帧
         if torrent_is_complete:
             final_try_keyframes = [kf for kf in remaining_keyframes if kf.index not in processed_this_run]
             for kf_index in [kf.index for kf in final_try_keyframes]:
                 task = await process_and_generate_task(kf_index)
                 if task: generation_tasks_map[kf_index] = task
                 processed_this_run.add(kf_index)
-
         return processed_this_run, generation_tasks_map
 
     async def _generate_screenshots_from_torrent(self, handle, infohash_hex):
@@ -517,50 +473,35 @@ class ScreenshotService:
         self.log.info("正在处理任务: %s", infohash_hex)
         handle = None
         should_delete_files = True
-
         try:
             handle = await self.client.add_torrent(infohash_hex, metadata=task_info.get('metadata'))
             if not handle or not handle.is_valid():
                 raise TorrentClientError(f"无法为 {infohash_hex} 获取有效的 torrent handle。")
-
             await self._generate_screenshots_from_torrent(handle, infohash_hex)
             self.log.info("任务 %s 成功完成。", infohash_hex)
             await self._send_status_update(status='success', infohash=infohash_hex, message='任务成功完成。')
-
         except (MetadataTimeoutError, MoovFetchError, FrameDownloadTimeoutError, TorrentClientError) as e:
             self.log.warning("任务 %s 遇到可恢复的错误: %s", e.infohash, e)
             await self._send_status_update(status='recoverable_failure', infohash=e.infohash, message=str(e), error=e)
-            should_delete_files = False  # 保留元数据以供重试
-            return
-
+            should_delete_files = False
         except TaskError as e:
             self.log.error("任务 %s 因永久性错误而失败: %s", e.infohash, e, exc_info=True)
             await self._send_status_update(status='permanent_failure', infohash=e.infohash, message=str(e), error=e)
-            return
-
         except Exception as e:
             self.log.exception("处理 %s 时发生意外的严重错误。", infohash_hex)
             await self._send_status_update(status='permanent_failure', infohash=infohash_hex, message=f"发生意外错误: {e}", error=e)
-            return
-
         finally:
             if handle and handle.is_valid():
                 await self.client.remove_torrent(handle, delete_files=should_delete_files)
             self.active_tasks.discard(infohash_hex)
 
     async def _worker(self):
-        """一个工作协程，不断地从任务队列中获取并处理任务。"""
         p = psutil.Process()
         while self._running:
             try:
-                # 资源使用检查
                 while p.num_fds() >= self.settings.MAX_FILE_DESCRIPTORS:
-                    self.log.warning(
-                        "文件描述符数量 (%d) 已达到阈值 (%d)。工作进程将暂停 2 秒。",
-                        p.num_fds(), self.settings.MAX_FILE_DESCRIPTORS
-                    )
+                    self.log.warning("文件描述符数量 (%d) 已达到阈值 (%d)。工作进程将暂停 2 秒。", p.num_fds(), self.settings.MAX_FILE_DESCRIPTORS)
                     await asyncio.sleep(2)
-
                 task_info = await self.task_queue.get()
                 await self._handle_screenshot_task(task_info)
                 self.task_queue.task_done()
