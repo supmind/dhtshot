@@ -64,3 +64,40 @@ def test_reset_task_for_retry(db_session):
     resetted_task = crud.get_task_by_infohash(db_session, "reset_task")
     assert resetted_task.status == "pending"
     assert resetted_task.retry_count == 1
+
+
+def test_reset_stuck_tasks_succeeds_on_worker_timeout(db_session):
+    """
+    验证 `reset_stuck_tasks` 在修复后能够正确工作。
+
+    该测试模拟一个 worker 领取任务后失联的场景，并断言 `reset_stuck_tasks`
+    能够基于 worker 的 `last_seen_at` 时间戳来正确地重置任务。
+    这是一个回归测试，确保此功能不会在未来被破坏。
+    """
+    from datetime import datetime, timedelta
+
+    # 1. 设置一个 worker 和一个 task
+    worker = crud.upsert_worker(db_session, "test_worker_1", "idle")
+    task = crud.create_task(db_session, schemas.TaskCreate(infohash="stuck_task_hash"))
+    db_session.commit()
+
+    # 2. 模拟 worker 领取任务
+    assigned_task = crud.get_and_assign_next_task(db_session, "test_worker_1")
+    assert assigned_task.status == "working"
+
+    # 3. 模拟 worker 失联，将其 last_seen_at 设置为1小时前
+    stale_time = datetime.utcnow() - timedelta(hours=1)
+    db_session.query(models.Worker).filter(models.Worker.worker_id == "test_worker_1").update({"last_seen_at": stale_time})
+    db_session.commit()
+
+    # 4. 运行被测函数
+    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds=300)
+
+    # 5. 断言修复后的正确行为
+    # `reset_stuck_tasks` 现在应该能找到并重置这个任务。
+    assert reset_count == 1, "reset_stuck_tasks 未能按预期重置卡死的任务"
+
+    # 确认任务状态已被正确重置
+    final_task = crud.get_task_by_infohash(db_session, "stuck_task_hash")
+    assert final_task.status == "pending", "任务状态应被重置为 'pending'"
+    assert final_task.assigned_worker_id is None, "任务的 assigned_worker_id 应被清除"

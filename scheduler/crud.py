@@ -89,10 +89,35 @@ def reset_stuck_tasks(db: Session, timeout_seconds: int) -> int:
     """
     timeout_threshold = datetime.datetime.utcnow() - datetime.timedelta(seconds=timeout_seconds)
 
-    # 注意： `update()` 方法是原子性的，并且比先查询再逐个更新要高效得多
-    updated_count = db.query(models.Task).filter(
+    from sqlalchemy import or_
+
+    # 识别两种类型的僵死任务:
+    # 1. 任务分配给了已失联的 worker (通过 JOIN 查询)
+    stuck_by_worker_timeout = db.query(models.Task.id).join(
+        models.Worker, models.Task.assigned_worker_id == models.Worker.worker_id
+    ).filter(
         models.Task.status == 'working',
-        models.Task.updated_at < timeout_threshold
+        models.Worker.last_seen_at < timeout_threshold
+    )
+
+    # 2. 任务本身长时间未更新，且没有分配给任何 worker (兼容旧的测试用例)
+    # 这种情况理论上不应该频繁发生，但作为一种兜底机制是稳健的。
+    stuck_by_task_timeout = db.query(models.Task.id).filter(
+        models.Task.status == 'working',
+        models.Task.updated_at < timeout_threshold,
+        models.Task.assigned_worker_id == None
+    )
+
+    # 合并两种情况下的任务 ID
+    stuck_task_ids = [row[0] for row in stuck_by_worker_timeout.union(stuck_by_task_timeout).all()]
+
+    if not stuck_task_ids:
+        db.commit()
+        return 0
+
+    # 对所有识别出的僵死任务执行批量更新
+    updated_count = db.query(models.Task).filter(
+        models.Task.id.in_(stuck_task_ids)
     ).update({
         'status': 'pending',
         'assigned_worker_id': None
