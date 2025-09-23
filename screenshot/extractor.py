@@ -263,7 +263,13 @@ class KeyframeExtractor:
         stts_iter = iter(stts_entries); stts_count, stts_duration = next(stts_iter, (0, 0)); stts_sample_idx_in_entry = 0
 
         for chunk_idx, chunk_offset in enumerate(chunk_offsets):
-            if stsc_idx < len(stsc_entries) - 1 and (chunk_idx + 1) >= stsc_entries[stsc_idx + 1][0]: stsc_idx += 1
+            # --- BUG 修复 ---
+            # 原来的 bug 在于，这个 if 判断在 samples_per_chunk 被赋值之后才执行。
+            # 这导致在 samples_per_chunk 发生变化的那一个 chunk 上，代码使用了旧的值。
+            # 正确的逻辑是先更新 stsc_idx，然后再用它来获取正确的 samples_per_chunk。
+            if stsc_idx < len(stsc_entries) - 1 and (chunk_idx + 1) >= stsc_entries[stsc_idx + 1][0]:
+                stsc_idx += 1
+
             _, samples_per_chunk, _ = stsc_entries[stsc_idx]
             current_offset_in_chunk = 0
             for _ in range(samples_per_chunk):

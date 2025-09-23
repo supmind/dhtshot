@@ -4,6 +4,7 @@
 """
 import pytest
 import struct
+import os
 from io import BytesIO
 
 from screenshot.extractor import KeyframeExtractor
@@ -89,3 +90,62 @@ def test_extractor_with_invalid_data():
     invalid_data = b'this is not a valid moov box'
     with pytest.raises(ValueError, match="在 'moov' Box 中未找到有效的视频轨道"):
         KeyframeExtractor(invalid_data)
+
+
+def test_variable_stsc_box_parsing(moov_atom_data):
+    """
+    测试 KeyframeExtractor 是否能正确解析具有多个 'stsc' 条目的视频。
+
+    这个测试专门用于暴露 'stsc' 解析逻辑中的一个 bug，即在块的样本数
+    发生变化时，代码使用了过时的值。
+    """
+    # 首先，确保我们的测试视频生成脚本存在
+    video_gen_script = "tests/utils/create_stsc_test_video.py"
+    assert os.path.exists(video_gen_script), "测试视频生成脚本丢失！"
+
+    # 运行脚本来生成我们需要的特定视频文件
+    import subprocess
+    subprocess.run(["python", video_gen_script], check=True)
+
+    video_path = "tests/assets/test_variable_stsc.mp4"
+    assert os.path.exists(video_path), f"测试视频文件不存在: {video_path}"
+
+    with open(video_path, "rb") as f:
+        # 从这个特殊的视频中重新获取 moov 数据
+        data = f.read()
+        stream = BytesIO(data)
+        moov_data_stsc = None
+        while True:
+            header_data = stream.read(8)
+            if not header_data: break
+            size, box_type_bytes = struct.unpack('>I4s', header_data)
+            if box_type_bytes.decode('ascii') == 'moov':
+                stream.seek(stream.tell() - 8)
+                moov_data_stsc = stream.read(size)
+                break
+            if size == 1:
+                size = struct.unpack('>Q', stream.read(8))[0]
+                stream.seek(size - 16, 1)
+            else:
+                stream.seek(size - 8, 1)
+
+    assert moov_data_stsc is not None, "未能从 test_variable_stsc.mp4 中找到 'moov' atom"
+
+    # 使用修复后的逻辑进行解析
+    extractor = KeyframeExtractor(moov_data_stsc)
+
+    # 视频总共有 6 帧。我们断言解析出的样本数必须是 6。
+    # 这是验证修复是否破坏基本功能的第一道防线。
+    expected_sample_count = 6
+    actual_sample_count = len(extractor.samples)
+
+    assert actual_sample_count == expected_sample_count, \
+        f"解析含有可变stsc box的视频时样本数错误。预期: {expected_sample_count}, 实际: {actual_sample_count}。"
+
+    # 这是一个更强的断言，验证偏移量计算的正确性。
+    # 如果 stsc 解析逻辑错误，这里的偏移量很可能会错乱。
+    offsets = [s.offset for s in extractor.samples]
+    assert all(offsets[i] < offsets[i+1] for i in range(len(offsets) - 1)), "样本偏移量必须是单调递增的"
+
+    # 清理生成的视频文件
+    os.remove(video_path)
