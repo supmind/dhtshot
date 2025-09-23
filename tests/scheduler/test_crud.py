@@ -164,8 +164,12 @@ def test_reset_stuck_tasks(db_session):
     ok_task.status = 'working'
     db_session.commit()
 
-    # 执行重置操作，超时时间为 30 分钟
-    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds=1800)
+    # 执行重置操作
+    reset_count = crud.reset_stuck_tasks(
+        db_session,
+        worker_timeout_seconds=3600, # worker 1小时没心跳
+        task_timeout_seconds=1800    # task 30分钟没更新
+    )
     assert reset_count == 1
 
     # 验证任务状态

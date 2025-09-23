@@ -8,12 +8,14 @@ from screenshot.extractor import Keyframe
 from config import Settings
 
 
-@pytest.fixture
-def settings():
-    # Provide a baseline settings object
-    return Settings()
-
-def test_select_keyframes_logic(settings):
+def test_select_keyframes_logic():
+    settings = Settings(
+        default_screenshots=3,
+        min_screenshots=3,
+        max_screenshots=3,
+        keyframe_trim_percentage=0.0,
+        target_interval_sec=60
+    )
     all_keyframes = [
         Keyframe(index=0, sample_index=0, pts=0, timescale=90000),
         Keyframe(index=1, sample_index=1, pts=10 * 90000, timescale=90000),
@@ -22,13 +24,6 @@ def test_select_keyframes_logic(settings):
         Keyframe(index=4, sample_index=4, pts=95 * 90000, timescale=90000),
         Keyframe(index=5, sample_index=5, pts=170 * 90000, timescale=90000)
     ]
-    # Override settings for this specific test case
-    settings.default_screenshots = 3
-    settings.min_screenshots = 3
-    settings.max_screenshots = 3
-    settings.keyframe_trim_percentage = 0.0
-    settings.target_interval_sec = 60 # duration_sec (180) / 60 = 3 screenshots
-
     duration_pts = 180 * 90000
     selected = select_keyframes(all_keyframes, 90000, duration_pts, settings, None)
 
@@ -37,41 +32,42 @@ def test_select_keyframes_logic(settings):
     expected_pts = {0, 88 * 90000, 95 * 90000}
     assert selected_pts == expected_pts
 
-def test_keyframe_trimming(settings):
+def test_keyframe_trimming():
+    settings = Settings(
+        keyframe_trim_percentage=0.1,
+        max_screenshots=20,
+        min_screenshots=1,
+        target_interval_sec=1  # Use integer value
+    )
     all_keyframes = [Keyframe(i, i, i * 1000, 1000) for i in range(20)]
-    settings.keyframe_trim_percentage = 0.1 # trim 10%, so 2 from start, 2 from end
-    settings.max_screenshots = 20 # Ensure we don't cap the number of screenshots
-    settings.min_screenshots = 1
-    settings.target_interval_sec = 0.5 # 20s duration / 0.5 = 40, but capped at max_screenshots
-
     selected = select_keyframes(all_keyframes, 1000, 20000, settings, None)
 
-    # After trimming, 16 keyframes remain. Since max_screenshots is 20, it should select all 16.
     assert len(selected) == 16
     assert selected[0].pts == 2000
     assert selected[-1].pts == 17000
 
-def test_not_enough_keyframes_to_trim(settings):
+def test_not_enough_keyframes_to_trim():
+    settings = Settings(
+        keyframe_trim_percentage=0.1,
+        max_screenshots=10,
+        min_screenshots=1,
+        target_interval_sec=1
+    )
     all_keyframes = [Keyframe(i, i, i * 1000, 1000) for i in range(5)]
-    settings.keyframe_trim_percentage = 0.1 # Should not trim as 10% of 5 is < 1 on each side
-    settings.max_screenshots = 10
-    settings.min_screenshots = 1
-    settings.target_interval_sec = 1
-
     selected = select_keyframes(all_keyframes, 1000, 5000, settings, None)
 
     assert len(selected) == 5
 
-def test_selects_all_if_less_than_target(settings):
+def test_selects_all_if_less_than_target():
+    settings = Settings(
+        default_screenshots=5,
+        keyframe_trim_percentage=0.0,
+        max_screenshots=10,
+        min_screenshots=1,
+        target_interval_sec=1
+    )
     all_keyframes = [Keyframe(i, i, i * 1000, 1000) for i in range(4)]
-    settings.default_screenshots = 5
-    settings.keyframe_trim_percentage = 0.0
-    settings.max_screenshots = 10
-    settings.min_screenshots = 1
-    settings.target_interval_sec = 1
-
     selected = select_keyframes(all_keyframes, 1000, 4000, settings, None)
 
-    # The number of screenshots to take is 4 (from duration/interval), but since we only have 4, it should just return all of them.
     assert len(selected) == 4
     assert selected == all_keyframes

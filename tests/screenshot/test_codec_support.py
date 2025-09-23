@@ -61,8 +61,8 @@ def get_moov_atom(video_data: bytes) -> bytes:
 @pytest.fixture
 def settings():
     """提供一个临时的、用于测试的配置实例。"""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        yield Settings(output_dir=temp_dir)
+    # output_dir 已被移除，不再需要临时目录
+    yield Settings()
 
 # --- 测试用例 ---
 @pytest.mark.parametrize("video_filename", TEST_VIDEOS)
@@ -117,7 +117,6 @@ async def test_codec_decoding_logic(settings, video_filename: str):
     # 4. 创建 ScreenshotGenerator 并执行解码
     generator = ScreenshotGenerator(
         loop=asyncio.get_running_loop(),
-        output_dir=settings.output_dir,
         on_success=on_success_callback
     )
 

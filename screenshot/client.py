@@ -39,7 +39,6 @@ class TorrentClient:
         app_settings = settings or Settings()
 
         self.save_path = app_settings.torrent_save_path
-        self.metadata_timeout = app_settings.metadata_timeout
 
         # libtorrent 会话设置，从应用配置中读取
         settings_pack = {
@@ -79,8 +78,7 @@ class TorrentClient:
         self._running = False
 
         self.dht_ready = asyncio.Event()
-        # 用于跟踪等待元数据下载的 Future: {infohash: Future}
-        self.pending_metadata = {}
+        # self.pending_metadata 已被移除，因为元数据总是被直接提供。
         # 用于跟踪正在进行的 piece 读取请求: {(infohash, piece_idx): Future}
         self.pending_reads = {}
         self.pending_reads_lock = threading.Lock()
@@ -201,7 +199,7 @@ class TorrentClient:
         """从会话中移除一个 torrent，并可选择是否删除其文件。"""
         if handle and handle.is_valid():
             infohash = str(await self._execute_sync(handle.info_hash))
-            self.pending_metadata.pop(infohash, None)
+            # self.pending_metadata.pop(infohash, None) # 已移除
 
             options = lt.session.delete_files if delete_files else 0
             await self._execute_sync(self._ses.remove_torrent, handle, options)
@@ -288,13 +286,6 @@ class TorrentClient:
                     f.cancel()
                     self.pending_reads.pop(read_keys_to_await[i], None)
             raise
-
-    def _handle_metadata_received(self, alert):
-        """警报处理：元数据已收到。唤醒等待的 Future。"""
-        infohash_str = str(alert.handle.info_hash())
-        future = self.pending_metadata.get(infohash_str)
-        if future and not future.done():
-            self.loop.call_soon_threadsafe(future.set_result, alert.handle)
 
     def _handle_piece_finished(self, alert):
         """警报处理：一个 piece 已完成。通知 `fetch_pieces` 和订阅者。"""
@@ -415,7 +406,6 @@ class TorrentClient:
                     self.log.debug("Libtorrent 警报: %s", alert)
 
                 alert_map = {
-                    lt.metadata_received_alert: self._handle_metadata_received,
                     lt.piece_finished_alert: self._handle_piece_finished,
                     lt.read_piece_alert: self._handle_read_piece,
                     lt.dht_bootstrap_alert: self._handle_dht_bootstrap,

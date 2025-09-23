@@ -91,7 +91,11 @@ def test_reset_stuck_tasks_succeeds_on_worker_timeout(db_session):
     db_session.commit()
 
     # 4. 运行被测函数
-    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds=300)
+    reset_count = crud.reset_stuck_tasks(
+        db_session,
+        worker_timeout_seconds=300,
+        task_timeout_seconds=3600
+    )
 
     # 5. 断言修复后的正确行为
     # `reset_stuck_tasks` 现在应该能找到并重置这个任务。

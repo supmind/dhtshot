@@ -22,19 +22,16 @@ class ScreenshotGenerator:
     通过向 PyAV 解码器提供数据包来处理截图的创建。
     此类封装了与 PyAV 的所有交互，并通过线程池实现了异步接口。
     """
-    def __init__(self, loop: asyncio.AbstractEventLoop, output_dir: str = './screenshots_output', on_success: Optional[Callable[[str, bytes, str], Awaitable[None]]] = None):
+    def __init__(self, loop: asyncio.AbstractEventLoop, on_success: Optional[Callable[[str, bytes, str], Awaitable[None]]] = None):
         """
         初始化截图生成器。
 
         :param loop: asyncio 事件循环，用于调度线程池任务。
-        :param output_dir: 保存生成截图的目录 (在此版本中已废弃，但保留以兼容旧接口)。
         :param on_success: 一个可选的异步回调函数。成功生成截图后，
                            将从工作线程中安全地调用此回调，并传入 (infohash, image_bytes, timestamp_str)。
         """
         self.loop = loop
         self.on_success = on_success
-        # output_dir is no longer used for saving but might be kept for other purposes if needed.
-        self.output_dir = output_dir
 
 
     def _generate_jpeg_from_frame(self, frame: av.VideoFrame, infohash_hex: str, timestamp_str: str):

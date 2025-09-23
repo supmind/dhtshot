@@ -53,7 +53,6 @@ class ScreenshotService:
         )
         self.generator = ScreenshotGenerator(
             loop=self.loop,
-            output_dir=self.settings.output_dir,
             on_success=screenshot_callback
         )
         self.status_callback = status_callback

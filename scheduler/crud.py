@@ -77,39 +77,38 @@ def upsert_worker(db: Session, worker_id: str, status: str) -> models.Worker:
     db.refresh(db_worker)
     return db_worker
 
-def reset_stuck_tasks(db: Session, timeout_seconds: int) -> int:
+def reset_stuck_tasks(db: Session, worker_timeout_seconds: int, task_timeout_seconds: int) -> int:
     """
-    重置长时间处于 'working' 状态的任务。
-    如果一个任务处于 'working' 状态，但其 `updated_at` 时间戳早于指定的超时时间，
-    则将其状态重置为 'pending'，以便其他工作节点可以接手。
+    重置卡死的任务。一个任务被视为卡死，如果满足以下任一条件：
+    1. 它被分配给一个已经失联（心跳超时）的 Worker。
+    2. 它处于 'working' 状态的时间超过了允许的最大任务时长。
 
     :param db: 数据库会话。
-    :param timeout_seconds: 定义任务被视为“卡住”的秒数。
+    :param worker_timeout_seconds: Worker 被视为失联的秒数。
+    :param task_timeout_seconds: 任务被视为卡死的最大时长（秒）。
     :return: 被重置的任务数量。
     """
-    timeout_threshold = datetime.datetime.utcnow() - datetime.timedelta(seconds=timeout_seconds)
-
     from sqlalchemy import or_
 
-    # 识别两种类型的僵死任务:
-    # 1. 任务分配给了已失联的 worker (通过 JOIN 查询)
-    stuck_by_worker_timeout = db.query(models.Task.id).join(
-        models.Worker, models.Task.assigned_worker_id == models.Worker.worker_id
-    ).filter(
-        models.Task.status == 'working',
-        models.Worker.last_seen_at < timeout_threshold
+    worker_timeout_threshold = datetime.datetime.utcnow() - datetime.timedelta(seconds=worker_timeout_seconds)
+    task_timeout_threshold = datetime.datetime.utcnow() - datetime.timedelta(seconds=task_timeout_seconds)
+
+    # 条件1: Worker 失联
+    worker_timed_out_cond = models.Task.assigned_worker_id.in_(
+        db.query(models.Worker.worker_id).filter(models.Worker.last_seen_at < worker_timeout_threshold)
     )
 
-    # 2. 任务本身长时间未更新，且没有分配给任何 worker (兼容旧的测试用例)
-    # 这种情况理论上不应该频繁发生，但作为一种兜底机制是稳健的。
-    stuck_by_task_timeout = db.query(models.Task.id).filter(
+    # 条件2: 任务自身执行超时
+    task_timed_out_cond = models.Task.updated_at < task_timeout_threshold
+
+    # 使用 OR 合并两个条件，并确保任务状态是 'working'
+    stuck_tasks_query = db.query(models.Task).filter(
         models.Task.status == 'working',
-        models.Task.updated_at < timeout_threshold,
-        models.Task.assigned_worker_id == None
+        or_(worker_timed_out_cond, task_timed_out_cond)
     )
 
-    # 合并两种情况下的任务 ID
-    stuck_task_ids = [row[0] for row in stuck_by_worker_timeout.union(stuck_by_task_timeout).all()]
+    # 获取需要被重置任务的 ID 列表
+    stuck_task_ids = [task.id for task in stuck_tasks_query.all()]
 
     if not stuck_task_ids:
         db.commit()
@@ -120,7 +119,8 @@ def reset_stuck_tasks(db: Session, timeout_seconds: int) -> int:
         models.Task.id.in_(stuck_task_ids)
     ).update({
         'status': 'pending',
-        'assigned_worker_id': None
+        'assigned_worker_id': None,
+        'result_message': '任务因超时而被系统自动重置'
     }, synchronize_session=False)
 
     db.commit()

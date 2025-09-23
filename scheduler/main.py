@@ -47,20 +47,23 @@ def get_db():
     finally:
         db.close()
 
+from config import Settings
+
 # --- 后台任务 ---
-async def reset_stuck_tasks_periodically(db_session_factory, timeout: int, interval: int):
+async def reset_stuck_tasks_periodically(db_session_factory, settings: Settings):
     """
     一个后台任务，定期检查并重置卡死的任务。
-    :param db_session_factory: 用于创建新的数据库会话的函数。
-    :param timeout: 任务被视为卡死的秒数。
-    :param interval: 检查周期的秒数。
     """
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(settings.scheduler_check_interval)
         db = db_session_factory()
         try:
             log.info("开始执行后台任务：重置卡死的任务...")
-            reset_count = crud.reset_stuck_tasks(db, timeout_seconds=timeout)
+            reset_count = crud.reset_stuck_tasks(
+                db,
+                worker_timeout_seconds=settings.scheduler_stuck_worker_timeout,
+                task_timeout_seconds=settings.scheduler_max_task_duration,
+            )
             if reset_count > 0:
                 log.info(f"成功重置了 {reset_count} 个卡死的任务。")
             else:
@@ -72,8 +75,6 @@ async def reset_stuck_tasks_periodically(db_session_factory, timeout: int, inter
 async def retry_scheduler_loop(db_session_factory, interval: int):
     """
     一个后台任务，定期检查并重试可恢复的失败任务。
-    :param db_session_factory: 用于创建新的数据库会话的函数。
-    :param interval: 检查周期的秒数。
     """
     while True:
         await asyncio.sleep(interval)
@@ -98,16 +99,13 @@ async def startup_event():
     """
     在应用启动时，初始化 Redis 连接池并启动后台任务。
     """
+    settings = Settings()
     log.info("应用启动...")
     await init_redis_pool()
 
     log.info("启动后台任务...")
-    task_timeout_seconds = 300  # 5 分钟
-    check_interval_seconds = 60   # 1 分钟
-    asyncio.create_task(reset_stuck_tasks_periodically(SessionLocal, task_timeout_seconds, check_interval_seconds))
-
-    retry_interval_seconds = 300  # 5 分钟
-    asyncio.create_task(retry_scheduler_loop(SessionLocal, retry_interval_seconds))
+    asyncio.create_task(reset_stuck_tasks_periodically(SessionLocal, settings))
+    asyncio.create_task(retry_scheduler_loop(SessionLocal, settings.scheduler_retry_interval))
 
 @app.on_event("shutdown")
 async def shutdown_event():

@@ -35,8 +35,6 @@ def get_invariant_worker_id() -> str:
     return worker_uuid
 
 WORKER_ID = f"worker-{get_invariant_worker_id()}"
-HEARTBEAT_INTERVAL = 30
-POLL_INTERVAL = 10
 
 
 class SchedulerAPIClient:
@@ -44,10 +42,11 @@ class SchedulerAPIClient:
     一个封装了与调度器所有 API 交互的客户端。
     这使得网络逻辑集中化，并简化了测试（通过 mock 这个类而不是网络请求）。
     """
-    def __init__(self, session: aiohttp.ClientSession, scheduler_url: str, api_key: str):
+    def __init__(self, session: aiohttp.ClientSession, scheduler_url: str, api_key: str, timeout: int):
         self._session = session
         self._url = scheduler_url
         self._api_key = api_key
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
 
     def _get_headers(self) -> Dict[str, str]:
         """构造带有认证信息的请求头。"""
@@ -58,7 +57,7 @@ class SchedulerAPIClient:
         url = f"{self._url}/workers/register"
         payload = {"worker_id": worker_id, "status": "idle"}
         try:
-            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers(), timeout=self._timeout) as response:
                 if response.status == 200:
                     log.info(f"工作节点 {worker_id} 注册成功。")
                     return True
@@ -72,11 +71,11 @@ class SchedulerAPIClient:
         """向调度器请求下一个待处理的任务。"""
         url = f"{self._url}/tasks/next?worker_id={worker_id}"
         try:
-            async with self._session.get(url, timeout=15, headers=self._get_headers()) as response:
+            async with self._session.get(url, timeout=self._timeout, headers=self._get_headers()) as response:
                 if response.status == 200:
                     return await response.json()
                 elif response.status == 204:
-                    log.info("调度器中无可用任务，等待中...")
+                    # log.info("调度器中无可用任务，等待中...") # 注释掉以减少日志噪音
                     return None
         except aiohttp.ClientError as e:
             log.error(f"连接调度器获取任务时出错: {e}")
@@ -86,7 +85,7 @@ class SchedulerAPIClient:
         """从调度器获取指定任务已成功记录的截图列表。"""
         url = f"{self._url}/tasks/{infohash}/screenshots"
         try:
-            async with self._session.get(url, timeout=15, headers=self._get_headers()) as response:
+            async with self._session.get(url, timeout=self._timeout, headers=self._get_headers()) as response:
                 if response.status == 200:
                     return await response.json()
                 else:
@@ -102,7 +101,7 @@ class SchedulerAPIClient:
         url = f"{self._url}/tasks/{infohash}/screenshots"
         payload = {"filename": filename}
         try:
-            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers(), timeout=self._timeout) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 报告截图失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -114,7 +113,7 @@ class SchedulerAPIClient:
         url = f"{self._url}/tasks/{infohash}/status"
         payload = {"status": status, "message": str(message)}
         try:
-            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers(), timeout=self._timeout) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 报告最终状态失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -125,7 +124,7 @@ class SchedulerAPIClient:
         log.info(f"[{infohash}] 正在上报任务详情: {details}")
         url = f"{self._url}/tasks/{infohash}/details"
         try:
-            async with self._session.post(url, json=details, headers=self._get_headers()) as response:
+            async with self._session.post(url, json=details, headers=self._get_headers(), timeout=self._timeout) as response:
                 if response.status != 200:
                     log.error(f"[{infohash}] 上报任务详情失败。状态码: {response.status}, 响应: {await response.text()}")
         except aiohttp.ClientError as e:
@@ -148,7 +147,7 @@ class SchedulerAPIClient:
             "queue_size": queue_size,
         }
         try:
-            async with self._session.post(url, json=payload, headers=self._get_headers()) as response:
+            async with self._session.post(url, json=payload, headers=self._get_headers(), timeout=self._timeout) as response:
                 if response.status != 200:
                     log.warning(f"发送心跳失败。状态码: {response.status}")
         except aiohttp.ClientError as e:
@@ -241,13 +240,14 @@ async def on_task_details_extracted(client: SchedulerAPIClient, infohash: str, d
 async def heartbeat_loop(
     stop_event: asyncio.Event,
     client: SchedulerAPIClient,
-    service: ScreenshotService
+    service: ScreenshotService,
+    settings: Settings
 ):
     """一个独立的协程，定期向调度器发送心跳。"""
     while not stop_event.is_set():
         await client.send_heartbeat(WORKER_ID, service)
         try:
-            await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=HEARTBEAT_INTERVAL)
+            await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=settings.worker_heartbeat_interval)
         except asyncio.TimeoutError:
             pass
 
@@ -261,7 +261,7 @@ async def main_loop(
     while not stop_event.is_set():
         try:
             if service.get_queue_size() >= settings.worker_max_queue_size:
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(settings.worker_poll_interval)
                 continue
 
             task_data = await client.get_next_task(WORKER_ID)
@@ -272,13 +272,13 @@ async def main_loop(
                 await service.submit_task(**task_data)
                 await asyncio.sleep(0.1)
             else:
-                log.info("调度器中无更多可用任务，进入等待状态。")
-                await asyncio.sleep(POLL_INTERVAL)
+                # log.info("调度器中无更多可用任务，进入等待状态。") # 注释掉以减少日志噪音
+                await asyncio.sleep(settings.worker_poll_interval)
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.error(f"主轮询循环发生意外错误: {e}", exc_info=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(settings.worker_poll_interval)
 
 async def run_worker(session: aiohttp.ClientSession):
     """设置并运行工作节点的所有组件。"""
@@ -293,7 +293,12 @@ async def run_worker(session: aiohttp.ClientSession):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    client = SchedulerAPIClient(session, settings.scheduler_url, settings.scheduler_api_key)
+    client = SchedulerAPIClient(
+        session,
+        settings.scheduler_url,
+        settings.scheduler_api_key,
+        settings.worker_http_timeout
+    )
     if not await client.register(WORKER_ID):
         log.error("无法向调度器注册，程序退出。")
         return
@@ -311,7 +316,7 @@ async def run_worker(session: aiohttp.ClientSession):
     await service.run()
     log.info("ScreenshotService 已在后台运行。")
 
-    heartbeat = asyncio.create_task(heartbeat_loop(stop_event, client, service))
+    heartbeat = asyncio.create_task(heartbeat_loop(stop_event, client, service, settings))
     log.info("心跳任务已启动。")
 
     log.info("启动主任务轮询循环...")

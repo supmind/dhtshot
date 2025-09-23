@@ -14,7 +14,8 @@ from screenshot.client import TorrentClient
 
 @pytest.fixture
 def settings():
-    return Settings(min_screenshots=2, max_screenshots=5, default_screenshots=3, target_interval_sec=60, moov_probe_timeout=5, piece_fetch_timeout=5, piece_queue_timeout=5)
+    # The necessary settings are now defined in config.py with default values.
+    return Settings()
 
 @pytest.fixture
 def mock_callbacks():

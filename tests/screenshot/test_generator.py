@@ -59,8 +59,7 @@ async def test_screenshot_generator_creates_valid_jpeg(video_packet_data):
             callback_called.set_result((infohash, image_bytes, ts))
 
     # 2. 实例化并运行生成器
-    # output_dir 已废弃，但为保持构造函数兼容性而传入
-    generator = ScreenshotGenerator(loop=loop, output_dir="", on_success=on_success_callback)
+    generator = ScreenshotGenerator(loop=loop, on_success=on_success_callback)
 
     packet_data = video_packet_data["packet_data"]
 

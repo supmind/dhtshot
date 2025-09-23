@@ -18,8 +18,6 @@ from screenshot.service import ScreenshotService
 def mock_settings(tmp_path):
     """为测试提供一个 Settings 实例，并设置一个较小的队列上限。"""
     return Settings(
-        scheduler_url="http://test-scheduler",
-        output_dir=str(tmp_path),
         worker_max_queue_size=5
     )
 
@@ -84,7 +82,7 @@ async def test_main_loop_waits_when_queue_is_full(mock_sleep, mock_settings, moc
     # --- 断言 ---
     mock_service.get_queue_size.assert_called()
     mock_client.get_next_task.assert_not_awaited()
-    mock_sleep.assert_awaited_once_with(worker.POLL_INTERVAL)
+    mock_sleep.assert_awaited_once_with(mock_settings.worker_poll_interval)
 
 @pytest.mark.asyncio
 async def test_on_task_finished_callback():
@@ -109,7 +107,12 @@ async def test_scheduler_api_client_send_heartbeat():
     # --- 安排 ---
     mock_session = AsyncMock(spec=ClientSession)
     # The API key is required now, let's provide a dummy one for the test
-    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler", "dummy-api-key")
+    client = worker.SchedulerAPIClient(
+        mock_session,
+        "http://fake-scheduler",
+        "dummy-api-key",
+        timeout=10
+    )
 
     mock_service = MagicMock(spec=ScreenshotService)
     type(mock_service).active_tasks = PropertyMock(return_value={"t1", "t2", "t3"})
@@ -128,5 +131,6 @@ async def test_scheduler_api_client_send_heartbeat():
     mock_session.post.assert_called_once_with(
         "http://fake-scheduler/workers/heartbeat",
         json=expected_payload,
-        headers={"X-API-Key": "dummy-api-key"}
+        headers={"X-API-Key": "dummy-api-key"},
+        timeout=ANY
     )
